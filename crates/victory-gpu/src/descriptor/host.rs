@@ -1766,6 +1766,14 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// sets the most). 2^18 ran out in the title's bigger places (session
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
+///
+/// On a capped host heap (NVIDIA's 1,000,000 views) [`DYNAMIC`] all the
+/// same, unless `VICTORY_DYNAMIC_SLOTS_CAPPED` asks for more (off by default;
+/// after deynesdev fab7fda): up to half the heap. They come out of the
+/// title's slots: with half the heap the title keeps its first 500,000 in
+/// place (its highest seen is about 720,000), the views past them read the
+/// null slot, and a table past them is made afresh in these slots like any
+/// other.
 fn dynamic_slots(count: u32, null: u32) -> u32 {
     static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
@@ -1775,9 +1783,38 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        static CAPPED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let asked = *CAPPED.get_or_init(|| {
+            std::env::var("VICTORY_DYNAMIC_SLOTS_CAPPED")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        });
+        let slots = dynamic_slots_capped(null, asked);
+        if slots != DYNAMIC {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!(
+                    slots,
+                    title_in_place = null.saturating_sub(slots),
+                    "more dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS_CAPPED)"
+                );
+            });
+        }
+        return slots;
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
+/// [`dynamic_slots`] on a capped heap whose null slot is `null` (0: none, the
+/// heap holds the title's slots and these, [`DYNAMIC`]): `asked`
+/// (`VICTORY_DYNAMIC_SLOTS_CAPPED`), at least [`DYNAMIC`] and at most half
+/// the heap; [`DYNAMIC`] when not asked.
+fn dynamic_slots_capped(null: u32, asked: Option<u32>) -> u32 {
+    if null == 0 {
+        return DYNAMIC;
+    }
+    let max_half = (null / 2).max(DYNAMIC);
+    asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, max_half)
 }
 
 impl HostHeap {
@@ -6548,4 +6585,18 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod capped_heap_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_slots_capped_honors_the_switch_within_half_the_heap() {
+        assert_eq!(dynamic_slots_capped(0, Some(524_288)), DYNAMIC);
+        assert_eq!(dynamic_slots_capped(999_999, None), DYNAMIC);
+        assert_eq!(dynamic_slots_capped(999_999, Some(524_288)), 499_999);
+        assert_eq!(dynamic_slots_capped(999_999, Some(1)), DYNAMIC);
+        assert_eq!(dynamic_slots_capped(999_999, Some(384_000)), 384_000);
+    }
 }

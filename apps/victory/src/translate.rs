@@ -407,6 +407,138 @@ pub fn run(
     Ok(())
 }
 
+/// A shader container of this many bytes or more is a big one for
+/// [`PrebakeGate`].
+const BIG_SHADER_BYTES: usize = 32 << 10;
+
+/// `VICTORY_PREBAKE_GUARD=1` (off by default; after deynesdev fab7fda): how
+/// many translations [`precompile`] runs at once, so that DXC's allocations
+/// do not run the PC out of memory. At most `VICTORY_PREBAKE_BIG_MAX` big
+/// containers ([`BIG_SHADER_BYTES`]; 1 to 4, 2 unset) at a time, small ones
+/// as many as there are threads; and while the PC has less than
+/// `VICTORY_PREBAKE_MIN_FREE_MB` of physical memory free (4,096 unset), one
+/// translation at a time, looked at again every 200 ms. Only the order and
+/// overlap of the translations change, never what they make.
+struct PrebakeGate {
+    /// Translations running: all, big.
+    state: Mutex<(usize, usize)>,
+    cv: std::sync::Condvar,
+    max_big: usize,
+    min_free_bytes: u64,
+}
+
+impl PrebakeGate {
+    /// The gate when `VICTORY_PREBAKE_GUARD=1`.
+    fn new() -> Option<Self> {
+        if !std::env::var_os("VICTORY_PREBAKE_GUARD").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let max_big = std::env::var("VICTORY_PREBAKE_BIG_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 4);
+        let min_free_mb = std::env::var("VICTORY_PREBAKE_MIN_FREE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4096);
+        println!(
+            "prebake guard: at most {max_big} big shaders at a time, one at a time under {min_free_mb} MB free (VICTORY_PREBAKE_GUARD)"
+        );
+        Some(Self {
+            state: Mutex::new((0, 0)),
+            cv: std::sync::Condvar::new(),
+            max_big,
+            min_free_bytes: min_free_mb << 20,
+        })
+    }
+
+    /// The PC's free physical memory, in bytes (`GlobalMemoryStatusEx`).
+    fn avail_ram_bytes() -> Option<u64> {
+        #[cfg(windows)]
+        {
+            // (filled in by the call; only `ull_avail_phys` is read)
+            #[repr(C)]
+            #[allow(dead_code)]
+            struct MemoryStatusEx {
+                dw_length: u32,
+                dw_memory_load: u32,
+                ull_total_phys: u64,
+                ull_avail_phys: u64,
+                ull_total_page_file: u64,
+                ull_avail_page_file: u64,
+                ull_total_virtual: u64,
+                ull_avail_virtual: u64,
+                ull_avail_extended_virtual: u64,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+            }
+            let mut st = MemoryStatusEx {
+                dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+                dw_memory_load: 0,
+                ull_total_phys: 0,
+                ull_avail_phys: 0,
+                ull_total_page_file: 0,
+                ull_avail_page_file: 0,
+                ull_total_virtual: 0,
+                ull_avail_virtual: 0,
+                ull_avail_extended_virtual: 0,
+            };
+            // SAFETY: a MEMORYSTATUSEX with its dwLength set.
+            if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 {
+                return Some(st.ull_avail_phys);
+            }
+        }
+        None
+    }
+
+    /// Waits until a translation of a big (`big`) or small container may
+    /// run; it runs until the permit is dropped.
+    fn acquire(&self, big: bool) -> PrebakePermit<'_> {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let low_ram = Self::avail_ram_bytes().is_some_and(|avail| avail < self.min_free_bytes);
+            // Short of memory: one translation at a time, the others looking
+            // again shortly, once what finished translations took is back.
+            let may = if low_ram { g.0 == 0 } else { !big || g.1 < self.max_big };
+            if may {
+                g.0 += 1;
+                if big {
+                    g.1 += 1;
+                }
+                return PrebakePermit { gate: self, big };
+            }
+            g = if low_ram {
+                self.cv
+                    .wait_timeout(g, std::time::Duration::from_millis(200))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+            } else {
+                self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
+            };
+        }
+    }
+}
+
+/// A translation [`PrebakeGate::acquire`] let run.
+struct PrebakePermit<'a> {
+    gate: &'a PrebakeGate,
+    big: bool,
+}
+
+impl Drop for PrebakePermit<'_> {
+    fn drop(&mut self) {
+        let mut g = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = g.0.saturating_sub(1);
+        if self.big {
+            g.1 = g.1.saturating_sub(1);
+        }
+        self.gate.cv.notify_all();
+    }
+}
+
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
@@ -414,6 +546,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     let paths = crate::default_paths(paths)?;
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let gate = PrebakeGate::new();
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
@@ -433,6 +566,8 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
                             if !lock(&seen).insert(hash) {
                                 continue;
                             }
+                            // (held through the translation, `VICTORY_PREBAKE_GUARD=1`)
+                            let _permit = gate.as_ref().map(|g| g.acquire(bytes.len() >= BIG_SHADER_BYTES));
                             match victory_hle::modules::d3d12x::precompile(&bytes) {
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;

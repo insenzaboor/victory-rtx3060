@@ -150,6 +150,15 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_WAVE_WIDE_ONLY=");
             bytes.extend_from_slice(listed.join(",").as_bytes());
         }
+        // Likewise, only when on (after deynesdev fab7fda): the loose-LDS forms of wave64
+        // programs on 32-lane hosts (`VICTORY_WAVE_LDS_LOOSE=1`), and `ds_bpermute` within
+        // 32-lane halves with the 32 KiB group-shared limit kept to (`VICTORY_WAVE32_FIXES=1`).
+        if victory_shader::emit::wave_lds_loose() {
+            bytes.extend_from_slice(b"VICTORY_WAVE_LDS_LOOSE=1");
+        }
+        if victory_shader::emit::wave32_fixes() {
+            bytes.extend_from_slice(b"VICTORY_WAVE32_FIXES=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
