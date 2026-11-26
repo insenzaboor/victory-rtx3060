@@ -381,6 +381,14 @@ pub(crate) fn show_new_later() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_NEW_LATER").is_none_or(|v| v != "0"))
 }
 
+/// Whether a slot [`show_new_later`] holds back keeps showing its old view
+/// only while the card had room lately, as the slots written at once do
+/// (`VICTORY_KEPT_ROOM_LATER`, on unless 0; Belobug e9428969).
+fn kept_room_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEPT_ROOM_LATER").is_none_or(|v| v != "0"))
+}
+
 /// Slots [`show_new_later`] holds back now: heap, slot, record.
 static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, u32, u64)>>> =
     std::sync::LazyLock::new(Default::default);
@@ -3710,9 +3718,12 @@ impl HostHeap {
                     return Some(view);
                 }
                 let old = view_at(shown as u32, (shown >> 32) as u32);
+                // (Kept only while the card had room lately, as the other
+                // two places have it: Belobug e9428969 has all three;
+                // `VICTORY_KEPT_ROOM_LATER=0`: kept regardless here, as before.)
                 let kept = old.is_some_and(|old| match kin(&old, &view) {
                     Kin::Same => true,
-                    kin => kin.kept(keep_shown()),
+                    kin => (!kept_room_later() || crate::resource::room_lately()) && kin.kept(keep_shown()),
                 });
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
@@ -4762,7 +4773,9 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    from_base(desc, copy.base, own_mips);
                 }
                 // Made whole from the store: all its levels.
                 let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
@@ -4926,18 +4939,48 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+///
+/// With [`base_fix`] (Belobug e9428969) the view also stays within the
+/// `own_mips` levels the host copy has (a first level past its last, or more
+/// levels than it holds from there, is a view the card may not take), and a
+/// 2D array's view is moved the same way as a 2D one's.
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    let own_mips = if base_fix() { own_mips } else { 0 };
+    let shift = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if own_mips > 0 {
+            *most = (*most).min(own_mips - 1);
+        }
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).max(1);
+            if own_mips > 0 {
+                *levels = (*levels).min(own_mips - *most).max(1);
+            }
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY if base_fix() => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
+}
+
+/// Whether [`from_base`] keeps a view within the host copy's levels and
+/// moves 2D arrays' views too (`VICTORY_VIEW_BASE_FIX`, on unless 0: what
+/// Belobug e9428969 does; 0: 2D views only, unclamped, as before).
+fn base_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BASE_FIX").is_none_or(|v| v != "0"))
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5520,7 +5563,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, 10);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
@@ -5529,6 +5572,9 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+        // Within the copy's ten levels (Belobug e9428969).
+        assert_eq!(view(15, 1, 0.0), (9, 1, 0.0));
+        assert_eq!(view(10, 8, 0.0), (7, 3, 0.0));
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.
