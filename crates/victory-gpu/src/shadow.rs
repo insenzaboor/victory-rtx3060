@@ -275,6 +275,22 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes of the arenas of title memory by address placed on the card
+/// ([`by_address`]), for the panel.
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The panel's breakdown of the card's buffers (after Belobug e9428969):
+/// copies, their twins and windows, and the arenas by address.
+pub(crate) fn vram_breakdown() -> [u64; 2] {
+    let arenas = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
+    let windows = WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_sub(arenas);
+    let buffers = CARD_BYTES[0].load(Ordering::Relaxed)
+        + CARD_BYTES[1].load(Ordering::Relaxed)
+        + windows
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+    [buffers, arenas]
+}
+
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
 /// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
@@ -5683,7 +5699,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         None
     };
     let buffer = match on_card {
-        Some(buffer) => buffer,
+        Some(buffer) => {
+            // (Never counted down: as `USED` above.)
+            BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+            buffer
+        }
         None => host.shared_buffer(len)?.0,
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
