@@ -58,7 +58,76 @@ pub(crate) extern "system" fn create(
         flags,
         waiters: Mutex::new(Vec::new()),
     });
+    if sweeps() {
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push(&raw const *fence as usize);
+        start_sweep();
+    }
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        if sweeps() {
+            let me = self as *const Fence as usize;
+            LIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != me);
+        }
+    }
+}
+
+/// Fences alive, for [`start_sweep`] (removed in their drop, under the lock).
+static LIVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether the events of fences whose value moved without [`set`] are set
+/// by a sweep (`VICTORY_FENCE_SWEEP=0`: not, as before). A fence's value
+/// is memory the title reads and that lists' bottom-of-pipe writes store
+/// into (`crate::queue::Written::write`) without telling the events that
+/// wait for it: the title's thread would then wait for good. In 5 of 19
+/// runs of 2026-11-26 the load hung on a wait or the title's GPU watchdog
+/// ended it ("GPU Loc Sig", a cross-queue barrier unsignalled).
+fn sweeps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FENCE_SWEEP").is_none_or(|v| v != "0"))
+}
+
+/// Starts the sweep thread, once: every 50 ms, each live fence's events
+/// whose value has been reached are set.
+fn start_sweep() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-fence-sweep".into()).spawn(|| {
+            let mut said = 0u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+                for &f in live.iter() {
+                    // SAFETY: alive while it is in `LIVE` (its drop takes it
+                    // out under the lock held here).
+                    let fence = unsafe { &*(f as *const Fence) };
+                    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+                    if waiters.is_empty() {
+                        continue;
+                    }
+                    let value = fence.value.load(Ordering::Acquire);
+                    waiters.retain(|&(wanted, event)| {
+                        if wanted > value {
+                            return true;
+                        }
+                        set_event(event);
+                        if said < 32 {
+                            said += 1;
+                            tracing::warn!(
+                                fence = format_args!("{f:#x}"),
+                                value,
+                                wanted,
+                                "a fence's event set by the sweep: its value moved without a signal (VICTORY_FENCE_SWEEP)"
+                            );
+                        }
+                        false
+                    });
+                }
+            }
+        });
+    });
 }
 
 fn set_event(event: usize) {
