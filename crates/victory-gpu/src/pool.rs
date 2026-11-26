@@ -56,6 +56,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
+    // Heaps of buffers in the card's memory, as its blocks of textures.
+    if CARD.bytes() > 0
+        && let Ok(mut pool) = CARD.pool.try_lock()
+    {
+        pool.reclaim(tick, limit, true);
+    }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
@@ -438,7 +444,8 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
 }
 
 /// Buffers of one kind placed in heaps made once (`Host::shared_buffer`,
-/// `Host::upload_buffer`), with the switch that sets a heap's megabytes.
+/// `Host::upload_buffer`, `Host::card_buffer`), with the switch that sets a
+/// heap's megabytes.
 ///
 /// Each such buffer was an allocation of its own, made not resident, made
 /// resident and (shared ones) waited for until the card has it mapped
@@ -473,9 +480,9 @@ pub(crate) struct Placed {
     size: std::sync::OnceLock<u64>,
     pool:std::sync::LazyLock<Mutex<Pool<ID3D12Heap>>>,
     /// Heaps made, buffers placed (since the start); buffers in heaps now
-    /// and the bytes of their pieces; buffers too big for a heap (since the
-    /// start).
-    stats: [AtomicU64; 5],
+    /// and the bytes of their pieces; buffers too big for a heap, and
+    /// buffers placed where another lay before (since the start).
+    stats: [AtomicU64; 6],
     key: GUID,
     back: fn(Piece),
 }
@@ -495,7 +502,7 @@ pub(crate) static SHARED: Placed = Placed {
     what: "shared buffers",
     size: std::sync::OnceLock::new(),
     pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&SHARED))),
-    stats: [const { AtomicU64::new(0) }; 5],
+    stats: [const { AtomicU64::new(0) }; 6],
     key: GUID::from_u128(0x2b7d_51c4_8e0a_4f36_b1d9_5c3a_7e64_0f12),
     back: |piece| SHARED.give(piece),
 };
@@ -507,10 +514,53 @@ pub(crate) static UPLOAD: Placed = Placed {
     what: "upload buffers",
     size: std::sync::OnceLock::new(),
     pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&UPLOAD))),
-    stats: [const { AtomicU64::new(0) }; 5],
+    stats: [const { AtomicU64::new(0) }; 6],
     key: GUID::from_u128(0x9c41_e3a7_02bd_4d58_a6f0_83e1_5b29_c74d),
     back: |piece| UPLOAD.give(piece),
 };
+
+/// Buffers in the card's own memory that shaders write (`Host::card_buffer`,
+/// what `Host::uav_buffer` made for callers that write every byte they read
+/// first), in heaps of `VICTORY_CARD_HEAPS` MB (0 or unset: none, as before;
+/// 64 a good size), the same way: made not resident, then made resident and
+/// waited for until the card has them mapped once a heap ([`Placed::card`]).
+///
+/// The CPU cannot zero a piece used again in the card's memory, as it does
+/// for the others: such a buffer holds what the one before it left, and is
+/// marked so ([`begins_as_zeros`]). A heap made new is zeros (no
+/// `D3D12_HEAP_FLAG_CREATE_NOT_ZEROED`), and so is a piece of it nothing
+/// used yet. Which callers may have such a buffer is said at each of them;
+/// those that count on zeros (counters shaders add to) still call
+/// `Host::uav_buffer`, an allocation of its own.
+///
+/// Page faults: the card read memory it did not have mapped yet when new
+/// blocks of textures were read by lists already sent (runs n08 and n11),
+/// which [`crate::host::mapped`] waits for. A heap here is waited for so
+/// before its first piece is given out, so no buffer in it exists before
+/// its heap is mapped; a later piece lies in memory mapped since. A buffer
+/// let go leaves its piece mapped (its heap stays while a piece is taken or
+/// it is among the kept empty ones): a stray read there finds another's
+/// bytes, where memory given back was a lost device.
+pub(crate) static CARD: Placed = Placed {
+    switch: "VICTORY_CARD_HEAPS",
+    what: "card buffers",
+    size: std::sync::OnceLock::new(),
+    pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&CARD))),
+    stats: [const { AtomicU64::new(0) }; 6],
+    key: GUID::from_u128(0xd83a_6c15_4f9e_4b27_8e0c_a1f4_6b53_92e8),
+    back: |piece| CARD.give(piece),
+};
+
+/// The private data of a buffer placed where another lay ([`Placed::card`]).
+const NOT_ZEROS: GUID = GUID::from_u128(0x4e17_b2d9_63a8_4c05_b7f1_2d9e_08c6_a35b);
+
+/// Whether `buffer` began as zeros, as a buffer of its own does: false only
+/// for one placed in card memory where another lay before ([`CARD`]).
+pub(crate) fn begins_as_zeros(buffer: &ID3D12Resource) -> bool {
+    let mut size = 0u32;
+    // SAFETY: a size query; no data is written.
+    unsafe { buffer.GetPrivateData(&NOT_ZEROS, &mut size, None).is_err() }
+}
 
 impl Placed {
     /// Bytes of a heap (0: none are made), read once.
@@ -553,6 +603,55 @@ impl Placed {
         state: D3D12_RESOURCE_STATES,
         mapped: bool,
     ) -> Option<(ID3D12Resource, *mut u8)> {
+        let (made, again, log) = self.place(device, properties, desc, state, mapped)?;
+        let width = desc.Width.max(1);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a CPU-visible buffer of ours.
+        if let Err(e) = unsafe { made.Map(0, None, Some(&mut data)) } {
+            tracing::warn!(error = %e, width, "a buffer placed in a heap of {} is not mapped ({})", self.what, self.switch);
+            // (Its piece comes back as it goes, outside the lock.)
+            return None;
+        }
+        if again {
+            // A buffer of its own is zeros, and callers count on it (a
+            // copy's pages that nothing copied into yet, counters a shader
+            // adds to).
+            // SAFETY: the buffer's mapping, `width` bytes of it.
+            unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, width as usize) };
+        }
+        self.said(log);
+        Some((made, data.cast()))
+    }
+
+    /// A buffer of `desc` in the card's own memory (a heap of the default
+    /// kind), made in `state`, each new heap made resident and waited for
+    /// until the card has it mapped. Not mapped, and not zeros where another
+    /// buffer lay before: then [`begins_as_zeros`] says false of it. `None`:
+    /// as [`Placed::buffer`].
+    pub(crate) fn card(&self, device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
+        let properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let (made, again, log) = self.place(device, &properties, desc, state, true)?;
+        // SAFETY: a byte of data of ours, copied by the call.
+        if again && unsafe { made.SetPrivateData(&NOT_ZEROS, 1, Some((&raw const again).cast())) }.is_err() {
+            // Unmarked, it would be taken for zeros: not given out (its piece
+            // comes back as it goes).
+            tracing::warn!("a buffer placed where another lay in a heap of {} could not be marked so ({})", self.what, self.switch);
+            return None;
+        }
+        self.said(log);
+        Some(made)
+    }
+
+    /// The buffer placed, whether its piece was used before, and whether to
+    /// log ([`Placed::said`]): for [`Placed::buffer`] and [`Placed::card`].
+    fn place(
+        &self,
+        device: &ID3D12Device,
+        properties: &D3D12_HEAP_PROPERTIES,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        mapped: bool,
+    ) -> Option<(ID3D12Resource, bool, bool)> {
         let block = self.bytes();
         if block == 0 {
             return None;
@@ -607,25 +706,19 @@ impl Placed {
         // (Not given back if it would not take the object: then the piece
         // stays taken, counted as held.)
         give_back_to(&made, piece, &self.key, self.back);
-        let mut data = std::ptr::null_mut();
-        // SAFETY: a CPU-visible buffer of ours.
-        if let Err(e) = unsafe { made.Map(0, None, Some(&mut data)) } {
-            tracing::warn!(error = %e, width, "a buffer placed in a heap of {} is not mapped ({})", self.what, self.switch);
-            // (Its piece comes back as it goes, outside the lock.)
-            return None;
-        }
         if again {
-            // A buffer of its own is zeros, and callers count on it (a
-            // copy's pages that nothing copied into yet, counters a shader
-            // adds to).
-            // SAFETY: the buffer's mapping, `width` bytes of it.
-            unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, width as usize) };
+            self.stats[5].fetch_add(1, Ordering::Relaxed);
         }
         let placed = self.stats[1].fetch_add(1, Ordering::Relaxed) + 1;
-        if made_heap.get() || placed.is_multiple_of(16_384) {
-            self.log(placed);
+        Some((made, again, made_heap.get() || placed.is_multiple_of(16_384)))
+    }
+
+    /// [`Placed::log`], if [`Placed::place`] said to (a heap made, or
+    /// another 16,384 buffers placed).
+    fn said(&self, log: bool) {
+        if log {
+            self.log(self.stats[1].load(Ordering::Relaxed));
         }
-        Some((made, data.cast()))
     }
 
     /// Says what the heaps hold.
@@ -633,7 +726,7 @@ impl Placed {
         let heaps = self.lock().blocks();
         tracing::info!(
             "{} placed in heaps of {} MB made once ({}=0: each an allocation of its own): {} heaps made since the start, {heaps} now ({} MB); \
-             {} buffers in them now, in {} MB; {placed} placed since the start, {} too big for a heap made on their own",
+             {} buffers in them now, in {} MB; {placed} placed since the start ({} where another lay before), {} too big for a heap made on their own",
             self.what,
             self.bytes() >> 20,
             self.switch,
@@ -641,6 +734,7 @@ impl Placed {
             (heaps as u64 * self.bytes()) >> 20,
             self.stats[2].load(Ordering::Relaxed),
             self.stats[3].load(Ordering::Relaxed) >> 20,
+            self.stats[5].load(Ordering::Relaxed),
             self.stats[4].load(Ordering::Relaxed),
         );
     }
@@ -1168,7 +1262,7 @@ mod tests {
             what: "test buffers",
             size: std::sync::OnceLock::new(),
             pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&TEST))),
-            stats: [const { AtomicU64::new(0) }; 5],
+            stats: [const { AtomicU64::new(0) }; 6],
             key: GUID::from_u128(0x51e0_7a2c_d4b3_46f8_9e15_0c6a_b8d2_3f71),
             back: |piece| TEST.give(piece),
         };
@@ -1213,6 +1307,53 @@ mod tests {
         assert_eq!(unsafe { c.GetGPUVirtualAddress() }, at_a, "the piece is used again");
         assert!((0..1000).all(|i| unsafe { *c_data.add(i) } == 0));
         drop((b, c));
+        // SAFETY: plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Buffers placed in the card's memory come back when they go, as the
+    /// others; one placed where another lay is marked as not zeros, one in a
+    /// piece nothing used yet (and a buffer of its own) is not.
+    #[test]
+    fn card_buffers_placed_again_say_they_are_not_zeros() {
+        let Some(host) = crate::host::host() else { return };
+        static TEST: Placed = Placed {
+            switch: "VICTORY_TEST_CARD_HEAPS",
+            what: "test card buffers",
+            size: std::sync::OnceLock::new(),
+            pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&TEST))),
+            stats: [const { AtomicU64::new(0) }; 6],
+            key: GUID::from_u128(0x7b02_c9e4_15a6_4d83_a3f8_6e0d_29c1_b574),
+            back: |piece| TEST.give(piece),
+        };
+        let _ = TEST.size.set(4 << 20);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 4096,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let Some(a) = TEST.card(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) else { return };
+        assert!(begins_as_zeros(&a), "a piece nothing used yet");
+        assert_eq!(crate::host::references(&a), 1);
+        // SAFETY: a live buffer.
+        let at = unsafe { a.GetGPUVirtualAddress() };
+        drop(a);
+        assert_eq!(TEST.lock().resting.len(), 1);
+        TEST.lock().rested(u64::MAX);
+        let b = TEST.card(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { b.GetGPUVirtualAddress() }, at, "the piece is used again");
+        assert!(!begins_as_zeros(&b));
+        assert_eq!(TEST.stats[5].load(Ordering::Relaxed), 1);
+        let own = host.uav_buffer(4096).unwrap();
+        assert!(begins_as_zeros(&own));
+        drop((b, own));
         // SAFETY: plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

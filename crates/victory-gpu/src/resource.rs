@@ -540,7 +540,10 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        // Not zeros at need (`Host::card_buffer`): each copy fills every
+        // subresource from one texture before it copies it into the other
+        // (`host::record_twin_copy`).
+        let Some(buffer) = host.card_buffer(bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };

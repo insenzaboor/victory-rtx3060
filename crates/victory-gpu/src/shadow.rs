@@ -330,11 +330,41 @@ struct Carded {
     shadow: std::sync::Weak<Shadow>,
 }
 
-/// `shadow` is a copy in the card's memory from now on.
+/// `shadow` is a copy in the card's memory from now on. Called before any
+/// list can name it.
+///
+/// A card side placed where another buffer lay (`VICTORY_CARD_HEAPS`,
+/// `crate::pool::begins_as_zeros`) holds that one's bytes, where one of its
+/// own is zeros, and the copies count on zeros: only what a refresh takes
+/// goes up, and with [`send_changed`] or [`by_address`] only the dwords that
+/// differ from the CPU's side, which begins as zeros (a shared buffer is
+/// zeros, made or placed again). So the whole of it goes up from the CPU's
+/// side with the first submission after this, ahead of every list that
+/// reads it: from then on the two sides hold what they would with a buffer
+/// of its own. (Bytes the size of the copy over the bus once, the card
+/// side being at most a quarter of a heap; none for a piece nothing used
+/// yet, which is zeros.)
 fn carded(shadow: &Arc<Shadow>) {
     let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Carded { start, end, shadow: Arc::downgrade(shadow) });
+    if let Some(card) = &shadow.card
+        && !crate::pool::begins_as_zeros(&shadow.buffer)
+    {
+        let n = CARD_RESENT[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CARD_RESENT[1].fetch_add(card.size, Ordering::Relaxed) + card.size;
+        if n.is_power_of_two() {
+            tracing::info!(
+                "copies in the card's memory placed where another buffer lay (VICTORY_CARD_HEAPS), sent up whole from their CPU's side \
+                 as they are not zeros: {n} since the start, {} MB",
+                bytes >> 20
+            );
+        }
+        shadow.resend(0, card.size as usize);
+    }
 }
+
+/// Copies [`carded`] sent up whole, and their bytes.
+static CARD_RESENT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -455,7 +485,8 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // Not zeros at need (`Host::card_buffer`): [`carded`] sends it up whole.
+    let buffer = host.card_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -581,7 +612,8 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // Not zeros at need (`Host::card_buffer`): [`carded`] sends it up whole.
+    let buffer = host.card_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
@@ -5538,7 +5570,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+        // Not zeros at need (`Host::card_buffer`): [`carded`] sends it up
+        // whole, before any shader stores in it.
+        host.card_buffer(len)
     } else {
         None
     };

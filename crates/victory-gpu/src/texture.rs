@@ -242,7 +242,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                // Not zeros at need (`Host::card_buffer`): each copy fills
+                // every part from the texture written before it copies it out.
+                let Some(buffer) = host.card_buffer(bytes[0]) else {
                     return false;
                 };
                 crate::host::name(&buffer, || {
