@@ -5816,8 +5816,17 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// buffer held before is never read. `VICTORY_EXACT_POOL_MB` bounds the
 /// bytes kept (0 by default: no pool, every copy a new buffer as before).
 /// With 64 the title's loading screen never ended (run sixth: 5 minutes,
-/// against 64-94 s without): something still knows a reused buffer by what
-/// it was, not yet found.
+/// against 64-94 s without). Most likely why, by reading: the pool's own
+/// reference. [`exact`]'s sweep lets a copy go only if its buffer has one
+/// reference (`references(&shadow.buffer) > 1` keeps it), and every
+/// pooled buffer has two while its copy lives (the copy's, the pool's), so
+/// no pooled copy was ever let go, no pooled buffer ever came down to one
+/// for [`exact_pooled`] (`EXACT_REUSED` stays 0), and the map of copies grew
+/// with every ring position: past `4 * MANY` every miss walks the whole map,
+/// two COM calls a copy, under the lock all list threads take, and 64 MB of
+/// small views is tens of thousands of allocations of their own held.
+/// `crate::pool::Placed` (`VICTORY_SHARED_HEAPS`) holds no reference to the
+/// buffers it hands out.
 #[allow(clippy::type_complexity)]
 static EXACT_POOL: Mutex<(u64, BTreeMap<u64, Vec<(ID3D12Resource, usize)>>)> = Mutex::new((0, BTreeMap::new()));
 

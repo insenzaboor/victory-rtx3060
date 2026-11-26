@@ -9244,6 +9244,13 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
+        // Placed in a heap made resident once (`VICTORY_UPLOAD_HEAPS`,
+        // `crate::pool::Placed`).
+        if let Some((b, data)) = crate::pool::UPLOAD.buffer(&self.device, &heap, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, false) {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&b, || "an upload buffer".into());
+            return Some((b, data));
+        }
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of an upload buffer.
@@ -10240,6 +10247,13 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
+        // Placed in a heap made resident and waited for once
+        // (`VICTORY_SHARED_HEAPS`, `crate::pool::Placed`).
+        if let Some((b, data)) = crate::pool::SHARED.buffer(&self.device, &heap, &desc, D3D12_RESOURCE_STATE_COMMON, true) {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&b, || "a shared buffer".into());
+            return Some((b, data));
+        }
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.

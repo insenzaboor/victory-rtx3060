@@ -65,6 +65,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             limit
         };
         pool.reclaim(tick, staging_limit, true);
+        // Heaps of placed buffers are the PC's memory too.
+        for placed in [&SHARED, &UPLOAD] {
+            if placed.bytes() > 0
+                && let Ok(mut pool) = placed.pool.try_lock()
+            {
+                pool.reclaim(tick, staging_limit, true);
+            }
+        }
     }
 }
 
@@ -206,11 +214,21 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    /// Bytes of a block, and of the largest piece cut from one (without
+    /// blocks made ahead, [`ahead`]).
+    block: u64,
+    largest: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool::sized(most, BLOCK, BLOCK / 2)
+    }
+
+    /// A pool of blocks of `block` bytes, which gives pieces of at most
+    /// `largest`.
+    const fn sized(most: usize, block: u64, largest: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, block, largest }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -231,7 +249,7 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block } else { self.largest } {
             return None;
         }
         self.rested(now);
@@ -267,7 +285,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block)).count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
@@ -302,7 +320,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.block), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -326,7 +344,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(self.block);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -334,8 +352,9 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
+            let size = self.block;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -418,13 +437,230 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     Some((owned, memory.0, piece.start, data))
 }
 
-/// An object the host texture holds and releases when it goes: its piece
-/// is free then.
+/// Buffers of one kind placed in heaps made once (`Host::shared_buffer`,
+/// `Host::upload_buffer`), with the switch that sets a heap's megabytes.
+///
+/// Each such buffer was an allocation of its own, made not resident, made
+/// resident and (shared ones) waited for until the card has it mapped
+/// (`crate::host::resident`, `crate::host::mapped`): 102,900 shared buffers
+/// in six minutes, 68 s of `MakeResident` and 35 s of those waits, on the
+/// threads that record lists. A heap is made resident and waited for once;
+/// a buffer placed in it is mapped into the card's address space with it,
+/// so what [`crate::host::resident`] guards against (lists reading memory
+/// the card does not have mapped yet) cannot happen to it.
+///
+/// A piece comes back when the buffer's last reference goes: an object of
+/// ours in its private data is released then (as a pooled texture's). By
+/// the owners' rule nothing of the card's names it then: a list holds what
+/// it records until it is reset after its submission ran
+/// (`HostList::keep`, the uploads it holds), a descriptor slot holds what
+/// it shows and gives it to `crate::host::retire_resource` when it changes,
+/// and a buffer's copy (`crate::shadow::Shadow`) holds it while anything
+/// holds the copy. An allocation of its own let go too soon is a page fault
+/// (a lost device); a piece is used again only after [`REST`] on top.
+///
+/// Nothing else holds a reference to a placed buffer: the count
+/// `crate::host::references` reads is its owners' alone, as with a buffer
+/// of its own. (`VICTORY_EXACT_POOL_MB` kept one in its pool, so that every
+/// copy of a view's bytes it pooled was held by two and never let go by
+/// the sweep in `crate::shadow::exact`, which goes by that count.)
+pub(crate) struct Placed {
+    /// The switch, for the log.
+    switch: &'static str,
+    /// What the buffers are, for the log.
+    what: &'static str,
+    /// Bytes of a heap, from the switch ([`Placed::bytes`]).
+    size: std::sync::OnceLock<u64>,
+    pool:std::sync::LazyLock<Mutex<Pool<ID3D12Heap>>>,
+    /// Heaps made, buffers placed (since the start); buffers in heaps now
+    /// and the bytes of their pieces; buffers too big for a heap (since the
+    /// start).
+    stats: [AtomicU64; 5],
+    key: GUID,
+    back: fn(Piece),
+}
+
+/// The placement alignment of buffers.
+const PLACED_ALIGN: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+
+/// Empty heaps of placed buffers kept (the PC's memory, as staging's).
+const PLACED_KEPT: usize = 4;
+
+/// Shared buffers: CPU-visible write-back memory shaders read and write,
+/// in heaps of `VICTORY_SHARED_HEAPS` MB (0 or unset: none, each buffer an
+/// allocation of its own as before; 64 a good size). Buffers of a quarter
+/// of a heap or more are allocations of their own all the same.
+pub(crate) static SHARED: Placed = Placed {
+    switch: "VICTORY_SHARED_HEAPS",
+    what: "shared buffers",
+    size: std::sync::OnceLock::new(),
+    pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&SHARED))),
+    stats: [const { AtomicU64::new(0) }; 5],
+    key: GUID::from_u128(0x2b7d_51c4_8e0a_4f36_b1d9_5c3a_7e64_0f12),
+    back: |piece| SHARED.give(piece),
+};
+
+/// Upload buffers, in heaps of `VICTORY_UPLOAD_HEAPS` MB (0 or unset: none,
+/// as before), the same way.
+pub(crate) static UPLOAD: Placed = Placed {
+    switch: "VICTORY_UPLOAD_HEAPS",
+    what: "upload buffers",
+    size: std::sync::OnceLock::new(),
+    pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&UPLOAD))),
+    stats: [const { AtomicU64::new(0) }; 5],
+    key: GUID::from_u128(0x9c41_e3a7_02bd_4d58_a6f0_83e1_5b29_c74d),
+    back: |piece| UPLOAD.give(piece),
+};
+
+impl Placed {
+    /// Bytes of a heap (0: none are made), read once.
+    pub(crate) fn bytes(&self) -> u64 {
+        *self.size.get_or_init(|| {
+            let mb = std::env::var(self.switch).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+            // (A heap is at least four placements, so that the quarter one
+            // may take is one.)
+            if mb == 0 { 0 } else { (mb << 20).max(4 * PLACED_ALIGN) }
+        })
+    }
+
+    fn pool_of(this: &Placed) -> Pool<ID3D12Heap> {
+        let block = this.bytes().max(4 * PLACED_ALIGN);
+        Pool::sized(PLACED_KEPT, block, block / 4)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pool<ID3D12Heap>> {
+        self.pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The last reference to a buffer placed in a heap went.
+    fn give(&self, piece: Piece) {
+        self.stats[2].fetch_sub(1, Ordering::Relaxed);
+        self.stats[3].fetch_sub(piece.len, Ordering::Relaxed);
+        self.lock().give(piece, now());
+    }
+
+    /// A buffer of `desc` placed in a heap of `properties`, made in `state`
+    /// (`resident` waits for a new heap with [`crate::host::resident`], and
+    /// `mapped` with [`crate::host::mapped`] too), and its mapping: zeros,
+    /// as a buffer of its own is made. `None`: the switch is off, the
+    /// buffer is too big for a heap, or the host refused (the caller makes
+    /// an allocation of its own then).
+    pub(crate) fn buffer(
+        &self,
+        device: &ID3D12Device,
+        properties: &D3D12_HEAP_PROPERTIES,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        mapped: bool,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        let block = self.bytes();
+        if block == 0 {
+            return None;
+        }
+        let width = desc.Width.max(1);
+        let len = width.next_multiple_of(PLACED_ALIGN);
+        if len > block / 4 {
+            self.stats[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let made_heap = std::cell::Cell::new(false);
+        let (piece, heap, again) = self.lock().take(len, PLACED_ALIGN, now(), || {
+            let heap_desc = D3D12_HEAP_DESC {
+                SizeInBytes: block,
+                Properties: *properties,
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            if let Err(e) = unsafe { device.CreateHeap(&heap_desc, &mut heap) } {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, "no heap of {} ({})", self.what, self.switch);
+                return None;
+            }
+            let heap = heap?;
+            let ready = crate::host::resident(device, &heap).and_then(|()| if mapped { crate::host::mapped(device) } else { Ok(()) });
+            if let Err(e) = ready {
+                tracing::warn!(error = %e, "a heap of {} is not resident ({})", self.what, self.switch);
+                return None;
+            }
+            self.stats[0].fetch_add(1, Ordering::Relaxed);
+            made_heap.set(true);
+            Some(heap)
+        })?;
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: the piece is no one else's; the heap lives while a piece of
+        // it is taken.
+        let result = unsafe { device.CreatePlacedResource(&heap, piece.start, desc, state, None, &mut made) };
+        let made = match (result, made) {
+            (Ok(()), Some(made)) => made,
+            (result, _) => {
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, width, "no buffer placed in a heap of {} ({})", self.what, self.switch);
+                }
+                self.lock().give(piece, now());
+                return None;
+            }
+        };
+        self.stats[2].fetch_add(1, Ordering::Relaxed);
+        self.stats[3].fetch_add(piece.len, Ordering::Relaxed);
+        // (Not given back if it would not take the object: then the piece
+        // stays taken, counted as held.)
+        give_back_to(&made, piece, &self.key, self.back);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a CPU-visible buffer of ours.
+        if let Err(e) = unsafe { made.Map(0, None, Some(&mut data)) } {
+            tracing::warn!(error = %e, width, "a buffer placed in a heap of {} is not mapped ({})", self.what, self.switch);
+            // (Its piece comes back as it goes, outside the lock.)
+            return None;
+        }
+        if again {
+            // A buffer of its own is zeros, and callers count on it (a
+            // copy's pages that nothing copied into yet, counters a shader
+            // adds to).
+            // SAFETY: the buffer's mapping, `width` bytes of it.
+            unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, width as usize) };
+        }
+        let placed = self.stats[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if made_heap.get() || placed.is_multiple_of(16_384) {
+            self.log(placed);
+        }
+        Some((made, data.cast()))
+    }
+
+    /// Says what the heaps hold.
+    fn log(&self, placed: u64) {
+        let heaps = self.lock().blocks();
+        tracing::info!(
+            "{} placed in heaps of {} MB made once ({}=0: each an allocation of its own): {} heaps made since the start, {heaps} now ({} MB); \
+             {} buffers in them now, in {} MB; {placed} placed since the start, {} too big for a heap made on their own",
+            self.what,
+            self.bytes() >> 20,
+            self.switch,
+            self.stats[0].load(Ordering::Relaxed),
+            (heaps as u64 * self.bytes()) >> 20,
+            self.stats[2].load(Ordering::Relaxed),
+            self.stats[3].load(Ordering::Relaxed) >> 20,
+            self.stats[4].load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// An object the host texture (or placed buffer, [`shared`]) holds and
+/// releases when it goes: its piece is free then, and `back` gives it to its
+/// pool.
 #[repr(C)]
 struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    back: fn(Piece),
+}
+
+/// A texture's piece back in [`TEXTURES`].
+fn texture_back(piece: Piece) {
+    HELD.fetch_sub(piece.len, Ordering::Relaxed);
+    lock(&TEXTURES).give(piece, now());
 }
 
 struct Methods([*const (); 3]);
@@ -461,8 +697,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            (gone.back)(gone.piece);
         }
         left
     }
@@ -639,17 +874,27 @@ pub(crate) fn pooled(texture: &ID3D12Resource) -> bool {
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    give_back_to(texture, piece, &KEY, texture_back);
+}
+
+/// Makes `resource` hand `piece` to `back` when the last reference to it
+/// goes, through private data under `key`; false if it would not take it
+/// (the piece then stays taken: nothing is reused under a resource that may
+/// be alive).
+fn give_back_to(resource: &ID3D12Resource, piece: Piece, key: &GUID, back: fn(Piece)) -> bool {
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, back }));
     // SAFETY: a COM object of ours with one reference, which this takes and
-    // drops at the end; the texture takes its own.
+    // drops at the end; the resource takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if resource.SetPrivateDataInterface(key, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
+            return false;
         }
     }
+    true
 }
 
 /// A texture of `desc` (no target, depth or unordered access) in a block;
@@ -909,6 +1154,67 @@ mod tests {
         assert!(held >= before);
         drop(made);
         assert_eq!(crate::host::references(&heap), before);
+    }
+
+    /// Placed buffers do not overlap, hold no reference of their own (the
+    /// count is their owner's alone), give their piece back when their last
+    /// reference goes and not before, and a piece used again begins as zeros;
+    /// a quarter of a heap or more is not placed.
+    #[test]
+    fn placed_buffers_come_back_when_they_go_and_begin_as_zeros() {
+        let Some(host) = crate::host::host() else { return };
+        static TEST: Placed = Placed {
+            switch: "VICTORY_TEST_HEAPS",
+            what: "test buffers",
+            size: std::sync::OnceLock::new(),
+            pool: std::sync::LazyLock::new(|| Mutex::new(Placed::pool_of(&TEST))),
+            stats: [const { AtomicU64::new(0) }; 5],
+            key: GUID::from_u128(0x51e0_7a2c_d4b3_46f8_9e15_0c6a_b8d2_3f71),
+            back: |piece| TEST.give(piece),
+        };
+        let _ = TEST.size.set(4 << 20);
+        let properties = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = |width: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: width,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let make = |width| TEST.buffer(&host.device, &properties, &desc(width), D3D12_RESOURCE_STATE_COMMON, true);
+        let Some((a, a_data)) = make(1000) else { return };
+        let (b, _) = make(70_000).unwrap();
+        assert_eq!(crate::host::references(&a), 1);
+        // SAFETY: live buffers.
+        let (at_a, at_b) = unsafe { (a.GetGPUVirtualAddress(), b.GetGPUVirtualAddress()) };
+        assert!(at_a.abs_diff(at_b) >= PLACED_ALIGN);
+        assert!(make((1 << 20) + 1).is_none(),"a quarter of the heap is an allocation of its own");
+        // SAFETY: the buffer's mapping, 1000 bytes of it.
+        unsafe { std::ptr::write_bytes(a_data, 0xAB, 1000) };
+        let resting = || TEST.lock().resting.len();
+        let other = a.clone();
+        drop(a);
+        assert_eq!(resting(), 0);
+        drop(other);
+        assert_eq!(resting(), 1);
+        assert_eq!(TEST.stats[2].load(Ordering::Relaxed), 1);
+        TEST.lock().rested(u64::MAX);
+        let (c, c_data) = make(1000).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { c.GetGPUVirtualAddress() }, at_a, "the piece is used again");
+        assert!((0..1000).all(|i| unsafe { *c_data.add(i) } == 0));
+        drop((b, c));
+        // SAFETY: plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
