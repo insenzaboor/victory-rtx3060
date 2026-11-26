@@ -48,13 +48,13 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 | | Category | Done | In flight | Planned |
 |---|---|---|---|---|
 | <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 23 | 5 | 1 |
-| <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 1 | 6 | 2 |
-| <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 10 | 4 |
-| <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 3 | 0 |
-| <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 5 | 0 |
+| <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 1 | 7 | 2 |
+| <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 13 | 4 |
+| <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 4 | 0 |
+| <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 8 | 0 |
 | <img src="docs/assets/progress/tooling.svg" width="300"> | **Measurement and automation** | 4 | 1 | 0 |
 
-**35 of 72** items done or decided, **30** merged and waiting for a game run, **7** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
+**35 of 80** items done or decided, **38** merged and waiting for a game run, **7** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
 
 <!-- PROGRESS:END -->
 

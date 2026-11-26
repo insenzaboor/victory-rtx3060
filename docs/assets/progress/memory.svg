@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="RAM and VRAM: 11% done">
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="RAM and VRAM: 10% done">
 <style>text{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;fill:#768390;font-size:12px} .t{fill:#768390;font-size:14px;font-weight:600}</style>
-<text class="t" x="10" y="20">RAM and VRAM</text><text x="550" y="20" text-anchor="end">11% done · 7 of 9 landed</text>
+<text class="t" x="10" y="20">RAM and VRAM</text><text x="550" y="20" text-anchor="end">10% done · 8 of 10 landed</text>
 <rect x="10" y="30" width="540" height="16" rx="8" fill="#8c959f" fill-opacity="0.25"/>
-<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="60.0" height="16" fill="#2ea043"/><rect x="70.0" y="30" width="360.0" height="16" fill="#3b82f6"/><rect x="430.0" y="30" width="120.0" height="16" fill="#6e7681"/></g>
-<text x="10" y="64">■ 1 done</text><text x="120" y="64" style="fill:#3b82f6">■ 6 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 2 planned</text>
+<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="54.0" height="16" fill="#2ea043"/><rect x="64.0" y="30" width="378.0" height="16" fill="#3b82f6"/><rect x="442.0" y="30" width="108.0" height="16" fill="#6e7681"/></g>
+<text x="10" y="64">■ 1 done</text><text x="120" y="64" style="fill:#3b82f6">■ 7 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 2 planned</text>
 </svg>

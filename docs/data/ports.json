@@ -732,6 +732,94 @@
       "switch": "VICTORY_PORT_DESCRIPTORS=0",
       "effect": "427,634 missed view records: late textures (queue q11)",
       "issue": 37
+    },
+    {
+      "id": "bake-wait",
+      "title": "Skin-bake draws wait for their pipeline",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "GromX0 9dfbe7c",
+      "commit": "f2e785ae",
+      "switch": "VICTORY_BAKE_WAIT (on)",
+      "effect": "A cold start could bake skin as nothing: missing faces, necks, arms",
+      "issue": 38
+    },
+    {
+      "id": "bvh-no-hit-key",
+      "title": "VICTORY_BVH_NO_HIT keyed into the shader cache",
+      "category": "shaders",
+      "status": "default-untested",
+      "source": "ours (found porting Op-lite 50bd954)",
+      "commit": "50e3cffa",
+      "switch": "VICTORY_BVH_NO_HIT",
+      "effect": "With a warm cache the switch did nothing; now it applies (one cold retranslation)",
+      "issue": 39
+    },
+    {
+      "id": "probe-rays",
+      "title": "Light-probe ray programs run (violet vegetation)",
+      "category": "rendering",
+      "status": "ready",
+      "source": "Op-lite 50bd954",
+      "commit": "50e3cffa",
+      "switch": "VICTORY_ACTIVATE_RAYS=1, VICTORY_RT_RESOLVE=1",
+      "effect": "Skipped probes kept leftover memory: violet palms and bushes (queue q13)",
+      "issue": 40
+    },
+    {
+      "id": "halves",
+      "title": "16-bit halves through table views keep their bits",
+      "category": "shaders",
+      "status": "ready",
+      "source": "pr0vId3nce aa67414 / fxceless #927",
+      "commit": "e95b92e1",
+      "switch": "VICTORY_HALVES=1",
+      "effect": "Face animation buffers read as 0: mouths do not move, face specks (queue q13)",
+      "issue": 41
+    },
+    {
+      "id": "sdwa-sext",
+      "title": "SDWA 16-bit sign extension; f16 interpolation modifiers",
+      "category": "shaders",
+      "status": "ready",
+      "source": "pr0vId3nce aa67414",
+      "commit": "0ff6698d",
+      "switch": "VICTORY_SDWA_SEXT=1, VICTORY_INTERP_F16_FIXES=1",
+      "effect": "A 16-bit -1 came out as 0x0000FFFF",
+      "issue": 42
+    },
+    {
+      "id": "cbv-tail-zero",
+      "title": "Constant-buffer tails past the title size zeroed",
+      "category": "rendering",
+      "status": "ready",
+      "source": "ours (adanaport 906e643 lead)",
+      "commit": "4abe4dc6",
+      "switch": "VICTORY_CBV_TAIL_ZERO=1",
+      "effect": "Leftover bytes in 256-byte views; candidate for too-bright hair (queue q14)",
+      "issue": 43
+    },
+    {
+      "id": "texture-max",
+      "title": "Texture size cap under VRAM pressure",
+      "category": "memory",
+      "status": "ready",
+      "source": "pr0vId3nce c392501",
+      "commit": "38e1a8f4",
+      "switch": "VICTORY_TEXTURE_MAX=<N>",
+      "effect": "Halves at 92% VRAM, quarters at 97%",
+      "issue": 44
+    },
+    {
+      "id": "block-handles",
+      "title": "Descriptor handles kept within their block (shader clean-up)",
+      "category": "stability",
+      "status": "ready",
+      "source": "GromX0 1465c1f",
+      "commit": "7e549889",
+      "switch": "VICTORY_BLOCK_HANDLES=1",
+      "effect": "Fixed AMD compiler crashes; none known on NVIDIA",
+      "issue": 45
     }
   ]
 }
