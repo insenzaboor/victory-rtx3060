@@ -413,6 +413,10 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// A direct dispatch spread across z, for [`State::host_word`] at its
+    /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
+    /// its words from the clamp through its command signature).
+    dispatch_spread: [u32; 2],
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -1330,7 +1334,10 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_DISPATCH_SPREAD {
+            return self.dispatch_spread[usize::from(dword != 0)];
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2846,7 +2853,18 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // More than 65,535 groups in x: spread across z for a program that
+        // takes the spread words (`USER_DISPATCH_SPREAD`).
+        let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
+        if row != 0 {
+            SPREAD[0].fetch_add(1, Ordering::Relaxed);
+        } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+            once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
+        }
+        self.dispatch_spread = [row, asked];
+        let bound = self.bind(list, p, true);
+        self.dispatch_spread = [0, 0];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -4049,10 +4067,19 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        // A dispatch of a program that takes the spread words: the clamp
+        // writes [row, asked x, x, y, z] records, run through a signature
+        // that sets the two words, then dispatches.
+        let spread = (kind == DISPATCH && p.compute)
+            .then(|| spreads(p))
             .flatten()
-        else {
+            .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
+        let is_spread = spread.is_some();
+        let Some(signature) = spread.or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -4130,7 +4157,9 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    // (A spread dispatch is never windowed: `windowed` is
+                    // false for dispatches.)
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -4195,6 +4224,9 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if is_spread {
+                SPREAD[1].fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4244,6 +4276,105 @@ mod thread_tests {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
+/// Dispatches spread across z since the frame line last took them: direct,
+/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
+pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The user-data root parameter of compute pipeline `p` whose program takes
+/// the spread words, and the index of the first in it (the second follows:
+/// one root-constant argument sets both); `None` for any other pipeline.
+fn spreads(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    if !spread_on() {
+        return None;
+    }
+    let stage = p.stages.first()?;
+    let (param, _) = stage.user_data?;
+    let kind = RootType::Other(victory_shader::emit::USER_DISPATCH_SPREAD);
+    let words = &stage.translated().host.user_data;
+    let first = words.iter().find(|u| u.root == kind && u.dword == 0)?.index;
+    words
+        .iter()
+        .any(|u| u.root == kind && u.dword == 1 && u.index == first + 1)
+        .then_some((param, first))
+}
+
+/// Whether dispatches past 65,535 groups in x are spread across z
+/// (`VICTORY_SPREAD`: on by default; `0` off, as before f93: clamped to
+/// 65,535; `alt`: twenty seconds with, twenty without, in turn, each change
+/// said in the log), to measure what the spread costs and shows within one
+/// run. Off, a translated program's words stay 0: it runs as dispatched.
+fn spread_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "dispatches past 65,535 groups are spread across z from now (VICTORY_SPREAD=alt): {}",
+                    if on { "ON" } else { "off, clamped to 65,535 as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The command signature of a spread dispatch: two root constants (row,
+/// asked x) at `index` of root parameter `param`, then the dispatch; 20
+/// bytes a record (the clamp's spread layout). Made once per root
+/// signature, parameter and index. (After upstream VIctory pull request
+/// #2312.)
+fn host_spread_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> Option<ID3D12CommandSignature> {
+    type Key = (usize, u32, u32);
+    static MADE: std::sync::Mutex<Vec<(Key, ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: index,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: two valid argument descriptions and a live root signature.
+    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, Some(root), &mut signature) };
+    if let Err(e) = result {
+        once!(error = %e, param, index, "spread command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
+    Some(signature)
+}
+
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
