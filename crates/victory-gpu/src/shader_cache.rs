@@ -139,6 +139,17 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Likewise, only when on: lane masks copied a dword at a time
+        // (`VICTORY_MASK_COPIES=1`), and the programs that may take the
+        // wave-wide form by hash (`VICTORY_WAVE_WIDE_ONLY`, [`translate_listed`]).
+        if victory_shader::structure::mask_copies() {
+            bytes.extend_from_slice(b"VICTORY_MASK_COPIES=1");
+        }
+        let listed = wave_wide_listed();
+        if !listed.is_empty() {
+            bytes.extend_from_slice(b"VICTORY_WAVE_WIDE_ONLY=");
+            bytes.extend_from_slice(listed.join(",").as_bytes());
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -147,6 +158,48 @@ fn build() -> [u8; 32] {
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()
+}
+
+/// The hashes of `VICTORY_WAVE_WIDE_ONLY` (comma separated, lower case;
+/// unset, empty or `none`: none): the programs [`translate_listed`] lets take
+/// the wave-wide form.
+fn wave_wide_listed() -> &'static [String] {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut list: Vec<String> = std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty() && h != "none")
+            .collect();
+        list.sort_unstable();
+        list.dedup();
+        if !list.is_empty() {
+            tracing::info!(programs = ?list, "these programs may take the wave-wide form (VICTORY_WAVE_WIDE_ONLY)");
+        }
+        list
+    })
+}
+
+/// A container translated with the wave-wide form of a wave64 compute
+/// program allowed when its hash is on `VICTORY_WAVE_WIDE_ONLY` (hashes or
+/// their starts as the log names shaders, 16 hex digits; off by default).
+/// `VICTORY_WAVE_WIDE=1` allows that form for every program; it is off by
+/// default because two programs that had just moved to it were in a
+/// submission that lost the card (runs 121-124, not proven the cause). After
+/// Th3C0D3R e4245f3c and commit a416e392 of pull request #823 (Felix2180),
+/// whose list is 5dc3b25986622949 and 6f225b641c5b0708 (the water's
+/// transmission volumetrics), 369cbe906ea72764 (particle visibility) and
+/// 2cc4c197ee29e291 (the reflection pass's tiling). For runs and the warm-up
+/// alike, which share the cache.
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    let list = wave_wide_listed();
+    let wide = !list.is_empty() && {
+        // (As the log names a shader: `pipeline::shader`.)
+        let hash = blake3::hash(c).to_hex();
+        list.iter().any(|h| hash.starts_with(h.as_str()))
+    };
+    victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -161,7 +214,7 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,
@@ -173,7 +226,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),

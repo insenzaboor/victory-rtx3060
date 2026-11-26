@@ -23,6 +23,21 @@ use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 
+/// Whether a wave64 lane mask copied one dword at a time (`s_mov_b32`
+/// chains, two neighbouring `s_mov_b32` of a pair: how a pair the compiler
+/// parked in VGPR lanes comes back) is the mask it was copied from
+/// (`VICTORY_MASK_COPIES=1`; off by default, on in tests). Fork pull request
+/// #1112, after Th3C0D3R e4245f3c. Without it such a pair is an unknown
+/// value named by its low dword: lowering refuses what reads it, or (for a
+/// pair whose low dword it has a value for) takes lanes 32-63 from the dword
+/// beside that one. It changes the translation of programs that have such
+/// copies, so it is part of the shader cache's key when on; making it the
+/// default means bumping [`crate::TRANSLATOR_VERSION`].
+pub fn mask_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_COPIES").is_some_and(|v| v == "1"))
+}
+
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bool(u32);
@@ -908,32 +923,57 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time, which the spill pass turns into scalar moves: the
+        // pair is the mask it was copied from when both dwords still come
+        // from that known mask, in their order (fork pull request #1112,
+        // after Th3C0D3R e4245f3c).
+        if self.p.wave64 && mask_copies() {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                let (m, derived) = match (lo, hi) {
+                    (Some(at), Some(hi)) if at == hi => {
+                        let m = def(lo).and_then(|i| self.sop(i)).and_then(|r| r.dst).map(|d| d.1);
+                        (m, exec_write(lo, k.0) || exec_write(Some(hi), k.1))
+                    }
+                    // Halves written apart by two neighbouring `s_mov_b32`
+                    // of a source pair: that pair's mask, if it names no
+                    // value the pass does not know (#1112).
+                    _ => {
+                        let copied = self.moved_pair(k).filter(|_| self.p.wave64 && mask_copies()).and_then(|source| {
+                            let (m, derived) = self.mask(source);
+                            self.b
+                                .support(m)
+                                .iter()
+                                .all(|a| !matches!(a, Atom::Opaque(_)))
+                                .then_some((m, derived))
+                        });
+                        copied.map_or_else(|| (None, exec_write(lo, k.0) || exec_write(hi, k.1)), |(m, derived)| (Some(m), derived))
+                    }
+                };
                 // shortcut: the atom names the pair by its low dword, and
                 // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // written apart that are no known pair's copy (above) lanes
+                // 32-63 are wrong unless lowering has no value for the low
+                // dword (EXEC, compares) and refuses.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -948,6 +988,53 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The source pair of two neighbouring dword moves (`s_mov_b32` of
+    /// `s[n]` and `s[n + 1]` into `s[d]` and `s[d + 1]`) in one block that
+    /// wrote the pair `k` (#1112).
+    fn moved_pair(&self, k: Key) -> Option<Key> {
+        let moved = |v| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &self.p.blocks[b].insts[i];
+            if inst.name() != "s_mov_b32" {
+                return None;
+            }
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: dst, .. }),
+                src,
+                ..
+            } = &inst.fields
+            else {
+                return None;
+            };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else {
+                return None;
+            };
+            if inst.write(Reg::S(*dst)) != Some(v) {
+                return None;
+            }
+            Some((b, *dst, *src, inst.read(Reg::S(*src))?))
+        };
+        let (lb, ld, ls, lv) = moved(k.0)?;
+        let (hb, hd, hs, hv) = moved(k.1)?;
+        (lb == hb && ld.checked_add(1) == Some(hd) && ls.checked_add(1) == Some(hs)).then_some((lv, hv))
+    }
+
+    /// The value `value` is a copy of through a chain of `s_mov_b32` from a
+    /// scalar register (#1112).
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1729,6 +1816,73 @@ mod tests {
                 Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)),
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
+        }
+    }
+
+    /// Fork pull request #1112 (after Th3C0D3R e4245f3c): EXEC copied away
+    /// and back one dword at a time is EXEC still.
+    #[test]
+    fn paired_dword_moves_keep_exec_mask_provenance() {
+        let p = build(
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xBE86_0304, // s_mov_b32 s6, s4
+                0xBE87_0305, // s_mov_b32 s7, s5
+                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    /// #1112: dword moves of values the pass does not know stay unknown.
+    #[test]
+    fn paired_dword_moves_do_not_make_unknown_values_into_masks() {
+        let p = build(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0301, // s_mov_b32 s5, s1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let guard = s.guards[0][3].expect("unknown mask still guards the vector op");
+        assert!(s.bools.support(guard).iter().any(|a| matches!(a, Atom::Opaque(_))));
+    }
+
+    /// #1112: a wave64 compare copied one dword at a time on one side of a
+    /// branch is the compare after the join only if both dwords are its own.
+    #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
         }
     }
 
