@@ -110,6 +110,11 @@ except ImportError:
     print("matplotlib missing: chart not rebuilt")
 
 
+def issue_link(i):
+    n = i.get("issue")
+    return f"[#{n}]({REPO}/issues/{n})" if n else ""
+
+
 def commit_link(i):
     c = i.get("commit")
     return f"[`{c}`]({REPO}/commit/{c})" if c else ""
@@ -132,10 +137,10 @@ for s in ORDER:
 for cat, label in ports["categories"].items():
     group = sorted([i for i in items if i["category"] == cat], key=lambda i: ORDER.index(i["status"]))
     lines += ["", f"## {label}", "", f"![{cat}](assets/progress/{cat}.svg)", "",
-              "| Item | Status | Source | Switch | Effect | Commit |", "|---|---|---|---|---|---|"]
+              "| Item | Status | Source | Switch | Effect | Commit | Issue |", "|---|---|---|---|---|---|---|"]
     for i in group:
         sw = f"`{i['switch']}`" if i.get("switch") else ""
-        lines.append(f"| {i['title']} | {BADGE[i['status']]} | {i['source']} | {sw} | {i.get('effect', '')} | {commit_link(i)} |")
+        lines.append(f"| {i['title']} | {BADGE[i['status']]} | {i['source']} | {sw} | {i.get('effect', '')} | {commit_link(i)} | {issue_link(i)} |")
 write(os.path.join(ROOT, "docs", "TRACKER.md"), "\n".join(lines) + "\n")
 
 # README progress block.

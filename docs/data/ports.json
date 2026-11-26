@@ -18,66 +18,544 @@
     "tooling": "Measurement and automation"
   },
   "items": [
-    {"id": "card-windows", "title": "Title windows and small buffers in VRAM", "category": "performance", "status": "shipped", "source": "ours", "switch": "VICTORY_CARD_WINDOWS_MB=2304, VICTORY_CARD_BUFFERS_MB=1024", "effect": "Card no longer reads title memory over PCIe: ~300 -> ~130 ms (run 9 -> 10); 2304 MB moved ~0.75 GB off RAM (run 36)"},
-    {"id": "shared-heaps", "title": "Host buffers placed in heaps made resident once", "category": "performance", "status": "shipped", "source": "ours", "commit": "d147bd9a", "switch": "VICTORY_SHARED_HEAPS=16", "effect": "102,900 committed buffers + MakeResident per run -> ~105/s; 16 MB heaps cut fragmentation waste 2.8 -> 0.9 GB"},
-    {"id": "card-heaps", "title": "Card buffers placed in heaps (reused pieces resent whole)", "category": "performance", "status": "shipped", "source": "ours", "commit": "0d7ac684", "switch": "VICTORY_CARD_HEAPS=64", "effect": "Part of run 36: 153 -> 138 ms at 3k draws"},
-    {"id": "card-dirty-list", "title": "card_dirty looks only at copies noted as changed", "category": "performance", "status": "shipped", "source": "ours", "commit": "5caad0cb", "switch": "VICTORY_CARD_DIRTY_LIST=1", "effect": "Removes an atomic upgrade + swap per copy per submission (was 12% of the submit thread)"},
-    {"id": "struct-in-place", "title": "Structured views stay on their buffer's copy", "category": "performance", "status": "shipped", "source": "deynesdev 175ebc49", "commit": "32d87b9a", "switch": "VICTORY_STRUCT_IN_PLACE=1", "effect": "Avoids ~19k extra copy buffers; renders correctly (run 37)"},
-    {"id": "port1", "title": "Renderer port 1: constants heap read in place", "category": "performance", "status": "shipped", "source": "avatarmanz", "switch": "VICTORY_PORT_CONSTANTS=1", "effect": "No uploads or fills of the 174 MB constants heap"},
-    {"id": "port2", "title": "Renderer port 2: descriptor stores report their slots", "category": "performance", "status": "shipped", "source": "avatarmanz", "switch": "VICTORY_PORT_DESCRIPTORS=1", "effect": "Replaces a ~600,000-slot scan a frame"},
-    {"id": "port6", "title": "Renderer port 6: shared guard lock, per-block claims", "category": "performance", "status": "shipped", "source": "avatarmanz", "switch": "VICTORY_PORT_GUARD=1", "effect": "Title threads' waits 29 -> ~2 ms a frame (upstream)"},
-    {"id": "logger", "title": "Non-blocking logger", "category": "performance", "status": "shipped", "source": "ours", "commit": "e72f733d", "effect": "Logger lock stalls removed from frame chains"},
-    {"id": "affinity", "title": "Title thread affinity widened to all cores", "category": "performance", "status": "shipped", "source": "ours", "commit": "76faf5f2", "effect": "Console masks pinned title workers to 4 cores; run 24 best of its day"},
-    {"id": "bcpack", "title": "BCPack decoder 1.56x", "category": "performance", "status": "shipped", "source": "ours", "commit": "15eea45d", "effect": "27 -> 43 MB/s per thread, bit-exact"},
-    {"id": "nocopy-refresh", "title": "Lock-free fast path for refreshes that copy nothing", "category": "performance", "status": "shipped", "source": "XaviFortes fdfb306d", "commit": "4884d2a7", "effect": "~15k of ~16k refreshes a frame copy nothing; part of run 48/49 gains"},
-    {"id": "map-threads", "title": "Page mapping on 8 threads (kept, measured)", "category": "performance", "status": "shipped", "source": "ours", "effect": "A/B run 48: 30.9 vs 37.7 ms per 1k draws with 1 thread"},
-    {"id": "heap-gpu-start", "title": "Descriptor heap GPU start cached", "category": "performance", "status": "default-untested", "source": "aleksesipenko 41d8a1e", "commit": "31e16a63", "effect": "Small per-draw saving"},
-    {"id": "release-build", "title": "Plain release build (no diagnostics)", "category": "performance", "status": "ready", "source": "cool_fox / CGBJ", "commit": "ca28c339", "effect": "Builds clean; autopilot keys now work in release builds"},
-    {"id": "lookup-cache", "title": "Per-thread lookup cache for host copies", "category": "performance", "status": "ready", "source": "fxceless 32be36d + bc6ee68", "commit": "e1ac4e47", "switch": "VICTORY_LOOKUP_CACHE=1", "effect": "Claimed -8 to -15 ms/frame on RTX 4070"},
-    {"id": "apu-async", "title": "Audio decoded on a worker thread", "category": "performance", "status": "ready", "source": "ours", "commit": "c6ed52d8", "switch": "VICTORY_APU_ASYNC=1", "effect": "Opus decode was ~5% of title thread time (run 52 profile)"},
-    {"id": "join-parts-16", "title": "Joined submissions 16 parts / 96 lists", "category": "performance", "status": "planned", "source": "Maykzera (RTX 3060)", "switch": "VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96", "effect": "1% low +18%, P99 -15% on an RTX 3060"},
-    {"id": "port5", "title": "Renderer port 5: constant buffers read in place", "category": "performance", "status": "not-applicable", "source": "avatarmanz", "switch": "VICTORY_PORT_CBV", "effect": "Needs a 4.2M-view heap; NVIDIA caps heaps at 1M"},
-    {"id": "port7", "title": "Renderer port 7: heap journal", "category": "performance", "status": "no-gain", "source": "avatarmanz", "switch": "VICTORY_PORT_JOURNAL", "effect": "A/B run 49: 24.4 vs 24.8 ms per 1k draws"},
-    {"id": "settle-room", "title": "Settle room", "category": "performance", "status": "no-gain", "source": "fxceless", "switch": "VICTORY_SETTLE_ROOM", "effect": "A/B run 49: no difference"},
-    {"id": "placed-order", "title": "Placed order", "category": "performance", "status": "no-gain", "source": "Vice-Tay", "switch": "VICTORY_PLACED_ORDER", "effect": "A/B run 48: 39.0 vs 37.7 ms per 1k draws (worse)"},
-    {"id": "table-stages", "title": "Draw stages share fresh tables", "category": "performance", "status": "no-gain", "source": "fxceless 5d659e0c", "commit": "5e8cea34", "switch": "VICTORY_TABLE_STAGES", "effect": "A/B run 37: no difference"},
-    {"id": "stride-shadow", "title": "Stride shadow cache + coalesced unguard", "category": "performance", "status": "no-gain", "source": "XaviFortes 61477a81 / 8abd3671", "switch": "VICTORY_STRIDE_SHADOW, VICTORY_UNGUARD_RUNS", "effect": "Run 50: 26.0 vs 25.2 ms per 1k draws"},
-    {"id": "view-threads", "title": "8 descriptor view threads", "category": "performance", "status": "no-gain", "source": "ours", "switch": "VICTORY_VIEW_THREADS=8", "effect": "Run 51: 28.4 vs 25.2 ms per 1k draws"},
-    {"id": "dynamic-stripes", "title": "Dynamic descriptor slots in striped locks", "category": "performance", "status": "no-gain", "source": "ours", "commit": "f164ca3b", "switch": "VICTORY_DYNAMIC_STRIPES", "effect": "Loads 147-151 s instead of ~80 s"},
-    {"id": "join-parts", "title": "Join parts (Spook)", "category": "performance", "status": "no-gain", "source": "SPOOKEXE", "switch": "VICTORY_JOIN_PARTS", "effect": "A/B run 33: noisy, no clear gain"},
-    {"id": "skip-rt", "title": "Skip ray-tracing passes", "category": "performance", "status": "no-gain", "source": "LoverCatys / deynesdev", "switch": "VICTORY_SKIP_RT", "effect": "Run 31: ~206 ms (worse)"},
-
-    {"id": "residency", "title": "Residency budgets (pareto-residency)", "category": "memory", "status": "shipped", "source": "cool_fox", "switch": "VICTORY_RESIDENCY=1", "effect": "Admission control against out-of-memory"},
-    {"id": "levels-on-demand", "title": "Texture mip levels get VRAM on demand", "category": "memory", "status": "ready", "source": "ours (a26859fc) / used by CGBJ", "switch": "VICTORY_LEVELS_ON_DEMAND=1", "effect": "-3.1 GB VRAM allocated on an RTX 4070"},
-    {"id": "coolfox-idle", "title": "Idle times for staging/windows, read-buffer cap", "category": "memory", "status": "ready", "source": "cool_fox cf3f615", "commit": "a01ca023", "switch": "VICTORY_STAGING_IDLE_MS, VICTORY_WINDOW_IDLE_MS, VICTORY_READ_KEEP_MB", "effect": "Upstream: up to 40-46 GB kept alive in long runs"},
-    {"id": "coolfox-spare", "title": "Caps on spare scratch and send memory", "category": "memory", "status": "ready", "source": "cool_fox 39318a8", "commit": "6bc60929", "switch": "VICTORY_SCRATCH_SPARE_MB, VICTORY_SEND_SPARE_MB", "effect": "Up to ~1.8 GB of unused upload memory"},
-    {"id": "list-memory", "title": "Cap idle host lists (5.8-10.9 GB grew while lists were made)", "category": "memory", "status": "planned", "source": "ours", "switch": "VICTORY_ALLOC_TRIM", "effect": "Lead from run 51/52 memory lines"},
-    {"id": "card-buffers-2g", "title": "Card buffer cap 2 GB", "category": "memory", "status": "planned", "source": "grimygunnz / Rubenpannen", "switch": "VICTORY_CARD_BUFFERS_MB=2048", "effect": "Upstream 327 -> 61 ms on a 3070 Ti; our runs 38/38b hit the load hang, retest"},
-
-    {"id": "upscaler", "title": "Title's own upscaler instead of FSR4's fallback", "category": "rendering", "status": "default-untested", "source": "chabrune 53057554", "switch": "VICTORY_UPSCALER=6", "effect": "FSR4's fallback turns dithering into dots (hair, shadow edges)"},
-    {"id": "popin-order", "title": "In-place indirect arguments prepared alone, right before they run", "category": "rendering", "status": "default-untested", "source": "avatarmanz 631400f..7ab13ed", "commit": "d005b299", "switch": "VICTORY_PORT_CONSTANTS_ORDER (on)", "effect": "Trees and palms no longer drop out (upstream runs pop-14..17)"},
-    {"id": "th3-fixes", "title": "Released heaps forget slots; textures without room retried", "category": "rendering", "status": "shipped", "source": "Th3C0D3R e4245f3c", "commit": "d11c364c", "effect": "Correctness fixes from community pull requests"},
-    {"id": "early-tables", "title": "Descriptor tables released when their work finishes", "category": "rendering", "status": "ready", "source": "ours (ae6b0bab) / CGBJ default", "switch": "VICTORY_EARLY_TABLES=1", "effect": "Refused tables 2,200/frame -> 0; dropped draws come back"},
-    {"id": "indirect-rest", "title": "One oversized indirect record no longer empties the rest", "category": "rendering", "status": "ready", "source": "CGBJ default", "switch": "VICTORY_INDIRECT_REST=0", "effect": "Picture completeness"},
-    {"id": "belobug-flicker", "title": "Title textures uploaded in the submission prelude", "category": "rendering", "status": "in-progress", "source": "Belobug 5d6bd841", "effect": "Fixes frame-order flickering (Belobug)"},
-    {"id": "belobug-ambient", "title": "Ambient light follows the sky; least reflection light", "category": "rendering", "status": "in-progress", "source": "Belobug main (705a2d09, e48eb83e, c3bd5612)", "effect": "Interiors too dark/bright"},
-    {"id": "texture-changing", "title": "Changing textures rechecked every frame", "category": "rendering", "status": "ready", "source": "ApexIV da3b0c2", "commit": "6b50c44d", "switch": "VICTORY_TEXTURE_CHANGING=1", "effect": "Videos/screens no longer 12-40 frames late"},
-    {"id": "pipeline-parts", "title": "Console-precompiled pipelines (device slot 0x218)", "category": "rendering", "status": "no-gain", "source": "chabrune 84899fde", "commit": "43e832c3", "switch": "VICTORY_PIPELINE_PARTS", "effect": "Used only in the first 2 s; implementing them made pictures worse upstream"},
-
-    {"id": "tracker-unlock", "title": "Title bug: frame tracker present leaks its lock (load hang)", "category": "stability", "status": "shipped", "source": "ours", "commit": "dcb32bb1", "switch": "VICTORY_TRACKER_UNLOCK (on)", "effect": "14 of 17 launches hung once loads got faster; 6-byte byte-checked patch fixes it"},
-    {"id": "meter-occluded", "title": "Frame meter counts occluded presents", "category": "stability", "status": "shipped", "source": "ours", "commit": "6f014818", "effect": "Autopilot no longer mistakes loaded runs for hangs"},
-    {"id": "fence-sweep", "title": "Fence sweep for the title's GPU watchdog", "category": "stability", "status": "shipped", "source": "ours", "commit": "7c4c76a3", "switch": "VICTORY_FENCE_SWEEP", "effect": "Crashes at title+0x23cf683 gone"},
-    {"id": "always-active", "title": "Title always active (focus/minimise)", "category": "stability", "status": "shipped", "source": "ours", "commit": "1a25173a", "switch": "VICTORY_ALWAYS_ACTIVE", "effect": "Occluded-window hangs"},
-
-    {"id": "loose-lds", "title": "Loose-LDS forms of wave64 programs on 32-lane GPUs", "category": "shaders", "status": "ready", "source": "deynesdev fab7fda", "commit": "d157b329", "switch": "VICTORY_WAVE_LDS_LOOSE=1", "effect": "Offline probe: all 27 wave64-only shaders translate (particles, decal trails, water volumetrics, hair shadows)"},
-    {"id": "wave32-fixes", "title": "ds_bpermute within halves, 32 KiB LDS kept to", "category": "shaders", "status": "ready", "source": "deynesdev fab7fda", "commit": "d157b329", "switch": "VICTORY_WAVE32_FIXES=1", "effect": "Exact pieces of the same commit"},
-    {"id": "mask-copies", "title": "Split 64-lane masks treated as the mask", "category": "shaders", "status": "ready", "source": "Th3C0D3R #1112", "commit": "2cf371ee", "switch": "VICTORY_MASK_COPIES=1", "effect": "Translator correctness"},
-    {"id": "geometry-shaders", "title": "GS_VoxelizeGeneric (195 geometry shaders)", "category": "shaders", "status": "not-applicable", "source": "design: MiamiGame/XTP", "commit": "645819a2", "effect": "Never bound in 62 runs; design doc in docs/geometry-shaders.md"},
-
-    {"id": "autopilot", "title": "Autopilot: menus, roaming walk, screenshots, stuck detection", "category": "tooling", "status": "shipped", "source": "ours", "effect": "Hands-off measured runs"},
-    {"id": "ab-switching", "title": "Runtime A/B switching of switches", "category": "tooling", "status": "shipped", "source": "ours", "switch": "VICTORY_AB", "effect": "Both sides measured in the same scene"},
-    {"id": "timeline", "title": "Timeline traces with critical-path breakdown", "category": "tooling", "status": "shipped", "source": "ours", "switch": "VICTORY_TIMELINE", "effect": "Found every bottleneck above"},
-    {"id": "ram-monitor", "title": "RAM/commit monitor that kills the game before the PC pages to death", "category": "tooling", "status": "shipped", "source": "ours", "effect": "Remote sessions survived every out-of-memory run"},
-    {"id": "hud", "title": "On-screen fps / frame-time panel", "category": "tooling", "status": "in-progress", "source": "Belobug e9428969", "switch": "VICTORY_PANEL", "effect": ""}
+    {
+      "id": "card-windows",
+      "title": "Title windows and small buffers in VRAM",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "switch": "VICTORY_CARD_WINDOWS_MB=2304, VICTORY_CARD_BUFFERS_MB=1024",
+      "effect": "Card no longer reads title memory over PCIe: ~300 -> ~130 ms (run 9 -> 10); 2304 MB moved ~0.75 GB off RAM (run 36)"
+    },
+    {
+      "id": "shared-heaps",
+      "title": "Host buffers placed in heaps made resident once",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "d147bd9a",
+      "switch": "VICTORY_SHARED_HEAPS=16",
+      "effect": "102,900 committed buffers + MakeResident per run -> ~105/s; 16 MB heaps cut fragmentation waste 2.8 -> 0.9 GB"
+    },
+    {
+      "id": "card-heaps",
+      "title": "Card buffers placed in heaps (reused pieces resent whole)",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "0d7ac684",
+      "switch": "VICTORY_CARD_HEAPS=64",
+      "effect": "Part of run 36: 153 -> 138 ms at 3k draws"
+    },
+    {
+      "id": "card-dirty-list",
+      "title": "card_dirty looks only at copies noted as changed",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "5caad0cb",
+      "switch": "VICTORY_CARD_DIRTY_LIST=1",
+      "effect": "Removes an atomic upgrade + swap per copy per submission (was 12% of the submit thread)"
+    },
+    {
+      "id": "struct-in-place",
+      "title": "Structured views stay on their buffer's copy",
+      "category": "performance",
+      "status": "shipped",
+      "source": "deynesdev 175ebc49",
+      "commit": "32d87b9a",
+      "switch": "VICTORY_STRUCT_IN_PLACE=1",
+      "effect": "Avoids ~19k extra copy buffers; renders correctly (run 37)"
+    },
+    {
+      "id": "port1",
+      "title": "Renderer port 1: constants heap read in place",
+      "category": "performance",
+      "status": "shipped",
+      "source": "avatarmanz",
+      "switch": "VICTORY_PORT_CONSTANTS=1",
+      "effect": "No uploads or fills of the 174 MB constants heap"
+    },
+    {
+      "id": "port2",
+      "title": "Renderer port 2: descriptor stores report their slots",
+      "category": "performance",
+      "status": "shipped",
+      "source": "avatarmanz",
+      "switch": "VICTORY_PORT_DESCRIPTORS=1",
+      "effect": "Replaces a ~600,000-slot scan a frame"
+    },
+    {
+      "id": "port6",
+      "title": "Renderer port 6: shared guard lock, per-block claims",
+      "category": "performance",
+      "status": "shipped",
+      "source": "avatarmanz",
+      "switch": "VICTORY_PORT_GUARD=1",
+      "effect": "Title threads' waits 29 -> ~2 ms a frame (upstream)"
+    },
+    {
+      "id": "logger",
+      "title": "Non-blocking logger",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "e72f733d",
+      "effect": "Logger lock stalls removed from frame chains"
+    },
+    {
+      "id": "affinity",
+      "title": "Title thread affinity widened to all cores",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "76faf5f2",
+      "effect": "Console masks pinned title workers to 4 cores; run 24 best of its day"
+    },
+    {
+      "id": "bcpack",
+      "title": "BCPack decoder 1.56x",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "15eea45d",
+      "effect": "27 -> 43 MB/s per thread, bit-exact"
+    },
+    {
+      "id": "nocopy-refresh",
+      "title": "Lock-free fast path for refreshes that copy nothing",
+      "category": "performance",
+      "status": "shipped",
+      "source": "XaviFortes fdfb306d",
+      "commit": "4884d2a7",
+      "effect": "~15k of ~16k refreshes a frame copy nothing; part of run 48/49 gains"
+    },
+    {
+      "id": "map-threads",
+      "title": "Page mapping on 8 threads (kept, measured)",
+      "category": "performance",
+      "status": "shipped",
+      "source": "ours",
+      "effect": "A/B run 48: 30.9 vs 37.7 ms per 1k draws with 1 thread"
+    },
+    {
+      "id": "heap-gpu-start",
+      "title": "Descriptor heap GPU start cached",
+      "category": "performance",
+      "status": "default-untested",
+      "source": "aleksesipenko 41d8a1e",
+      "commit": "31e16a63",
+      "effect": "Small per-draw saving",
+      "issue": 1
+    },
+    {
+      "id": "release-build",
+      "title": "Plain release build (no diagnostics)",
+      "category": "performance",
+      "status": "ready",
+      "source": "cool_fox / CGBJ",
+      "commit": "ca28c339",
+      "effect": "Builds clean; autopilot keys now work in release builds",
+      "issue": 2
+    },
+    {
+      "id": "lookup-cache",
+      "title": "Per-thread lookup cache for host copies",
+      "category": "performance",
+      "status": "ready",
+      "source": "fxceless 32be36d + bc6ee68",
+      "commit": "e1ac4e47",
+      "switch": "VICTORY_LOOKUP_CACHE=1",
+      "effect": "Claimed -8 to -15 ms/frame on RTX 4070",
+      "issue": 3
+    },
+    {
+      "id": "apu-async",
+      "title": "Audio decoded on a worker thread",
+      "category": "performance",
+      "status": "ready",
+      "source": "ours",
+      "commit": "c6ed52d8",
+      "switch": "VICTORY_APU_ASYNC=1",
+      "effect": "Opus decode was ~5% of title thread time (run 52 profile)",
+      "issue": 4
+    },
+    {
+      "id": "join-parts-16",
+      "title": "Joined submissions 16 parts / 96 lists",
+      "category": "performance",
+      "status": "planned",
+      "source": "Maykzera (RTX 3060)",
+      "switch": "VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96",
+      "effect": "1% low +18%, P99 -15% on an RTX 3060",
+      "issue": 5
+    },
+    {
+      "id": "port5",
+      "title": "Renderer port 5: constant buffers read in place",
+      "category": "performance",
+      "status": "not-applicable",
+      "source": "avatarmanz",
+      "switch": "VICTORY_PORT_CBV",
+      "effect": "Needs a 4.2M-view heap; NVIDIA caps heaps at 1M"
+    },
+    {
+      "id": "port7",
+      "title": "Renderer port 7: heap journal",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "avatarmanz",
+      "switch": "VICTORY_PORT_JOURNAL",
+      "effect": "A/B run 49: 24.4 vs 24.8 ms per 1k draws"
+    },
+    {
+      "id": "settle-room",
+      "title": "Settle room",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "fxceless",
+      "switch": "VICTORY_SETTLE_ROOM",
+      "effect": "A/B run 49: no difference"
+    },
+    {
+      "id": "placed-order",
+      "title": "Placed order",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "Vice-Tay",
+      "switch": "VICTORY_PLACED_ORDER",
+      "effect": "A/B run 48: 39.0 vs 37.7 ms per 1k draws (worse)"
+    },
+    {
+      "id": "table-stages",
+      "title": "Draw stages share fresh tables",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "fxceless 5d659e0c",
+      "commit": "5e8cea34",
+      "switch": "VICTORY_TABLE_STAGES",
+      "effect": "A/B run 37: no difference"
+    },
+    {
+      "id": "stride-shadow",
+      "title": "Stride shadow cache + coalesced unguard",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "XaviFortes 61477a81 / 8abd3671",
+      "switch": "VICTORY_STRIDE_SHADOW, VICTORY_UNGUARD_RUNS",
+      "effect": "Run 50: 26.0 vs 25.2 ms per 1k draws"
+    },
+    {
+      "id": "view-threads",
+      "title": "8 descriptor view threads",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "ours",
+      "switch": "VICTORY_VIEW_THREADS=8",
+      "effect": "Run 51: 28.4 vs 25.2 ms per 1k draws"
+    },
+    {
+      "id": "dynamic-stripes",
+      "title": "Dynamic descriptor slots in striped locks",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "ours",
+      "commit": "f164ca3b",
+      "switch": "VICTORY_DYNAMIC_STRIPES",
+      "effect": "Loads 147-151 s instead of ~80 s"
+    },
+    {
+      "id": "join-parts",
+      "title": "Join parts (Spook)",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "SPOOKEXE",
+      "switch": "VICTORY_JOIN_PARTS",
+      "effect": "A/B run 33: noisy, no clear gain"
+    },
+    {
+      "id": "skip-rt",
+      "title": "Skip ray-tracing passes",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "LoverCatys / deynesdev",
+      "switch": "VICTORY_SKIP_RT",
+      "effect": "Run 31: ~206 ms (worse)"
+    },
+    {
+      "id": "residency",
+      "title": "Residency budgets (pareto-residency)",
+      "category": "memory",
+      "status": "shipped",
+      "source": "cool_fox",
+      "switch": "VICTORY_RESIDENCY=1",
+      "effect": "Admission control against out-of-memory"
+    },
+    {
+      "id": "levels-on-demand",
+      "title": "Texture mip levels get VRAM on demand",
+      "category": "memory",
+      "status": "ready",
+      "source": "ours (a26859fc) / used by CGBJ",
+      "switch": "VICTORY_LEVELS_ON_DEMAND=1",
+      "effect": "-3.1 GB VRAM allocated on an RTX 4070",
+      "issue": 6
+    },
+    {
+      "id": "coolfox-idle",
+      "title": "Idle times for staging/windows, read-buffer cap",
+      "category": "memory",
+      "status": "ready",
+      "source": "cool_fox cf3f615",
+      "commit": "a01ca023",
+      "switch": "VICTORY_STAGING_IDLE_MS, VICTORY_WINDOW_IDLE_MS, VICTORY_READ_KEEP_MB",
+      "effect": "Upstream: up to 40-46 GB kept alive in long runs",
+      "issue": 7
+    },
+    {
+      "id": "coolfox-spare",
+      "title": "Caps on spare scratch and send memory",
+      "category": "memory",
+      "status": "ready",
+      "source": "cool_fox 39318a8",
+      "commit": "6bc60929",
+      "switch": "VICTORY_SCRATCH_SPARE_MB, VICTORY_SEND_SPARE_MB",
+      "effect": "Up to ~1.8 GB of unused upload memory",
+      "issue": 8
+    },
+    {
+      "id": "list-memory",
+      "title": "Cap idle host lists (5.8-10.9 GB grew while lists were made)",
+      "category": "memory",
+      "status": "planned",
+      "source": "ours",
+      "switch": "VICTORY_ALLOC_TRIM",
+      "effect": "Lead from run 51/52 memory lines",
+      "issue": 9
+    },
+    {
+      "id": "card-buffers-2g",
+      "title": "Card buffer cap 2 GB",
+      "category": "memory",
+      "status": "planned",
+      "source": "grimygunnz / Rubenpannen",
+      "switch": "VICTORY_CARD_BUFFERS_MB=2048",
+      "effect": "Upstream 327 -> 61 ms on a 3070 Ti; our runs 38/38b hit the load hang, retest",
+      "issue": 10
+    },
+    {
+      "id": "upscaler",
+      "title": "Title's own upscaler instead of FSR4's fallback",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "chabrune 53057554",
+      "switch": "VICTORY_UPSCALER=6",
+      "effect": "FSR4's fallback turns dithering into dots (hair, shadow edges)",
+      "issue": 11
+    },
+    {
+      "id": "popin-order",
+      "title": "In-place indirect arguments prepared alone, right before they run",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "avatarmanz 631400f..7ab13ed",
+      "commit": "d005b299",
+      "switch": "VICTORY_PORT_CONSTANTS_ORDER (on)",
+      "effect": "Trees and palms no longer drop out (upstream runs pop-14..17)",
+      "issue": 12
+    },
+    {
+      "id": "th3-fixes",
+      "title": "Released heaps forget slots; textures without room retried",
+      "category": "rendering",
+      "status": "shipped",
+      "source": "Th3C0D3R e4245f3c",
+      "commit": "d11c364c",
+      "effect": "Correctness fixes from community pull requests"
+    },
+    {
+      "id": "early-tables",
+      "title": "Descriptor tables released when their work finishes",
+      "category": "rendering",
+      "status": "ready",
+      "source": "ours (ae6b0bab) / CGBJ default",
+      "switch": "VICTORY_EARLY_TABLES=1",
+      "effect": "Refused tables 2,200/frame -> 0; dropped draws come back",
+      "issue": 13
+    },
+    {
+      "id": "indirect-rest",
+      "title": "One oversized indirect record no longer empties the rest",
+      "category": "rendering",
+      "status": "ready",
+      "source": "CGBJ default",
+      "switch": "VICTORY_INDIRECT_REST=0",
+      "effect": "Picture completeness",
+      "issue": 14
+    },
+    {
+      "id": "belobug-flicker",
+      "title": "Title textures uploaded in the submission prelude",
+      "category": "rendering",
+      "status": "in-progress",
+      "source": "Belobug 5d6bd841",
+      "effect": "Fixes frame-order flickering (Belobug)",
+      "issue": 15
+    },
+    {
+      "id": "belobug-ambient",
+      "title": "Ambient light follows the sky; least reflection light",
+      "category": "rendering",
+      "status": "in-progress",
+      "source": "Belobug main (705a2d09, e48eb83e, c3bd5612)",
+      "effect": "Interiors too dark/bright",
+      "issue": 16
+    },
+    {
+      "id": "texture-changing",
+      "title": "Changing textures rechecked every frame",
+      "category": "rendering",
+      "status": "ready",
+      "source": "ApexIV da3b0c2",
+      "commit": "6b50c44d",
+      "switch": "VICTORY_TEXTURE_CHANGING=1",
+      "effect": "Videos/screens no longer 12-40 frames late",
+      "issue": 17
+    },
+    {
+      "id": "pipeline-parts",
+      "title": "Console-precompiled pipelines (device slot 0x218)",
+      "category": "rendering",
+      "status": "no-gain",
+      "source": "chabrune 84899fde",
+      "commit": "43e832c3",
+      "switch": "VICTORY_PIPELINE_PARTS",
+      "effect": "Used only in the first 2 s; implementing them made pictures worse upstream"
+    },
+    {
+      "id": "tracker-unlock",
+      "title": "Title bug: frame tracker present leaks its lock (load hang)",
+      "category": "stability",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "dcb32bb1",
+      "switch": "VICTORY_TRACKER_UNLOCK (on)",
+      "effect": "14 of 17 launches hung once loads got faster; 6-byte byte-checked patch fixes it"
+    },
+    {
+      "id": "meter-occluded",
+      "title": "Frame meter counts occluded presents",
+      "category": "stability",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "6f014818",
+      "effect": "Autopilot no longer mistakes loaded runs for hangs"
+    },
+    {
+      "id": "fence-sweep",
+      "title": "Fence sweep for the title's GPU watchdog",
+      "category": "stability",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "7c4c76a3",
+      "switch": "VICTORY_FENCE_SWEEP",
+      "effect": "Crashes at title+0x23cf683 gone"
+    },
+    {
+      "id": "always-active",
+      "title": "Title always active (focus/minimise)",
+      "category": "stability",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "1a25173a",
+      "switch": "VICTORY_ALWAYS_ACTIVE",
+      "effect": "Occluded-window hangs"
+    },
+    {
+      "id": "loose-lds",
+      "title": "Loose-LDS forms of wave64 programs on 32-lane GPUs",
+      "category": "shaders",
+      "status": "ready",
+      "source": "deynesdev fab7fda",
+      "commit": "d157b329",
+      "switch": "VICTORY_WAVE_LDS_LOOSE=1",
+      "effect": "Offline probe: all 27 wave64-only shaders translate (particles, decal trails, water volumetrics, hair shadows)",
+      "issue": 18
+    },
+    {
+      "id": "wave32-fixes",
+      "title": "ds_bpermute within halves, 32 KiB LDS kept to",
+      "category": "shaders",
+      "status": "ready",
+      "source": "deynesdev fab7fda",
+      "commit": "d157b329",
+      "switch": "VICTORY_WAVE32_FIXES=1",
+      "effect": "Exact pieces of the same commit",
+      "issue": 19
+    },
+    {
+      "id": "mask-copies",
+      "title": "Split 64-lane masks treated as the mask",
+      "category": "shaders",
+      "status": "ready",
+      "source": "Th3C0D3R #1112",
+      "commit": "2cf371ee",
+      "switch": "VICTORY_MASK_COPIES=1",
+      "effect": "Translator correctness",
+      "issue": 20
+    },
+    {
+      "id": "geometry-shaders",
+      "title": "GS_VoxelizeGeneric (195 geometry shaders)",
+      "category": "shaders",
+      "status": "not-applicable",
+      "source": "design: MiamiGame/XTP",
+      "commit": "645819a2",
+      "effect": "Never bound in 62 runs; design doc in docs/geometry-shaders.md"
+    },
+    {
+      "id": "autopilot",
+      "title": "Autopilot: menus, roaming walk, screenshots, stuck detection",
+      "category": "tooling",
+      "status": "shipped",
+      "source": "ours",
+      "effect": "Hands-off measured runs"
+    },
+    {
+      "id": "ab-switching",
+      "title": "Runtime A/B switching of switches",
+      "category": "tooling",
+      "status": "shipped",
+      "source": "ours",
+      "switch": "VICTORY_AB",
+      "effect": "Both sides measured in the same scene"
+    },
+    {
+      "id": "timeline",
+      "title": "Timeline traces with critical-path breakdown",
+      "category": "tooling",
+      "status": "shipped",
+      "source": "ours",
+      "switch": "VICTORY_TIMELINE",
+      "effect": "Found every bottleneck above"
+    },
+    {
+      "id": "ram-monitor",
+      "title": "RAM/commit monitor that kills the game before the PC pages to death",
+      "category": "tooling",
+      "status": "shipped",
+      "source": "ours",
+      "effect": "Remote sessions survived every out-of-memory run"
+    },
+    {
+      "id": "hud",
+      "title": "On-screen fps / frame-time panel",
+      "category": "tooling",
+      "status": "in-progress",
+      "source": "Belobug e9428969",
+      "switch": "VICTORY_PANEL",
+      "effect": "",
+      "issue": 21
+    }
   ]
 }

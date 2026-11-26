@@ -208,6 +208,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 2
         document.getElementById("rows").innerHTML = rows.map(function (i) {
           var st = STATUS[i.status];
           var commit = i.commit ? ' <a href="https://github.com/insenzaboor/victory-rtx3060/commit/' + esc(i.commit) + '"><code>' + esc(i.commit) + "</code></a>" : "";
+          if (i.issue) commit += ' <a href="https://github.com/insenzaboor/victory-rtx3060/issues/' + i.issue + '">#' + i.issue + "</a>";
           return "<tr><td>" + esc(i.title) + commit + '</td><td><span class="pill" style="background:var(' + st[1] + ')">' + st[0] + "</span></td><td>" +
             esc(ports.categories[i.category]) + "</td><td>" + esc(i.source) + "</td><td>" + (i.switch ? "<code>" + esc(i.switch) + "</code>" : "") + "</td><td>" + esc(i.effect) + "</td></tr>";
         }).join("") || '<tr><td colspan="6">Nothing matches.</td></tr>';
