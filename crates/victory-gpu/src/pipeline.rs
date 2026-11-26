@@ -724,6 +724,178 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// What device method 0x218 is given: a compute pipeline from the pieces of
+/// a program the console's compiler made ahead of time, where the other
+/// methods are given a shader container. The pieces are those an `ACCC`
+/// part's `FSPX` holds (`victory_shader::native::fspx_program`): the
+/// pipeline's registers (kind 0, 0x1c bytes), what is said about the pipeline
+/// (kind 1, 0x14 bytes), the code (kind 6) and what is said about the program
+/// (kind 7), each a pointer and a length. Read from 96 descriptions the title
+/// passed (chabrune, an RX 7700 XT, Series S profile, 2026-11-26): every one
+/// had these lengths, a kind 7 beginning 0x403 and a code length that agrees
+/// with it; the descriptions of run fortynine (RTX 3060) have the same
+/// lengths. After them the title keeps three words of its own (two
+/// descriptions it links this one with, a hash): 12 words in all.
+#[repr(C)]
+pub(crate) struct ComputeParts {
+    root: This,
+    pieces: [Bytecode; 4],
+}
+
+/// The kinds of the `FSPX` entries [`ComputeParts::pieces`] are, in order.
+const PARTS_KINDS: [u32; 4] = [0, 1, 6, 7];
+
+/// What device method 0x218 does ([`parts_mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartsMode {
+    /// It answers that it is not there, as an unknown method does; the
+    /// title makes the same pipelines from shader containers instead.
+    Off,
+    /// It makes every pipeline whose pieces read as a compute program.
+    Parsed,
+    /// As `Parsed`, only for programs that translate, at once (on the
+    /// title's thread); for the others it answers as `Off` does.
+    Translated,
+}
+
+impl PartsMode {
+    fn parse(value: Option<&std::ffi::OsStr>) -> PartsMode {
+        match value.and_then(|v| v.to_str()).map(str::trim) {
+            Some("1") => PartsMode::Parsed,
+            Some("2") => PartsMode::Translated,
+            _ => PartsMode::Off,
+        }
+    }
+}
+
+/// Whether pipelines are made from programs' pieces (device method 0x218):
+/// `VICTORY_PIPELINE_PARTS=1` (every one whose pieces read) or `=2` (only
+/// those whose program translates), off by default. Without it the method
+/// answers that it is not there, as an unknown one does, and the title makes
+/// the same pipelines from shader containers instead, which is how every
+/// run so far drew. With 1 (chabrune run e1, an RX 7700 XT, Series S
+/// profile, 2026-11-26) the title got its pipelines here, over a thousand in
+/// the opening, and the picture was black: 1,065 dispatches a frame were
+/// dropped, because more than half of those programs do not translate from
+/// their pieces ("an address not from a root parameter", "an address with
+/// two computed terms", stores of some channels, root constants, which
+/// [`victory_shader::native::fspx_program`] does not take). 2 hands those
+/// back to the title's own way round; whether the title then makes them from
+/// containers, one by one, is not seen yet.
+/// shortcut: nothing is gained on the picture by either: the programs are
+/// the precompiled forms of the containers' (grimygunnz 229d582: 662 of
+/// 1,019 have a container program of the same group size and code length).
+pub(crate) fn parts_mode() -> PartsMode {
+    static MODE: OnceLock<PartsMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = PartsMode::parse(std::env::var_os("VICTORY_PIPELINE_PARTS").as_deref());
+        if mode != PartsMode::Off {
+            tracing::info!(?mode, "device method 0x218 makes compute pipelines from programs' pieces (VICTORY_PIPELINE_PARTS)");
+        }
+        mode
+    })
+}
+
+/// The `size` bytes of title memory `code` names, if they are there.
+fn piece(code: &Bytecode) -> Option<Vec<u8>> {
+    // (A program's code is a few KiB to some hundred; its other pieces less.)
+    if code.code.is_null() || code.size == 0 || code.size > 4 << 20 {
+        return None;
+    }
+    let mut bytes = vec![0u8; code.size];
+    #[cfg(windows)]
+    let there = crate::host::read_into(code.code, &mut bytes);
+    #[cfg(not(windows))]
+    let there = {
+        // SAFETY: the title passes `size` bytes.
+        bytes.copy_from_slice(unsafe { std::slice::from_raw_parts(code.code, code.size) });
+        true
+    };
+    there.then_some(bytes)
+}
+
+/// An `FSPX` of `pieces` ([`PARTS_KINDS`]), as an `ACCC` part holds it: the
+/// name, version 1, the entry count and the size, then 16 bytes an entry
+/// (kind, offset, size, zero) and the pieces, each on four bytes.
+fn fspx_of(pieces: &[Vec<u8>; 4]) -> Vec<u8> {
+    let head = 0x10 + 16 * pieces.len();
+    let total = head + pieces.iter().map(|p| p.len().next_multiple_of(4)).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"FSPX");
+    for word in [1, pieces.len() as u32, total as u32] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut at = head;
+    for (kind, piece) in PARTS_KINDS.iter().zip(pieces) {
+        for word in [*kind, at as u32, piece.len() as u32, 0] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        at += piece.len().next_multiple_of(4);
+    }
+    for piece in pieces {
+        out.extend_from_slice(piece);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
+}
+
+/// A shader container whose one part is `fspx`, as the compiler's own
+/// containers of such programs have it (`ACCC`).
+fn container_of(fspx: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 0x20;
+    let total = HEADER + 4 + 8 + fspx.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"DXBC");
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&((HEADER + 4) as u32).to_le_bytes());
+    out.extend_from_slice(b"ACCC");
+    out.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    out.extend_from_slice(fspx);
+    out
+}
+
+/// The container that stands for the program a description of device method
+/// 0x218 names; `None` if its pieces are not there or are not a compute
+/// program as [`victory_shader::native_programs`] reads one.
+fn compute_parts_container(desc: &ComputeParts) -> Option<Vec<u8>> {
+    let [a, b, c, d] = &desc.pieces;
+    let pieces = [piece(a)?, piece(b)?, piece(c)?, piece(d)?];
+    let fspx = fspx_of(&pieces);
+    let programs = victory_shader::native_programs(&fspx).ok()?;
+    matches!(programs.as_slice(), [p] if p.stage == victory_shader::HwStage::Cs).then(|| container_of(&fspx))
+}
+
+/// Device method 0x218 ([`ComputeParts`]): `None` if the description is not
+/// understood, or, with [`PartsMode::Translated`], its program does not
+/// translate (the caller answers as for an unknown method).
+pub(crate) fn create_compute_parts(desc: *const ComputeParts, iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+    // SAFETY: the title passes a description (null is tolerated).
+    let desc = unsafe { desc.as_ref() }?;
+    let container = compute_parts_container(desc)?;
+    let shader = shader("compute", &container);
+    #[cfg(windows)]
+    if parts_mode() == PartsMode::Translated && shader.translated().is_none() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static REFUSED: AtomicU64 = AtomicU64::new(0);
+        let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if refused.is_power_of_two() {
+            tracing::info!(refused, hash = %shader.hash, "device method 0x218: a program that does not translate is left to the title's containers");
+        }
+        return None;
+    }
+    Some(hand_out(
+        vec![shader],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    ))
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -928,6 +1100,98 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    /// The four pieces device method 0x218 is handed, of the lengths the
+    /// title's have (registers 0x1c, note 0x14), for a wave32 program of
+    /// 64x1x1 threads and two dwords of code: kind 7 is 0x403, its size less
+    /// 0x14, the code's dwords, then a 0x43 record only.
+    fn compute_pieces() -> [Vec<u8>; 4] {
+        let mut registers = vec![0u8; 0x1c];
+        registers[0x0c..0x0e].copy_from_slice(&64u16.to_le_bytes());
+        registers[0x0e..0x10].copy_from_slice(&1u16.to_le_bytes());
+        registers[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        registers[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        let note = vec![0x5au8; 0x14];
+        let code = [0x0000_0000u32, 0xbf81_0000].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let mut metadata = vec![0u8; 0x18 + 32];
+        metadata[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        metadata[4..8].copy_from_slice(&((0x18 + 32 - 0x14) as u32).to_le_bytes());
+        metadata[8..12].copy_from_slice(&((code.len() / 4) as u32).to_le_bytes());
+        metadata[0x14] = 0x40;
+        metadata[0x18] = 0x43;
+        [registers, note, code, metadata]
+    }
+
+    fn compute_parts_of(pieces: &[Vec<u8>; 4]) -> ComputeParts {
+        let at = |p: &Vec<u8>| Bytecode {
+            code: p.as_ptr(),
+            size: p.len(),
+        };
+        ComputeParts {
+            root: std::ptr::null(),
+            pieces: [at(&pieces[0]), at(&pieces[1]), at(&pieces[2]), at(&pieces[3])],
+        }
+    }
+
+    /// The pieces put together read back as the compute program they are,
+    /// through the container the translator is given.
+    #[test]
+    fn programs_pieces_make_a_container_the_translator_reads() {
+        let pieces = compute_pieces();
+        let fspx = fspx_of(&pieces);
+        assert_eq!(&fspx[..4], b"FSPX");
+        assert_eq!(fspx.len(), 0x10 + 4 * 16 + 0x1c + 0x14 + 8 + 0x38);
+        let container = container_of(&fspx);
+        let parsed = victory_shader::Container::parse(&container).unwrap();
+        let part = parsed.part(victory_shader::FourCC::ACCC).unwrap();
+        assert_eq!(part.data, &fspx[..]);
+        let programs = victory_shader::native_programs(part.data).unwrap();
+        let [program] = programs.as_slice() else {
+            panic!("one program: {programs:?}");
+        };
+        assert_eq!(program.stage, victory_shader::HwStage::Cs);
+        assert!(!program.wave64);
+        assert_eq!(program.code, pieces[2]);
+        match &program.io {
+            victory_shader::native::StageIo::Cs(cs) => assert_eq!(cs.threads, [64, 1, 1]),
+            io => panic!("not a compute program's: {io:?}"),
+        }
+    }
+
+    #[test]
+    fn method_0x218_makes_a_compute_pipeline_of_its_pieces() {
+        let pieces = compute_pieces();
+        let desc = compute_parts_of(&pieces);
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_compute_parts(&desc, &PIPELINE_IIDS[0], &mut p),
+            Some(S_OK)
+        );
+        assert_eq!(shaders(p), [("compute", container_of(&fspx_of(&pieces)))]);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        // A code length the metadata does not agree with is not a program.
+        let mut wrong = compute_pieces();
+        wrong[2].extend_from_slice(&[0; 4]);
+        let desc = compute_parts_of(&wrong);
+        let mut q = std::ptr::null();
+        assert_eq!(create_compute_parts(&desc, &PIPELINE_IIDS[0], &mut q), None);
+        assert!(q.is_null());
+        // Nor is a missing piece, or no description.
+        let mut desc = compute_parts_of(&pieces);
+        desc.pieces[1].code = std::ptr::null();
+        assert_eq!(create_compute_parts(&desc, &PIPELINE_IIDS[0], &mut q), None);
+        assert_eq!(create_compute_parts(std::ptr::null(), &PIPELINE_IIDS[0], &mut q), None);
+    }
+
+    #[test]
+    fn pipeline_parts_switch_values() {
+        use std::ffi::OsStr;
+        assert_eq!(PartsMode::parse(None), PartsMode::Off);
+        assert_eq!(PartsMode::parse(Some(OsStr::new("0"))), PartsMode::Off);
+        assert_eq!(PartsMode::parse(Some(OsStr::new("1"))), PartsMode::Parsed);
+        assert_eq!(PartsMode::parse(Some(OsStr::new(" 2 "))), PartsMode::Translated);
+        assert_eq!(PartsMode::parse(Some(OsStr::new("yes"))), PartsMode::Off);
     }
 
     /// The stream layout the title builds (title+0x86f090): root

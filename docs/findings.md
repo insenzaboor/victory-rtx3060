@@ -79,6 +79,47 @@ in that order of size:
 - An on-screen panel of numbers (`VICTORY_PANEL`): it helps finding where a frame goes but
   costs some, so it is off and F3 shows it.
 
+## Pipelines the title has ready-made (device methods 0x1c8 and 0x218), 2026-11-26
+
+From chabrune (84899fde, 03552a5b; 96 descriptions of each method written down with
+`VICTORY_PIPELINE_DUMP=<folder>` on an RX 7700 XT) and grimygunnz/nvidia-3070-VI
+(58a0c92, 229d582); run fortynine here (RTX 3060) logs descriptions of the same lengths.
+
+**What they are.** Pipelines whose programs the console's compiler made ahead of time,
+handed over in pieces instead of a shader container: the pieces of the `FSPX` an `ACCC`
+part holds. When a method answers that it is not there, the title makes the same
+pipeline from containers through the methods we have. So the warnings these two log
+("a ready-made pipeline method that is not implemented") are not missing draws; all of
+them come in the first two seconds, while the title prepares its pipelines (run
+fortynine: 0x1c8 16,384+ calls, 0x218 2,048+).
+
+**0x218, compute**, 12 words: the root signature object (one of ours); four pieces as
+pointer and length: the pipeline's registers (0x1c bytes: thread-group size as three
+u16 at +0x0c, flags at +0x12, `COMPUTE_PGM_RSRC1/2` at +0x14/+0x18), a note about the
+pipeline (0x14 bytes, a hash first), the GFX10 code, the program's metadata (0x403,
+size - 0x14, code dwords, then 32-byte records 0x41/0x42/0x43 from +0x18); then three
+words of the title's own (two descriptions it is linked with, a hash).
+
+**0x1c8, graphics**, 13 words: the root signature object, a block of registers (0x17c,
+0x184 or 0x18c bytes), a note (0x78 to 0xbc bytes, with the input layout: element
+count, then semantic names and formats), then code and metadata of the pixel program
+(null for depth-only pipelines) and of the vertex program. The register block holds
+`SPI_SHADER_PGM_RSRC1/2` of both stages (+0x38, +0x4c), `CB_COLOR_CONTROL` (+0x7c),
+`PA_SU_SC_MODE_CNTL` (+0xa0), `DB_DEPTH_CONTROL` and `DB_STENCIL_CONTROL` (+0xb8,
++0xbc), `CB_BLEND0..7_CONTROL` (+0xd0); the render target and depth formats, the sample
+count and the topology are not found yet. Not written.
+
+**State.** 0x218 is written behind `VICTORY_PIPELINE_PARTS` (off by default): `1` makes
+every pipeline whose pieces read as a compute program (put into a one-part `ACCC`
+container the translator already reads), `2` only those whose program translates at
+once, leaving the others to the title's containers. With `1` the title used these
+pipelines in place of the containers' and the picture was black (chabrune: 1,065
+dispatches a frame dropped; grimygunnz: 821 programs that do not translate, 40 ms
+frames): the pieces lack what a container's program record says of root parameters,
+and the `FSPX` reader takes only what the upscaler's programs need (no root constants,
+for one). Nothing is gained on the picture by either value: 662 of 1,019 such programs
+have a container program of the same group size and code length (grimygunnz).
+
 ## What is next
 
 1. The preparing thread: split what one submission does over two threads in a row; ask

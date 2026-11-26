@@ -346,16 +346,26 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// Device methods 0x1c8 and 0x218 (`SLOT`): pipelines whose programs the
+/// console's compiler made ahead of time, handed over in pieces (an
+/// `ACCC` part's `FSPX` entries) instead of a shader container; 0x1c8
+/// graphics (a register block, an input layout, then code and metadata of
+/// the pixel and the vertex stage), 0x218 compute
+/// ([`crate::pipeline::ComputeParts`]). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// id, out)` and asks for `ID3D12PipelineState`. When a method answers that
+/// it is not there, the title makes the same pipeline from shader
+/// containers through the methods we have (chabrune 84899fde, grimygunnz
+/// 58a0c92 and 229d582: with 0x218 written the title used its pipelines in
+/// place of the containers' and more than half of them did not translate),
+/// so these failures are not missing draws. The calls fail with `out` null,
+/// and the first ones log the description's words and what its first word
+/// (the root signature, one of ours) points at.
+/// shortcut: 0x1c8 not implemented (the host state is in a register block
+/// read only in part, see docs/findings.md); 0x218 behind
+/// `VICTORY_PIPELINE_PARTS` ([`compute_parts`]). Answering `S_OK` here
+/// without making the pipeline would hand the title whatever its stack held
+/// as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -393,10 +403,159 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a ready-made pipeline method that is not implemented: the title makes this pipeline from shader containers instead"
         );
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    unknown_pipeline_census(SLOT, desc);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    unknown_pipeline_dump(SLOT, desc);
     E_NOTIMPL
+}
+
+/// Device method 0x218: a compute pipeline from a program's pieces
+/// (`crate::pipeline::ComputeParts`) with `VICTORY_PIPELINE_PARTS` set
+/// ([`crate::pipeline::parts_mode`]); otherwise, and when the pieces are not
+/// understood (or, at 2, their program does not translate), as an unknown
+/// method answers, and the title makes the pipeline from containers.
+/// After chabrune 84899fde.
+extern "system" fn compute_parts(
+    this: This,
+    desc: *const crate::pipeline::ComputeParts,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if crate::pipeline::parts_mode() != crate::pipeline::PartsMode::Off
+        && let Some(hr) = crate::pipeline::create_compute_parts(desc, iid, out)
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if made.is_power_of_two() {
+            tracing::info!(made, hr, "compute pipelines made from programs' pieces (device method 0x218)");
+        }
+        return hr;
+    }
+    unknown_pipeline::<0x218>(this, desc.cast(), iid, out)
+}
+
+/// Diagnostics: how many different pipelines the title asks of the two
+/// methods above, told apart by the words of their description that name
+/// shader code (the code's addresses, and for 0x218 its 64-bit hash), and how
+/// often a second: a title that asks again every frame for what failed shows
+/// a rate near its frame rate. Logged every ten seconds. After chabrune
+/// 03552a5b.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn unknown_pipeline_census(slot: usize, desc: *const u8) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    struct Census {
+        seen: [HashSet<[u64; 3]>; 2],
+        calls: [u64; 2],
+        since: Option<std::time::Instant>,
+    }
+    static CENSUS: Mutex<Option<Census>> = Mutex::new(None);
+    let mut bytes = [0u8; 96];
+    if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
+        return;
+    }
+    let word = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    // 0x1c8: two stages' code at words 5 and 9; 0x218: code at word 5 and a
+    // hash at word 11.
+    let (which, key) = if slot == 0x218 { (1, [word(5), word(11), word(6)]) } else { (0, [word(5), word(9), word(6)]) };
+    let mut guard = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let census = guard.get_or_insert_with(|| Census {
+        seen: [HashSet::new(), HashSet::new()],
+        calls: [0, 0],
+        since: Some(std::time::Instant::now()),
+    });
+    census.seen[which].insert(key);
+    census.calls[which] += 1;
+    let since = *census.since.get_or_insert_with(std::time::Instant::now);
+    if since.elapsed() >= std::time::Duration::from_secs(10) {
+        let seconds = since.elapsed().as_secs_f64();
+        tracing::info!(
+            "pipelines asked of the ready-made methods in {seconds:.0} s: 0x1c8 {} calls ({:.1} a second), {} different so far; 0x218 {} calls ({:.1} a second), {} different so far",
+            census.calls[0],
+            census.calls[0] as f64 / seconds,
+            census.seen[0].len(),
+            census.calls[1],
+            census.calls[1] as f64 / seconds,
+            census.seen[1].len(),
+        );
+        census.calls = [0, 0];
+        census.since = Some(std::time::Instant::now());
+    }
+}
+
+/// Diagnostics: with `VICTORY_PIPELINE_DUMP=<folder>` (outside the
+/// repository), what the title hands the two methods above is written down
+/// for the first 96 different descriptions of each, one file a description
+/// (`p-<slot>-<n>.bin`), so that their layout can be worked out: pieces of a
+/// tag (u32), a length (u32) and the bytes. Tag 0 is the description's first
+/// 128 bytes; 1 to 8 what its words 1, 3, 5, 7, 9 and 11 point at, as long as
+/// the word after each says (for 0x218 words 9 and 10 have no length: 256
+/// bytes each); 9 the first 128 bytes of the object word 0 names, and 10
+/// what that object's fourth word points at, as long as its third says (a
+/// root signature of ours and the bytes the title made it from). After
+/// chabrune 84899fde.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn unknown_pipeline_dump(slot: usize, desc: *const u8) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static SEEN: Mutex<Option<[HashSet<[u64; 3]>; 2]>> = Mutex::new(None);
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_PIPELINE_DUMP")?);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }) else {
+        return;
+    };
+    let read = |at: u64, len: usize| -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; len];
+        (at != 0 && len != 0 && len <= 1 << 20 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
+    };
+    let Some(head) = read(desc as u64, 128) else {
+        return;
+    };
+    let word = |bytes: &[u8], i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let which = usize::from(slot == 0x218);
+    let key = if which == 1 { [word(&head, 5), word(&head, 11), word(&head, 6)] } else { [word(&head, 5), word(&head, 9), word(&head, 6)] };
+    let number = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = &mut seen.get_or_insert_with(|| [HashSet::new(), HashSet::new()])[which];
+        if seen.len() >= 96 || !seen.insert(key) {
+            return;
+        }
+        seen.len()
+    };
+    let mut out = Vec::new();
+    let mut put = |tag: u32, bytes: Option<Vec<u8>>| {
+        if let Some(bytes) = bytes {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+    };
+    let sized = |i: usize| read(word(&head, i), word(&head, i + 1) as usize);
+    let pieces: [(u32, Option<Vec<u8>>); 6] = if which == 1 {
+        [(1, sized(1)), (2, sized(3)), (3, sized(5)), (4, sized(7)), (7, read(word(&head, 9), 256)), (8, read(word(&head, 10), 256))]
+    } else {
+        [(1, sized(1)), (2, sized(3)), (3, sized(5)), (4, sized(7)), (5, sized(9)), (6, sized(11))]
+    };
+    let object = read(word(&head, 0), 128);
+    let made_from = object.as_ref().and_then(|o| read(word(o, 3), word(o, 2) as usize));
+    put(0, Some(head.clone()));
+    for (tag, bytes) in pieces {
+        put(tag, bytes);
+    }
+    put(9, object);
+    put(10, made_from);
+    let file = dir.join(format!("p-{slot:x}-{number:03}.bin"));
+    if let Err(e) = std::fs::write(&file, out) {
+        tracing::warn!(error = %e, file = %file.display(), "a pipeline description was not written down");
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is
@@ -452,7 +611,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = compute_parts as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -500,6 +659,21 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    /// The ready-made pipeline methods answer that they are not there
+    /// (the title then makes the pipeline from containers), with `out`
+    /// cleared, for a description they cannot read.
+    #[test]
+    fn ready_made_pipeline_methods_fail_cleanly() {
+        type Create = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        let device = super::device();
+        for offset in [0x1c8, 0x218] {
+            let mut out = device;
+            let create = slot::<Create>(device, offset);
+            assert_eq!(create(device, std::ptr::null(), &IID, &mut out), E_NOTIMPL, "{offset:#x}");
+            assert!(out.is_null(), "{offset:#x}");
+        }
     }
 
     #[test]
