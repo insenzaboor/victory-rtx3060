@@ -1310,12 +1310,90 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// The share of the card's local VRAM budget in use, in percent (cached for
+/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 8 == tenth {
+        return last & 0xff;
+    }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+/// How many of a placed 2D texture's largest levels its host copy goes
+/// without so no side passes the cap `VICTORY_TEXTURE_MAX=<N>` (unset or 0:
+/// no cap, as before), halved from 92 % of the VRAM budget in use and
+/// quartered from 97 % (never under 256). From pr0vId3nce/VIctory-NVIDIA
+/// c3925019 (after `VIctory-vitesse` 7ada43b6), where unset is 1024: here
+/// it is off unless asked for, being a loss of detail, not a fix. Only for
+/// textures whose levels are kept from their first viewed one on
+/// ([`held_only`]); views of the levels left out show the copy's first
+/// (`VICTORY_VIEW_BASE_FIX`).
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_MAX").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+        if n > 0 {
+            tracing::info!(cap = n, "placed textures capped (VICTORY_TEXTURE_MAX; halved from 92 % of the VRAM budget, quartered from 97 %)");
+        }
+        n
+    });
+    if set == 0 {
+        return 0;
+    }
+    let max = capped(set, video_memory_percent());
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
+/// The cap of [`over_cap`] at `percent` of the VRAM budget in use: `base`,
+/// half from 92 %, a quarter from 97 % (never under 256, nor over `base`).
+#[cfg(any(windows, test))]
+fn capped(base: u64, percent: u64) -> u64 {
+    let cap = match percent {
+        0..92 => base,
+        92..97 => base / 2,
+        _ => base / 4,
+    };
+    cap.max(256.min(base))
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::capped;
+
+    #[test]
+    fn a_texture_cap_keeps_its_steps_under_vram_pressure() {
+        assert_eq!([capped(1024, 50), capped(1024, 92), capped(1024, 99)], [1024, 512, 256]);
+        assert_eq!([capped(4096, 91), capped(4096, 96), capped(4096, 97)], [4096, 2048, 1024]);
+        // Never below 256, nor above the cap asked for.
+        assert_eq!([capped(512, 99), capped(128, 99)], [256, 128]);
+    }
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1661,11 +1739,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
-            // The store has its larger levels: made whole at once.
+            // (No level said: from 0, which only a cap moves.)
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            // The store has its larger levels: made whole at once (not past
+            // a cap, `VICTORY_TEXTURE_MAX`).
             if base > 0
+                && over_cap(&r.desc) == 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
