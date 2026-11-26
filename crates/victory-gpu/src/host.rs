@@ -1298,8 +1298,48 @@ mod tests {
 }
 
 /// The batches of clamped records in one scratch buffer
-/// ([`HostList::batch_place`]).
-const BATCHES: u32 = 8;
+/// ([`HostList::batch_place`]): 8, or 32 with [`batch_pool`].
+fn batches() -> u32 {
+    if batch_pool() { 32 } else { 8 }
+}
+
+/// Whether the scratch buffers of batched clamps go to one pool when their
+/// list is reset, for any list to take, where each list kept its own from
+/// recording to recording, idle lists' too (`VICTORY_BATCH_POOL=1`; off by
+/// default), and hold 32 batches each, not 8. After Belobug e9428969, where
+/// it is on.
+fn batch_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The pool of [`batch_pool`]: buffers in the common state, whose lists'
+/// last submission has run.
+struct BatchBuf(ID3D12Resource);
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for BatchBuf {}
+static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
+
+fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
+    if batch_pool()
+        && let Some(BatchBuf(buffer)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop()
+    {
+        return Some(buffer);
+    }
+    // Not zeros at need (`card_buffer`): a batch's clamp writes the
+    // records of its places before their executions read them, as in the
+    // buffers kept from recording to recording.
+    let made = host()?.card_buffer(size)?;
+    name(&made, || format!("indirect batches {size:#x}"));
+    Some(made)
+}
+
+fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
+    let most: usize = if keep_freed() { 64 } else { 16 };
+    let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let room = most.saturating_sub(spare.len());
+    spare.extend(buffers.into_iter().take(room).map(BatchBuf));
+}
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
@@ -6748,6 +6788,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        if batch_pool() {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            // (Closed lists left them in the common state, `batches_common`.)
+            let left = std::mem::take(&mut args.1);
+            let buffers = std::mem::take(&mut args.0);
+            drop(args);
+            if left == 0 {
+                give_batch_buffers(buffers);
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7634,14 +7684,11 @@ impl HostList {
     pub(crate) fn batch_place(&self) -> Option<(ID3D12Resource, u32, D3D12_RESOURCE_STATES)> {
         use crate::indirect::batch::{JOBS, SLOT};
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
+        let batches = batches();
+        let (buffer, i) = ((args.1 / batches) as usize, args.1 % batches);
         if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
-            // Not zeros at need (`card_buffer`): a batch's clamp writes the
-            // records of its places before their executions read them, as
-            // in the buffers kept from recording to recording.
-            let made = host()?.card_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let size = u64::from(batches * JOBS * SLOT);
+            let made = take_batch_buffer(size)?;
             args.0.push(made);
         }
         args.1 += 1;
@@ -7655,7 +7702,7 @@ impl HostList {
     /// back to the common state, where the next recording expects them.
     fn batches_common(&self) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
+        let used = std::mem::take(&mut args.1).div_ceil(batches()) as usize;
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
             .iter()
             .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
