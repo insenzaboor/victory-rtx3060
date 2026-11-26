@@ -126,14 +126,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 raw = src_args.Load3(src_at);
-        // Diagnostics: what the record asked for before the clamp (one
-        // dispatch runs at most 65,535 groups a dimension; run 200 saw
-        // compute records ask 77,000 to 98,000 in x). A record ahead of
-        // its dispatch the title has not filled is not counted.
-        asked = max(raw.x, max(raw.y, raw.z));
-        if (ahead && asked > (1u << 24)) {
-            asked = 0;
-        }
         uint3 g;
         asked_x = raw.x;
         // Past 65,535 groups in x (one row): spread across z, the program
@@ -171,10 +163,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind >= 2) {
+    if (active && kind > 2) {
         // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh or compute record asked for, and the
-        // groups asked in all.
+        // largest group count a mesh record asked for, and the groups
+        // asked in all.
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
@@ -231,7 +223,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind >= 2 && n > 0) {
+    if (gi == 0 && kind > 2 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
