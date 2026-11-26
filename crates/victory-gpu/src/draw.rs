@@ -206,6 +206,26 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Whether a texture picked by index found changed with nothing to tell of
+/// it is looked at in every frame from then on, until it has stayed the same
+/// for [`CHANGING_IDLE`] looks (`VICTORY_TEXTURE_CHANGING=1`; off by default:
+/// [`recheck_soon`] looks once in the next frame, then the schedule goes on).
+/// A video or a painted texture that changes every second or third frame was
+/// otherwise found a schedule step late each time. From KevinPratap/ApexIV
+/// da3b0c2 with its cd751e8 (slots never seen changing keep the schedule,
+/// the every-frame look for all fresh uploads cost ~12 ms a frame).
+fn texture_changing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGING").is_some_and(|v| v == "1"))
+}
+
+/// In a slot's look count: it was found changing ([`texture_changing`]); the
+/// low bits count the looks since that found it the same.
+const CHANGING_BIT: u8 = 0x80;
+/// Looks in a row that find a changing slot the same before it goes back to
+/// the schedule (at [`RECHECK_FRAMES`]`[2]`).
+const CHANGING_IDLE: u8 = 120;
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2750,9 +2770,22 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
+            // Found changing (`texture_changing`): the upload below is looked
+            // at in every frame.
+            let mut first_looks = 0;
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if looks & CHANGING_BIT != 0 && texture_changing() {
+                        let idle = (looks & !CHANGING_BIT).saturating_add(1);
+                        if idle < CHANGING_IDLE {
+                            host.texture_slot_recheck(index, write, frame + 1, (at, len), print, CHANGING_BIT | idle, uploaded);
+                        } else {
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[2], (at, len), print, 2, uploaded);
+                        }
+                        continue;
+                    }
+                    let looks = looks & !CHANGING_BIT;
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
@@ -2770,6 +2803,10 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                if texture_changing() {
+                    again_in = 1;
+                    first_looks = CHANGING_BIT;
+                }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2786,7 +2823,7 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = looks & !CHANGING_BIT,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
@@ -2942,7 +2979,7 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, first_looks, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -3067,7 +3104,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, first_looks, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
