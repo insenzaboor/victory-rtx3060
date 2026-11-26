@@ -1527,6 +1527,19 @@ pub fn host_settings() -> [u32; 4] {
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
 }
 
+/// `VICTORY_DIV_FIXUP=1`: `v_div_fixup_f32` in the hardware's order, a quotient
+/// that is NaN coming after `0 / x` and `x / Inf` (which give zero) instead of
+/// before them. The division sequence's `v_div_scale_f32` and
+/// `v_fma_f32(-Inf, 0, 1)` make a NaN quotient for exactly those, so without
+/// this `0 / x` came out as ±Infinity, which later arithmetic turns into NaN
+/// dots in the picture. After dng-nguyn/victory-rtx2060-dlssg 472518cb (also
+/// FluffyCyanNova/VIctory-RTX3060-Intel12100F b44/0010). Off by default;
+/// part of the shader cache's key while on (`victory-gpu`'s `shader_cache`).
+pub fn div_fixup_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIV_FIXUP").is_some_and(|v| v == "1"))
+}
+
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
@@ -9135,16 +9148,21 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+                // (`VICTORY_DIV_FIXUP=1`, [`div_fixup_order`]: a NaN quotient
+                // below `make_zero` in priority, as the hardware has it:
+                // n_nan, d_nan, invalid, make_inf, make_zero, q_nan, signed_q.)
+                let fixed = div_fixup_order();
                 let make_inf = {
                     let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
+                    if fixed { t } else { self.s.m.bin(c, Bin::Or, t, q_nan) }
                 };
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                let r = if fixed { self.s.m.select(c, q_nan, signed_inf, signed_q) } else { signed_q };
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);

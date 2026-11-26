@@ -159,6 +159,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::wave32_fixes() {
             bytes.extend_from_slice(b"VICTORY_WAVE32_FIXES=1");
         }
+        // Likewise, only when on: `v_div_fixup_f32` in the hardware's order
+        // (`VICTORY_DIV_FIXUP=1`, after dng-nguyn 472518cb).
+        if victory_shader::emit::div_fixup_order() {
+            bytes.extend_from_slice(b"VICTORY_DIV_FIXUP=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
