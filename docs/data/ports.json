@@ -397,19 +397,23 @@
       "id": "belobug-flicker",
       "title": "Title textures uploaded in the submission prelude",
       "category": "rendering",
-      "status": "in-progress",
+      "status": "default-untested",
       "source": "Belobug 5d6bd841",
-      "effect": "Fixes frame-order flickering (Belobug)",
-      "issue": 15
+      "effect": "Title textures checked at submission and uploaded just before the list that uses them, not a frame late (Belobug)",
+      "issue": 15,
+      "commit": "a606b9cb",
+      "switch": "VICTORY_PRELUDE_UPLOADS (on)"
     },
     {
       "id": "belobug-ambient",
-      "title": "Ambient light follows the sky; least reflection light",
+      "title": "Ambient light follows the sky; reflection cap and least light",
       "category": "rendering",
-      "status": "in-progress",
+      "status": "ready",
       "source": "Belobug main (705a2d09, e48eb83e, c3bd5612)",
-      "effect": "Interiors too dark/bright",
-      "issue": 16
+      "effect": "Interiors too dark or too bright; glossy-floor glaze indoors",
+      "issue": 16,
+      "commit": "7ac7d719",
+      "switch": "VICTORY_AMBIENT=sky, VICTORY_AMBIENT_REFLECT=0.5"
     },
     {
       "id": "texture-changing",
@@ -551,11 +555,77 @@
       "id": "hud",
       "title": "On-screen fps / frame-time panel",
       "category": "tooling",
-      "status": "in-progress",
+      "status": "ready",
       "source": "Belobug e9428969",
-      "switch": "VICTORY_PANEL",
-      "effect": "",
-      "issue": 21
+      "switch": "VICTORY_PANEL=1",
+      "effect": "fps, frame-time graph, VRAM/RAM and per-core CPU, in release builds too",
+      "issue": 21,
+      "commit": "fcd42dfd"
+    },
+    {
+      "id": "compiler-guard",
+      "title": "Driver compiler crashes on a pipeline worker caught and skipped",
+      "category": "stability",
+      "status": "ready",
+      "source": "Belobug e9428969",
+      "commit": "2c65587b",
+      "switch": "VICTORY_COMPILER_GUARD=1",
+      "effect": "A crashing pipeline is listed in warm-bad.txt and skipped from then on",
+      "issue": 22
+    },
+    {
+      "id": "view-base-fix",
+      "title": "Texture views clamped to the levels their copy has",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "Belobug e9428969",
+      "commit": "3afba992",
+      "switch": "VICTORY_VIEW_BASE_FIX (on), VICTORY_KEPT_ROOM_LATER (on)",
+      "effect": "Views of copies starting at a later mip; arrays too",
+      "issue": 23
+    },
+    {
+      "id": "by-address-count",
+      "title": "Ray-tracing memory counting leak fixed",
+      "category": "memory",
+      "status": "default-untested",
+      "source": "Belobug e9428969",
+      "commit": "078fec6a",
+      "switch": "VICTORY_BY_ADDRESS_COUNT (on)",
+      "effect": "Areas stayed off the card after one did not fit",
+      "issue": 24
+    },
+    {
+      "id": "batch-pool",
+      "title": "Shared pool of indirect scratch buffers",
+      "category": "memory",
+      "status": "ready",
+      "source": "Belobug e9428969",
+      "commit": "e8d846ca",
+      "switch": "VICTORY_BATCH_POOL=1",
+      "effect": "Less VRAM for idle lists",
+      "issue": 25
+    },
+    {
+      "id": "lod-clamp",
+      "title": "View minimum level of detail as its first mip",
+      "category": "rendering",
+      "status": "ready",
+      "source": "Belobug 5d7bd16d",
+      "commit": "cf933365",
+      "switch": "VICTORY_LOD_CLAMP=1",
+      "effect": "Logs the first such views either way",
+      "issue": 26
+    },
+    {
+      "id": "save-fix",
+      "title": "A save folder Windows refused to delete no longer drops settings",
+      "category": "stability",
+      "status": "default-untested",
+      "source": "Belobug 705a2d09",
+      "commit": "92da03de",
+      "effect": "The game no longer starts without its settings",
+      "issue": 27
     }
   ]
 }

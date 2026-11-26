@@ -125,7 +125,7 @@ lines = [
     "# Port tracker",
     "",
     f"_Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/build.py` · updated {ports['updated']}_ · "
-    f"**[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**",
+    f"**[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Project board](https://github.com/users/insenzaboor/projects/2)**",
     "",
     "![overall](assets/progress/overall.svg)",
     "",

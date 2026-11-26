@@ -1,15 +1,15 @@
 # Port tracker
 
-_Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/build.py` · updated 2026-11-26_ · **[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
+_Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/build.py` · updated 2026-11-26_ · **[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Project board](https://github.com/users/insenzaboor/projects/2)**
 
 ![overall](assets/progress/overall.svg)
 
 | Status | Meaning | Count |
 |---|---|---|
 | 🟢 shipped | On by default, verified in game runs | 23 |
-| 🔵 on, untested | On by default, merged, not yet verified in a game run | 3 |
-| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 12 |
-| 🟡 in progress | Being ported or built | 3 |
+| 🔵 on, untested | On by default, merged, not yet verified in a game run | 7 |
+| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 17 |
+| 🟡 in progress | Being ported or built | 0 |
 | ⬜ planned | Designed or queued, not started | 3 |
 | ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 10 |
 | ⚫ n/a | Does not apply to NVIDIA / this title (documented why) | 2 |
@@ -56,9 +56,11 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Item | Status | Source | Switch | Effect | Commit | Issue |
 |---|---|---|---|---|---|---|
 | Residency budgets (pareto-residency) | 🟢 shipped | cool_fox | `VICTORY_RESIDENCY=1` | Admission control against out-of-memory |  |  |
+| Ray-tracing memory counting leak fixed | 🔵 on, untested | Belobug e9428969 | `VICTORY_BY_ADDRESS_COUNT (on)` | Areas stayed off the card after one did not fit | [`078fec6a`](https://github.com/insenzaboor/victory-rtx3060/commit/078fec6a) | [#24](https://github.com/insenzaboor/victory-rtx3060/issues/24) |
 | Texture mip levels get VRAM on demand | 🔵 ready to test | ours (a26859fc) / used by CGBJ | `VICTORY_LEVELS_ON_DEMAND=1` | -3.1 GB VRAM allocated on an RTX 4070 |  | [#6](https://github.com/insenzaboor/victory-rtx3060/issues/6) |
 | Idle times for staging/windows, read-buffer cap | 🔵 ready to test | cool_fox cf3f615 | `VICTORY_STAGING_IDLE_MS, VICTORY_WINDOW_IDLE_MS, VICTORY_READ_KEEP_MB` | Upstream: up to 40-46 GB kept alive in long runs | [`a01ca023`](https://github.com/insenzaboor/victory-rtx3060/commit/a01ca023) | [#7](https://github.com/insenzaboor/victory-rtx3060/issues/7) |
 | Caps on spare scratch and send memory | 🔵 ready to test | cool_fox 39318a8 | `VICTORY_SCRATCH_SPARE_MB, VICTORY_SEND_SPARE_MB` | Up to ~1.8 GB of unused upload memory | [`6bc60929`](https://github.com/insenzaboor/victory-rtx3060/commit/6bc60929) | [#8](https://github.com/insenzaboor/victory-rtx3060/issues/8) |
+| Shared pool of indirect scratch buffers | 🔵 ready to test | Belobug e9428969 | `VICTORY_BATCH_POOL=1` | Less VRAM for idle lists | [`e8d846ca`](https://github.com/insenzaboor/victory-rtx3060/commit/e8d846ca) | [#25](https://github.com/insenzaboor/victory-rtx3060/issues/25) |
 | Cap idle host lists (5.8-10.9 GB grew while lists were made) | ⬜ planned | ours | `VICTORY_ALLOC_TRIM` | Lead from run 51/52 memory lines |  | [#9](https://github.com/insenzaboor/victory-rtx3060/issues/9) |
 | Card buffer cap 2 GB | ⬜ planned | grimygunnz / Rubenpannen | `VICTORY_CARD_BUFFERS_MB=2048` | Upstream 327 -> 61 ms on a 3070 Ti; our runs 38/38b hit the load hang, retest |  | [#10](https://github.com/insenzaboor/victory-rtx3060/issues/10) |
 
@@ -71,11 +73,13 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Released heaps forget slots; textures without room retried | 🟢 shipped | Th3C0D3R e4245f3c |  | Correctness fixes from community pull requests | [`d11c364c`](https://github.com/insenzaboor/victory-rtx3060/commit/d11c364c) |  |
 | Title's own upscaler instead of FSR4's fallback | 🔵 on, untested | chabrune 53057554 | `VICTORY_UPSCALER=6` | FSR4's fallback turns dithering into dots (hair, shadow edges) |  | [#11](https://github.com/insenzaboor/victory-rtx3060/issues/11) |
 | In-place indirect arguments prepared alone, right before they run | 🔵 on, untested | avatarmanz 631400f..7ab13ed | `VICTORY_PORT_CONSTANTS_ORDER (on)` | Trees and palms no longer drop out (upstream runs pop-14..17) | [`d005b299`](https://github.com/insenzaboor/victory-rtx3060/commit/d005b299) | [#12](https://github.com/insenzaboor/victory-rtx3060/issues/12) |
+| Title textures uploaded in the submission prelude | 🔵 on, untested | Belobug 5d6bd841 | `VICTORY_PRELUDE_UPLOADS (on)` | Title textures checked at submission and uploaded just before the list that uses them, not a frame late (Belobug) | [`a606b9cb`](https://github.com/insenzaboor/victory-rtx3060/commit/a606b9cb) | [#15](https://github.com/insenzaboor/victory-rtx3060/issues/15) |
+| Texture views clamped to the levels their copy has | 🔵 on, untested | Belobug e9428969 | `VICTORY_VIEW_BASE_FIX (on), VICTORY_KEPT_ROOM_LATER (on)` | Views of copies starting at a later mip; arrays too | [`3afba992`](https://github.com/insenzaboor/victory-rtx3060/commit/3afba992) | [#23](https://github.com/insenzaboor/victory-rtx3060/issues/23) |
 | Descriptor tables released when their work finishes | 🔵 ready to test | ours (ae6b0bab) / CGBJ default | `VICTORY_EARLY_TABLES=1` | Refused tables 2,200/frame -> 0; dropped draws come back |  | [#13](https://github.com/insenzaboor/victory-rtx3060/issues/13) |
 | One oversized indirect record no longer empties the rest | 🔵 ready to test | CGBJ default | `VICTORY_INDIRECT_REST=0` | Picture completeness |  | [#14](https://github.com/insenzaboor/victory-rtx3060/issues/14) |
+| Ambient light follows the sky; reflection cap and least light | 🔵 ready to test | Belobug main (705a2d09, e48eb83e, c3bd5612) | `VICTORY_AMBIENT=sky, VICTORY_AMBIENT_REFLECT=0.5` | Interiors too dark or too bright; glossy-floor glaze indoors | [`7ac7d719`](https://github.com/insenzaboor/victory-rtx3060/commit/7ac7d719) | [#16](https://github.com/insenzaboor/victory-rtx3060/issues/16) |
 | Changing textures rechecked every frame | 🔵 ready to test | ApexIV da3b0c2 | `VICTORY_TEXTURE_CHANGING=1` | Videos/screens no longer 12-40 frames late | [`6b50c44d`](https://github.com/insenzaboor/victory-rtx3060/commit/6b50c44d) | [#17](https://github.com/insenzaboor/victory-rtx3060/issues/17) |
-| Title textures uploaded in the submission prelude | 🟡 in progress | Belobug 5d6bd841 |  | Fixes frame-order flickering (Belobug) |  | [#15](https://github.com/insenzaboor/victory-rtx3060/issues/15) |
-| Ambient light follows the sky; least reflection light | 🟡 in progress | Belobug main (705a2d09, e48eb83e, c3bd5612) |  | Interiors too dark/bright |  | [#16](https://github.com/insenzaboor/victory-rtx3060/issues/16) |
+| View minimum level of detail as its first mip | 🔵 ready to test | Belobug 5d7bd16d | `VICTORY_LOD_CLAMP=1` | Logs the first such views either way | [`cf933365`](https://github.com/insenzaboor/victory-rtx3060/commit/cf933365) | [#26](https://github.com/insenzaboor/victory-rtx3060/issues/26) |
 | Console-precompiled pipelines (device slot 0x218) | ⚪ no gain (off) | chabrune 84899fde | `VICTORY_PIPELINE_PARTS` | Used only in the first 2 s; implementing them made pictures worse upstream | [`43e832c3`](https://github.com/insenzaboor/victory-rtx3060/commit/43e832c3) |  |
 
 ## Loads, hangs, crashes
@@ -88,6 +92,8 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Frame meter counts occluded presents | 🟢 shipped | ours |  | Autopilot no longer mistakes loaded runs for hangs | [`6f014818`](https://github.com/insenzaboor/victory-rtx3060/commit/6f014818) |  |
 | Fence sweep for the title's GPU watchdog | 🟢 shipped | ours | `VICTORY_FENCE_SWEEP` | Crashes at title+0x23cf683 gone | [`7c4c76a3`](https://github.com/insenzaboor/victory-rtx3060/commit/7c4c76a3) |  |
 | Title always active (focus/minimise) | 🟢 shipped | ours | `VICTORY_ALWAYS_ACTIVE` | Occluded-window hangs | [`1a25173a`](https://github.com/insenzaboor/victory-rtx3060/commit/1a25173a) |  |
+| A save folder Windows refused to delete no longer drops settings | 🔵 on, untested | Belobug 705a2d09 |  | The game no longer starts without its settings | [`92da03de`](https://github.com/insenzaboor/victory-rtx3060/commit/92da03de) | [#27](https://github.com/insenzaboor/victory-rtx3060/issues/27) |
+| Driver compiler crashes on a pipeline worker caught and skipped | 🔵 ready to test | Belobug e9428969 | `VICTORY_COMPILER_GUARD=1` | A crashing pipeline is listed in warm-bad.txt and skipped from then on | [`2c65587b`](https://github.com/insenzaboor/victory-rtx3060/commit/2c65587b) | [#22](https://github.com/insenzaboor/victory-rtx3060/issues/22) |
 
 ## Shader translation
 
@@ -110,4 +116,4 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Runtime A/B switching of switches | 🟢 shipped | ours | `VICTORY_AB` | Both sides measured in the same scene |  |  |
 | Timeline traces with critical-path breakdown | 🟢 shipped | ours | `VICTORY_TIMELINE` | Found every bottleneck above |  |  |
 | RAM/commit monitor that kills the game before the PC pages to death | 🟢 shipped | ours |  | Remote sessions survived every out-of-memory run |  |  |
-| On-screen fps / frame-time panel | 🟡 in progress | Belobug e9428969 | `VICTORY_PANEL` |  |  | [#21](https://github.com/insenzaboor/victory-rtx3060/issues/21) |
+| On-screen fps / frame-time panel | 🔵 ready to test | Belobug e9428969 | `VICTORY_PANEL=1` | fps, frame-time graph, VRAM/RAM and per-core CPU, in release builds too | [`fcd42dfd`](https://github.com/insenzaboor/victory-rtx3060/commit/fcd42dfd) | [#21](https://github.com/insenzaboor/victory-rtx3060/issues/21) |

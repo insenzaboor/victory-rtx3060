@@ -16,8 +16,9 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 [![license](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![tracker](https://img.shields.io/badge/tracker-docs%2FTRACKER.md-orange?style=flat-square)](docs/TRACKER.md)
 [![dashboard](https://img.shields.io/badge/live-dashboard-ff69b4?style=flat-square)](https://insenzaboor.github.io/victory-rtx3060/)
+[![board](https://img.shields.io/badge/project-board-0969da?style=flat-square&logo=github)](https://github.com/users/insenzaboor/projects/2)
 
-**[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Port tracker](docs/TRACKER.md)** · **[How to run](#how-to-run)** · **[What made it fast](#what-made-it-fast)** · **[Credits](#credits)**
+**[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Project board](https://github.com/users/insenzaboor/projects/2)** · **[Port tracker](docs/TRACKER.md)** · **[How to run](#how-to-run)** · **[What made it fast](#what-made-it-fast)** · **[Credits](#credits)**
 
 </div>
 
@@ -47,13 +48,13 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 | | Category | Done | In flight | Planned |
 |---|---|---|---|---|
 | <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 23 | 4 | 1 |
-| <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 1 | 3 | 2 |
-| <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 7 | 0 |
-| <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 0 | 0 |
+| <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 1 | 5 | 2 |
+| <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 9 | 0 |
+| <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 2 | 0 |
 | <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 3 | 0 |
 | <img src="docs/assets/progress/tooling.svg" width="300"> | **Measurement and automation** | 4 | 1 | 0 |
 
-**35 of 56** items done or decided, **18** merged and waiting for a game run, **3** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
+**35 of 62** items done or decided, **24** merged and waiting for a game run, **3** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
 
 <!-- PROGRESS:END -->
 
@@ -120,6 +121,7 @@ Every number on this page is from one PC: **AMD Ryzen 9 5900X · 32 GB RAM · NV
 |---|---|
 | **[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** | charts of every measured run, filterable list of every port |
 | **[docs/TRACKER.md](docs/TRACKER.md)** | every item by category and status, with source, switch, effect and commit |
+| **[Project board](https://github.com/users/insenzaboor/projects/2)** | every item as a card: Todo / In Progress / Done, with port status, category, source, switch, effect and commit fields |
 | **[Issues](https://github.com/insenzaboor/victory-rtx3060/issues)** | one issue per open item, labelled by category and status |
 | [`docs/data/`](docs/data) | the single source of truth: `ports.json` and `runs.json`. `python scripts/tracker/build.py` rebuilds the tracker, progress bars and chart |
 
