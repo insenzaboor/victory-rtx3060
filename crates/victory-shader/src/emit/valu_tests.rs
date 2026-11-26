@@ -186,6 +186,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -2092,6 +2093,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2309,6 +2311,7 @@ fn a_spread_dispatch_runs_each_asked_group_once() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2353,4 +2356,190 @@ fn a_spread_dispatch_runs_each_asked_group_once() {
     }
     eprintln!("ran on {ran:?}");
     assert!(!ran.is_empty(), "no device ran the test");
+}
+
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | op << 18 | 1 << 13,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// A one-wave compute program with a root table in parameter 1 (address in
+/// s[4:5]) holding the views `used` names, lowered (`VICTORY_HALVES` is on
+/// in tests).
+fn lowered_with_table(words: &[u32], used: Vec<UsedResource>, threads: u32) -> lower::Lowered {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [threads, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower")
+}
+
+fn table_view(kind: ResourceType, table_offset_dwords: u32, stride: u32) -> UsedResource {
+    UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: table_offset_dwords / 8,
+        stride,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    }
+}
+
+/// From pr0vId3nce/VIctory-NVIDIA e49edcca / b85748d1 (fxceless/victory-fork
+/// #927): a program that moves a typed buffer's 16-bit channels
+/// (`buffer_load_format_d16_xyzw` from a table's view, the store to another)
+/// names both places for the host, as the descriptors it loads, not the
+/// start of the range their used-resource entry describes (one entry for a
+/// range from dword 0, a load at byte 0x20: dword 8). A descriptor picked at
+/// run time names nothing: the pick may land on the store's place too, so
+/// no place of that table is named and the d16 accesses there take the float
+/// path. The DXIL validates. A raw store through a table names nothing.
+#[test]
+fn half_places_are_the_descriptors_the_program_loads() {
+    const LOAD_D16_XYZW: u32 = 0x83;
+    const STORE_D16_XYZW: u32 = 0x87;
+    let used = || vec![table_view(ResourceType::Srv, 0, 4), table_view(ResourceType::Uav, 16, 4)];
+    let at = |dst: u8, offset: u32| {
+        let mut w = s_load_dwordx4(dst, 4);
+        w[1] |= offset;
+        w
+    };
+    let picked = |dst: u8, soffset: u8| {
+        let mut w = s_load_dwordx4(dst, 4);
+        w[1] = u32::from(soffset) << 25;
+        w
+    };
+    let mut fixed = vec![s_mov_b32(5, 0x80)];
+    fixed.extend_from_slice(&at(8, 0x20));
+    fixed.extend_from_slice(&at(12, 0x40));
+    fixed.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+    fixed.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+    fixed.push(S_ENDPGM);
+    let l = lowered_with_table(&fixed, used(), 32);
+    assert_eq!(l.half_views, [(1, 8), (1, 16)]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = l.dxil.clone();
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    let mut runtime = vec![s_mov_b32(5, 0x80), vop1(0x02, 20, vgpr(0))];
+    runtime.extend_from_slice(&picked(8, 20));
+    runtime.extend_from_slice(&at(12, 0x40));
+    runtime.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+    runtime.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+    runtime.push(S_ENDPGM);
+    assert!(lowered_with_table(&runtime, used(), 32).half_views.is_empty());
+    assert!(build_valu_cs(&[]).half_views.is_empty());
+}
+
+/// From pr0vId3nce/VIctory-NVIDIA ba327cca / 77adfb81: a format load of
+/// whole dwords (`buffer_load_format_x`, not d16) whose result the program
+/// only reads one half of as a half float (`v_cvt_f32_f16`) moves 16-bit
+/// integers (the head program reads the face network's output so, from an
+/// `R16_UINT` view) and names its view. Read as a whole float (`v_add_f32`)
+/// it names nothing; nor does a load of halves beside a load of the same
+/// view read as a whole float, d16 or not. Behind a branch, the value goes
+/// on through a phi and a later write under EXEC only keeps it.
+#[test]
+fn a_format_load_read_as_halves_names_its_view() {
+    const LOAD_FORMAT_X: u32 = 0x00;
+    const LOAD_FORMAT_D16_X: u32 = 0x80;
+    const V_CVT_F32_F16: u16 = 0x0B;
+    const V_ADD_F32: u8 = 0x03;
+    let lowered = |body: &[u32]| {
+        let mut second = s_load_dwordx4(12, 4);
+        second[1] |= 0x20;
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.extend_from_slice(&second);
+        words.extend_from_slice(body);
+        words.extend_from_slice(&buffer_store_dword(2, 12, 0));
+        words.push(S_ENDPGM);
+        let used = vec![table_view(ResourceType::Srv, 0, 4), table_view(ResourceType::Uav, 8, 0)];
+        lowered_with_table(&words, used, 1)
+    };
+    let load = mubuf_idxen(LOAD_FORMAT_X, 1, 0, 8);
+    let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
+    let as_halves = lowered(&[&load[..], &[half]].concat());
+    assert_eq!(as_halves.half_views, [(1, 0)]);
+    let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
+    assert!(as_float.half_views.is_empty());
+    let mut beside = load.to_vec();
+    beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
+    beside.push(half);
+    beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
+    assert!(lowered(&beside).half_views.is_empty());
+    const SAVE_EXEC: u32 = 0xBE90_037E; // s_mov_b32 s16, exec_lo
+    const ONLY_LANE_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec_lo, 0, v0
+    const SKIP_3: u32 = 0xBF88_0003; // s_cbranch_execz over the next 3 words
+    const RESTORE_EXEC: u32 = 0xBEFE_0310; // s_mov_b32 exec_lo, s16
+    let zero = vop1(0x01, 2, 128); // v_mov_b32 v2, 0
+    let rewrite = vop1(0x01, 1, 128); // v_mov_b32 v1, 0
+    let branched = lowered(
+        &[
+            &[zero, SAVE_EXEC, ONLY_LANE_0, SKIP_3][..],
+            &load,
+            &[half, RESTORE_EXEC, SAVE_EXEC, ONLY_LANE_0, rewrite, RESTORE_EXEC],
+        ]
+        .concat(),
+    );
+    assert_eq!(branched.half_views, [(1, 0)]);
+    let d16 = mubuf_idxen(LOAD_FORMAT_D16_X, 1, 0, 8);
+    let d16_alone = lowered(&[&d16[..], &[half]].concat());
+    assert_eq!(d16_alone.half_views, [(1, 0)]);
+    let mut d16_beside = d16.to_vec();
+    d16_beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
+    d16_beside.push(half);
+    d16_beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
+    assert!(lowered(&d16_beside).half_views.is_empty());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for l in [&as_halves, &branched, &d16_alone] {
+            let mut dxil = l.dxil.clone();
+            v.validate(&mut dxil).expect("DXIL validation failed");
+        }
+    }
 }

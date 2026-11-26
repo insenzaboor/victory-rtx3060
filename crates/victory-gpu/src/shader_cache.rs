@@ -159,6 +159,12 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::wave32_fixes() {
             bytes.extend_from_slice(b"VICTORY_WAVE32_FIXES=1");
         }
+        // Likewise, only when on (pr0vId3nce/VIctory-NVIDIA's translator
+        // version 3, aa67414f): 16-bit halves through tables' typed buffer
+        // views keep their bits (`VICTORY_HALVES=1`).
+        if victory_shader::emit::halves_on() {
+            bytes.extend_from_slice(b"VICTORY_HALVES=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -431,6 +437,15 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    // Only when there are any (`VICTORY_HALVES=1`, which is in the key):
+    // entries without them keep the encoding of [`FORMAT`] 2.
+    if !s.half_views.is_empty() {
+        word(&mut out, s.half_views.len() as u32);
+        for &(slot, dword) in &s.half_views {
+            word(&mut out, u32::from(slot));
+            word(&mut out, dword);
+        }
+    }
     out
 }
 
@@ -501,6 +516,15 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    // (None unless the entry has a tail: see `encode`.)
+    let mut half_views = Vec::new();
+    if !r.0.is_empty() {
+        let n = r.word()? as usize;
+        half_views.reserve(n.min(256));
+        for _ in 0..n {
+            half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+        }
+    }
     r.0.is_empty().then_some((
         HostShader {
         stage,
@@ -512,6 +536,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
         },
         made_by,
     ))
@@ -548,6 +573,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
