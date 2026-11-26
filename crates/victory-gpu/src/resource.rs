@@ -1264,12 +1264,39 @@ pub(crate) fn held_only() -> bool {
 
 /// The first level a placed texture's view shows: of views of one 2D
 /// texture (the others show whole textures). After victory-amd 4436f8f1.
+///
+/// With `VICTORY_LOD_CLAMP=1` a view that holds its detail back with a least
+/// level of detail (word 7, `ResourceMinLODClamp`) shows from that level on
+/// too: the title streams the larger levels in later and their memory holds
+/// nothing yet, so the host copy goes without them as for a view that
+/// starts there (Belobug 5d7bd16d, where it is on; it saw no such view of
+/// Grand Theft Auto VI's, so off here until a run shows some: the first
+/// ones are logged either way).
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
     const TEXTURE_2D_VIEW: u32 = 4;
     match *view {
+        [_, TEXTURE_2D_VIEW, _, _, first, _, _, clamp, ..] => first.max(lod_clamped(first, f32::from_bits(clamp))).min(15),
         [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
         _ => 0,
     }
+}
+
+/// The first level a least level of detail `clamp` leaves to a view that
+/// starts at `first` ([`first_mip`]); 0 with the switch off.
+fn lod_clamped(first: u32, clamp: f32) -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let level = if clamp.is_finite() && clamp >= 1.0 { clamp.floor().min(15.0) as u32 } else { 0 };
+    if level <= first {
+        return 0;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_LOD_CLAMP").is_some_and(|v| v == "1"));
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(views = n, first, clamp, on, "a placed texture's view holds its detail back (VICTORY_LOD_CLAMP)");
+    }
+    if on { level } else { 0 }
 }
 
 /// The level from which on a texture of layout `layout` is read for a view
