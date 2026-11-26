@@ -1197,7 +1197,6 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1209,10 +1208,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1246,7 +1242,6 @@ mod host {
     }
 
     /// A key name of [`scripted`]'s lists, as a virtual key.
-    #[cfg(feature = "diagnostics")]
     fn key_code(key: &str) -> Option<u8> {
         Some(match key.trim() {
             "Enter" => 0x0D,
@@ -1263,11 +1258,9 @@ mod host {
     }
 
     /// One entry of `VICTORY_KEYS`: from, to, tap period (zero: held), key.
-    #[cfg(feature = "diagnostics")]
     type Scripted = (Duration, Duration, Duration, u8);
 
     /// `<seconds>:<key>`, `<from>-<to>:<key>` or `<from>-<to>/<period>:<key>`.
-    #[cfg(feature = "diagnostics")]
     fn parse_keys(list: &str) -> Vec<Scripted> {
         let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
         list.split(',')
@@ -1290,7 +1283,6 @@ mod host {
     /// Whether an entry presses its key `now` after input started: held
     /// through its span, or with a period tapped for 0.2 s (at most half
     /// the period) at its start and every period after.
-    #[cfg(feature = "diagnostics")]
     fn pressed(&(from, to, period, _): &Scripted, now: Duration) -> bool {
         if !(from..to).contains(&now) {
             return false;
@@ -1311,7 +1303,6 @@ mod host {
     /// appended to that file while the title runs, each `<key>` or
     /// `<key> <seconds>` (held that long, 0.2 s without), are pressed as
     /// they are read (the file is looked at every 50 ms).
-    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> =
             LazyLock::new(|| (Instant::now(), parse_keys(&std::env::var("VICTORY_KEYS").unwrap_or_default())));
@@ -1327,7 +1318,6 @@ mod host {
     }
 
     /// The keys `VICTORY_KEYS_LIVE`'s file presses now.
-    #[cfg(feature = "diagnostics")]
     fn live() -> Vec<u8> {
         struct Live {
             path: std::path::PathBuf,
@@ -1376,7 +1366,6 @@ mod host {
         live.held.iter().map(|&(_, vk)| vk).collect()
     }
 
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn scripted_keys_tap_and_hold() {
         let keys = parse_keys("1:Enter,2-4:W,10-20/1.5:Enter,bad,3:Nope");
