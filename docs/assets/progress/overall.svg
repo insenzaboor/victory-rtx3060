@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="Everything ported and evaluated: 44% done">
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="Everything ported and evaluated: 43% done">
 <style>text{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;fill:#768390;font-size:12px} .t{fill:#768390;font-size:14px;font-weight:600}</style>
-<text class="t" x="10" y="20">Everything ported and evaluated</text><text x="550" y="20" text-anchor="end">44% done · 73 of 80 landed</text>
+<text class="t" x="10" y="20">Everything ported and evaluated</text><text x="550" y="20" text-anchor="end">43% done · 76 of 83 landed</text>
 <rect x="10" y="30" width="540" height="16" rx="8" fill="#8c959f" fill-opacity="0.25"/>
-<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="236.2" height="16" fill="#2ea043"/><rect x="246.2" y="30" width="256.5" height="16" fill="#3b82f6"/><rect x="502.8" y="30" width="47.2" height="16" fill="#6e7681"/></g>
-<text x="10" y="64">■ 35 done</text><text x="120" y="64" style="fill:#3b82f6">■ 38 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 7 planned</text>
+<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="234.2" height="16" fill="#2ea043"/><rect x="244.2" y="30" width="260.2" height="16" fill="#3b82f6"/><rect x="504.5" y="30" width="45.5" height="16" fill="#6e7681"/></g>
+<text x="10" y="64">■ 36 done</text><text x="120" y="64" style="fill:#3b82f6">■ 40 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 7 planned</text>
 </svg>

@@ -152,10 +152,10 @@
       "id": "release-build",
       "title": "Plain release build (no diagnostics)",
       "category": "performance",
-      "status": "ready",
+      "status": "no-gain",
       "source": "cool_fox / CGBJ",
       "commit": "ca28c339",
-      "effect": "Builds clean; autopilot keys now work in release builds",
+      "effect": "q1-release vs q1-diag: 31.2 vs 31.6 ms per 1k draws (noise); loads fine (89 s). Use it to play, not for speed.",
       "issue": 2
     },
     {
@@ -361,7 +361,7 @@
       "source": "avatarmanz 631400f..7ab13ed",
       "commit": "d005b299",
       "switch": "VICTORY_PORT_CONSTANTS_ORDER (on)",
-      "effect": "Trees and palms no longer drop out (upstream runs pop-14..17)",
+      "effect": "Upstream: trees and palms no longer drop out. Bisect run b2 (off) was ruined by paging; kept on.",
       "issue": 12
     },
     {
@@ -397,12 +397,12 @@
       "id": "belobug-flicker",
       "title": "Title textures uploaded in the submission prelude",
       "category": "rendering",
-      "status": "default-untested",
+      "status": "ready",
       "source": "Belobug 5d6bd841",
-      "effect": "Title textures checked at submission and uploaded just before the list that uses them, not a frame late (Belobug)",
+      "effect": "Bisect: costs ~3 ms per 1k draws (~9%) on the submit thread (q1-diag 31.6, b3 off 28.8, all four off 27.6). Flicker benefit judged in queue q7.",
       "issue": 15,
       "commit": "a606b9cb",
-      "switch": "VICTORY_PRELUDE_UPLOADS (on)"
+      "switch": "VICTORY_PRELUDE_UPLOADS=1 (now off by default)"
     },
     {
       "id": "belobug-ambient",
@@ -820,6 +820,38 @@
       "switch": "VICTORY_BLOCK_HANDLES=1",
       "effect": "Fixed AMD compiler crashes; none known on NVIDIA",
       "issue": 45
+    },
+    {
+      "id": "sampler-aniso-point",
+      "title": "Sampler filter value 2 decoded as point, not anisotropic linear",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "ours (found studying XCL; no XCL code)",
+      "commit": "5c9d31f0",
+      "switch": "VICTORY_SAMPLER_ANISO_POINT (on)",
+      "effect": "Point-sampled lookups and noise were blended under anisotropy: edge halos, possibly hair dots",
+      "issue": 46
+    },
+    {
+      "id": "f16-nearest",
+      "title": "f32 to f16 conversions round to nearest even everywhere",
+      "category": "shaders",
+      "status": "ready",
+      "source": "ours (XCL study lead)",
+      "commit": "7aed3d5a",
+      "switch": "VICTORY_F16_NEAREST=1",
+      "effect": "NVIDIA truncates (0x3c01) where the console rounds (0x3c02); verified on the RTX 3060",
+      "issue": 47
+    },
+    {
+      "id": "formats-116-117",
+      "title": "10-bit float colour formats 116/117 mapped (RGBA16F)",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "ours (XCL study lead)",
+      "commit": "55eee34e",
+      "effect": "Were sized but never mapped; widened on upload",
+      "issue": 48
     }
   ]
 }

@@ -43,11 +43,14 @@ $set = [ordered]@{
     VICTORY_BCPACK_CACHE_MB = '0'; VICTORY_ALIAS_SAME = '1'; VICTORY_EXACT_LATELY = '8192'
     # picture: the title's own upscaler (FSR4's fallback dots hair and shadow edges)
     VICTORY_UPSCALER = '6'
+    # prelude uploads (flicker fix) cost ~3 ms per 1k draws: off unless -Experimental
+    VICTORY_PRELUDE_UPLOADS = '0'
 }
 if ($Experimental) {
     # merged, waiting for verification (see docs/TRACKER.md)
     $set.VICTORY_WAVE_LDS_LOOSE = '1'; $set.VICTORY_LOOKUP_CACHE = '1'; $set.VICTORY_APU_ASYNC = '1'
     $set.VICTORY_EARLY_TABLES = '1'; $set.VICTORY_INDIRECT_REST = '0'; $set.VICTORY_LEVELS_ON_DEMAND = '1'
+    $set.VICTORY_PRELUDE_UPLOADS = '1'
 }
 foreach ($k in $set.Keys) { Set-Item "Env:$k" $set[$k] }
 if ($DataDir) { $env:VICTORY_DATA_DIR = $DataDir }
