@@ -3103,9 +3103,21 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
     /// from this thread's descriptor of it if the recording `recording` has
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
-    /// ([`ListViews`]). What is known of the record in this recording;
-    /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    /// ([`ListViews`]). What is known of the record in this recording, what
+    /// `decide` made of that, and the view itself if `decide` asked for it
+    /// (it was a second look at this thread's views, a `listed_view`, for
+    /// every view a draw had not read yet in the list); `None` (the slot is
+    /// not made): not a view kept so.
+    ///
+    /// `decide` runs with this thread's views taken: it must not make or
+    /// look for listed views itself.
+    pub(crate) fn make_listed<T>(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        decide: impl FnOnce(&Listed) -> (T, bool),
+    ) -> Option<(Listed, T, Option<View>)> {
         if self.sampler {
             return None;
         }
@@ -3120,33 +3132,38 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            let (start, step, at) = (views.start, views.step, 2 * views.made.len() as u32);
+            let slot = |i: u32| ListViews::slot_in(start, step, i);
+            // (One look at the map for a view made before: nearly all.)
+            let made = match views.made.entry(words) {
+                std::collections::hash_map::Entry::Occupied(made) => made.into_mut(),
+                std::collections::hash_map::Entry::Vacant(room) => {
+                    let view = super::view_at(words[1], words[2])?;
+                    // (A constant buffer's bytes are copied for each draw.)
+                    if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                        return None;
+                    }
+                    let twin = twinned(&view);
+                    let kept = make_twinned(&view, slot(at), Some(slot(at + 1)))?;
+                    let listed = Listed {
+                        kind: crate::draw::view_kind(&view),
+                        texture: is_texture_view(&view),
+                        ready: (0, 0, false),
+                        tabled: None,
+                    };
+                    room.insert(ListView { view, at, twin, kept, listed })
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
-            }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
+            };
+            self.copy_from(index, slot(made.at));
             if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.copy_from(self.raw + index, slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
             self.keep(index, made.kept.clone());
-            Some(made.listed)
+            let (decided, view) = decide(&made.listed);
+            Some((made.listed, decided, view.then(|| made.view.clone())))
         })
     }
 
@@ -6524,7 +6541,8 @@ struct ListView {
 /// copies its descriptor.
 struct ListViews {
     recording: u64,
-    heap: ID3D12DescriptorHeap,
+    /// (Held: `start` is its first slot.)
+    _heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -6547,27 +6565,20 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews { recording: 0, _heap: heap, step, start, made: Default::default() })
         }
     }
 
-    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
-        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+    /// Slot `i` of the heap whose first slot is at `start`, `step` bytes
+    /// apart.
+    fn slot_in(start: usize, step: usize, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(i < Self::SLOTS && start != 0);
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step }
     }
 }
 
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The view the record `words` names, as this thread made it for `recording`.
-pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
-    LIST_VIEWS.with(|views| {
-        let views = views.borrow();
-        let views = views.as_ref().filter(|v| v.recording == recording)?;
-        views.made.get(&words).map(|m| m.view.clone())
-    })
 }
 
 /// Notes what is known of the record `words` in `recording`.
