@@ -2106,15 +2106,39 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+/// `VICTORY_SCRATCH_SPARE_MB=<n>`: at most `n` MiB of scratch chunks are kept
+/// while no list holds them (`0`: none, every chunk is freed when its list
+/// gives it back), under what [`spare_most_for`] allows; unset, that alone
+/// (up to 1 GiB). Lower, more chunks are freed at give-back and made anew
+/// by the next list; nothing else changes. After DoubleGhosty/cool_fox
+/// 39318a8.
+fn spare_asked() -> Option<u64> {
+    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
+    *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// [`spare_most_for`]'s limit with an asked one ([`spare_asked`]).
+fn spare_limit(asked: Option<u64>, computed: u64) -> u64 {
+    asked.map_or(computed, |most| most.min(computed))
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
 /// or dropped): kept for the next list, or freed past [`spare_most_for`]
-/// and without the pool.
+/// (and [`spare_asked`]) and without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
     let mut freed = Vec::new();
-    let most = spare_most_for(available_physical_ram_recent(), keep_freed() && !crate::residency::limited_host_ram());
+    let most = spare_limit(
+        spare_asked(),
+        spare_most_for(available_physical_ram_recent(), keep_freed() && !crate::residency::limited_host_ram()),
+    );
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         // Kept while the PC had more room: let go down to what it has now.
@@ -10744,7 +10768,17 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, spare_limit};
+
+    /// Unset, the limit is what free memory allows; an asked one is a cap.
+    #[test]
+    fn spare_limit_is_as_before_unless_asked() {
+        assert_eq!(spare_limit(None, 1 << 30), 1 << 30);
+        assert_eq!(spare_limit(None, 128 << 20), 128 << 20);
+        assert_eq!(spare_limit(Some(64 << 20), 1 << 30), 64 << 20);
+        assert_eq!(spare_limit(Some(0), 1 << 30), 0);
+        assert_eq!(spare_limit(Some(u64::MAX), 128 << 20), 128 << 20);
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.

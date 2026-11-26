@@ -206,6 +206,26 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Whether a texture picked by index found changed with nothing to tell of
+/// it is looked at in every frame from then on, until it has stayed the same
+/// for [`CHANGING_IDLE`] looks (`VICTORY_TEXTURE_CHANGING=1`; off by default:
+/// [`recheck_soon`] looks once in the next frame, then the schedule goes on).
+/// A video or a painted texture that changes every second or third frame was
+/// otherwise found a schedule step late each time. From KevinPratap/ApexIV
+/// da3b0c2 with its cd751e8 (slots never seen changing keep the schedule,
+/// the every-frame look for all fresh uploads cost ~12 ms a frame).
+fn texture_changing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGING").is_some_and(|v| v == "1"))
+}
+
+/// In a slot's look count: it was found changing ([`texture_changing`]); the
+/// low bits count the looks since that found it the same.
+const CHANGING_BIT: u8 = 0x80;
+/// Looks in a row that find a changing slot the same before it goes back to
+/// the schedule (at [`RECHECK_FRAMES`]`[2]`).
+const CHANGING_IDLE: u8 = 120;
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -306,6 +326,86 @@ const WINDOW_MOST: u64 = 64;
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+}
+
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
+/// clamped right before they run, after every earlier shader write
+/// (`VICTORY_PORT_CONSTANTS_ORDER`, on by default; `=0`: in batches and
+/// windows as any other).
+///
+/// A batch or a window clamps records ahead: in the pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine, its bytes are the title's of
+/// the submission. Where the card reads the title's memory in place, the
+/// records the title's culling passes write between the two are read before
+/// they are written: the execution draws the records of an earlier frame,
+/// or none (pop-in: palms and trees missing for runs of frames while the
+/// camera moves). From avatarmanz 631400f / 15c3d0e (runs pop-5 to pop-17).
+fn in_place_order() -> bool {
+    crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
+}
+
+/// With [`in_place_order`]: such executions never in a batch (unset or
+/// `VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`: the palms stayed in every frame,
+/// run pop-14). `=0`: in a batch opened after the last shader that may
+/// write buffers; not enough upstream, the palms still came and went
+/// (run pop-15).
+fn in_place_alone() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: indirect executions with arguments in place, those
+/// clamped alone for it, and the 1 MiB ranges they came from (diagnostics).
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// An indirect execution of `kind` with its arguments at `arguments` in place.
+fn in_place_indirect(arguments: u64, kind: u32, ordered: bool) {
+    IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+    IN_PLACE_INDIRECT[1].fetch_add(u64::from(ordered), Ordering::Relaxed);
+    let slot = match kind {
+        2 => 1,
+        10 => 2,
+        _ => 0,
+    };
+    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+}
+
+/// With the frame line: indirect executions with arguments in place per
+/// frame over `frames`, and the ranges most of them came from.
+pub(crate) fn in_place_indirect_line(frames: f64) {
+    let [all, ordered] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
+    if all == 0 {
+        return;
+    }
+    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+    let top: Vec<String> = by
+        .iter()
+        .take(6)
+        .map(|(mb, n)| {
+            format!(
+                "{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh",
+                mb << 20,
+                n[0] as f64 / frames,
+                n[1] as f64 / frames,
+                n[2] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER{}); from {} ranges of 1 MiB, the busiest: {}",
+        all as f64 / frames,
+        ordered as f64 / frames,
+        if in_place_alone() { "" } else { ", _ALONE=0: in batches opened after the last write" },
+        by.len(),
+        top.join("; ")
+    );
 }
 
 /// Whether indirect executions of one record are clamped in batches
@@ -2670,9 +2770,22 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
+            // Found changing (`texture_changing`): the upload below is looked
+            // at in every frame.
+            let mut first_looks = 0;
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if looks & CHANGING_BIT != 0 && texture_changing() {
+                        let idle = (looks & !CHANGING_BIT).saturating_add(1);
+                        if idle < CHANGING_IDLE {
+                            host.texture_slot_recheck(index, write, frame + 1, (at, len), print, CHANGING_BIT | idle, uploaded);
+                        } else {
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[2], (at, len), print, 2, uploaded);
+                        }
+                        continue;
+                    }
+                    let looks = looks & !CHANGING_BIT;
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
@@ -2690,6 +2803,10 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                if texture_changing() {
+                    again_in = 1;
+                    first_looks = CHANGING_BIT;
+                }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2706,7 +2823,7 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = looks & !CHANGING_BIT,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
@@ -2862,7 +2979,7 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, first_looks, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -2987,7 +3104,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, first_looks, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -4384,10 +4501,28 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped right before their
+        // execution, after every earlier shader write. Alone (the default):
+        // no batch at all; `VICTORY_PORT_CONSTANTS_ORDER_ALONE=0`: a batch a
+        // shader writing buffers was recorded after is not used, a new one
+        // is opened here, after it. Never a window.
+        let in_place = args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
+        let ordered = in_place && in_place_order();
+        if in_place {
+            in_place_indirect(arguments, kind, ordered);
+        }
+        let alone = ordered && in_place_alone();
+        if ordered {
+            if alone || self.batch.as_ref().is_some_and(|b| b.wrote) {
+                self.batch = None;
+            }
+            self.window = None;
+        }
         // One record without a count: clamped in a batch (`batches`). Not a
         // spread dispatch: the batch writes [x, y, z] records, the spread
         // signature reads [row, asked x, x, y, z].
-        let batch = if batches() > 0 && max == 1 && count.is_none() && !is_spread {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() && !is_spread {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4403,6 +4538,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !ordered
             && kind != DISPATCH
             && max == 1
             && count.is_none()

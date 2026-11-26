@@ -3136,6 +3136,16 @@ fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
     out
 }
 
+/// How long a window nothing asked for is kept, in milliseconds, in place
+/// of what free memory decides (`VICTORY_WINDOW_IDLE_MS`; unset, that; no
+/// less than 2 s, `crate::texture::idle_ms`). With 12 GiB or more free that
+/// is five minutes. The memory bands below may still shorten it. After
+/// DoubleGhosty/cool_fox cf3f615.
+fn window_idle_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_WINDOW_IDLE_MS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
 /// Kept between sweeps so one sample near a watermark does not toggle the
 /// policy on the next submission.
 static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
@@ -3158,7 +3168,7 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
-    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut idle_ms = crate::texture::idle_ms(window_idle_ms(), crate::host::ram_idle_ms(crate::host::available_physical_ram()));
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
