@@ -2979,6 +2979,18 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
+/// Whether a submission sets the heaps' records' mirroring going before its
+/// card steps and flight waits (`VICTORY_HEAPS_EARLY=1`, or a `VICTORY_AB`
+/// switch; off by default).
+fn heaps_early() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAPS_EARLY") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAPS_EARLY").is_some_and(|v| v == "1"))
+}
+
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     let (written, copies) = {
         let line = line();
@@ -5753,6 +5765,14 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // The heaps' records mirrored by their thread from here, not after the
+        // steps for the card are planned and the flights read from are waited
+        // for (`VICTORY_HEAPS_EARLY=1`, off by default; chabrune/VIctory-7900XTX
+        // 144bd30: 4.9 ms a frame less at the submission's end on an RX 7700 XT).
+        // The records are the title's, written before it submitted; off by
+        // default because a flight landed while waiting could still write
+        // title memory that holds records.
+        let heaps_early = heaps_early().then(crate::descriptor::begin_sync_heaps);
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -5781,7 +5801,7 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        let heaps_synced = heaps_early.unwrap_or_else(crate::descriptor::begin_sync_heaps);
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
