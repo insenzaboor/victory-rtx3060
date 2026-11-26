@@ -5574,49 +5574,60 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
-        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+    // The copy is made outside the writers' lock: each buffer it takes is
+    // made resident and waited for on the card (`host::mapped`), two with a
+    // card side, and every list thread asking for any window waited behind
+    // that (1.4 s of waits in 4 frames, run tenth's timeline). Another thread
+    // that made the same window meanwhile wins; this one is dropped.
+    drop(map);
+    let made = || -> Option<Arc<Shadow>> {
+        // One buffer in the card's memory, filled by the CPU through the bus.
+        if let Some((buffer, data)) = window_mapped_for(len) {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+            shadow.window = true;
+            shadow.mapped = true;
+            return Some(Arc::new(shadow));
+        }
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // With room for windows on the card (`window_card_most`): shaders get a
+        // buffer there, and the one just made is the CPU's side.
+        let (buffer, card) = match window_card_for(len) {
+            Some(on_card) => {
+                crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let card = Card {
+                    staging: buffer,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    touched: Default::default(),
+                    size: len,
+                };
+                (on_card, Some(card))
+            }
+            None => (buffer, None),
+        };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
-        shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                size: len,
-            };
-            (on_card, Some(card))
-        }
-        None => (buffer, None),
+        shadow.card = card;
+        Some(Arc::new(shadow))
     };
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-    shadow.window = true;
-    shadow.card = card;
-    let shadow = Arc::new(shadow);
+    let shadow = made()?;
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(other) = map.get(&(start, len)) {
+        note(other);
+        return Some(other.clone());
+    }
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
@@ -5670,7 +5681,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             return Some(shadow.clone());
         }
-        if map.len() >= MANY {
+        // Every 64th asking past MANY (or at four times it): the look at every
+        // copy kept, a COM call each, under the lock every list thread takes,
+        // was made at every miss with 400-600 kept (run tenth's timeline).
+        if map.len() >= MANY && (map.len() >= 4 * MANY || now.is_multiple_of(64)) {
             // Held by the map alone (no list), its buffer by the copy alone (no
             // slot shows it), and not asked for lately.
             map.retain(|_, (shadow, used)| {
