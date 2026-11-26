@@ -626,6 +626,102 @@
       "commit": "92da03de",
       "effect": "The game no longer starts without its settings",
       "issue": 27
+    },
+    {
+      "id": "split-tables",
+      "title": "Descriptor slots given back after split submits",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "fxceless af23c652 (PR #1320)",
+      "commit": "26b3d211",
+      "switch": "VICTORY_SPLIT_TABLES (on)",
+      "effect": "Slot ring ran out on NVIDIA (262,144): flicker, missing geometry (avatarmanz#35)"
+    },
+    {
+      "id": "wait-resident-textures",
+      "title": "Residency wait for textures only",
+      "category": "performance",
+      "status": "ready",
+      "source": "Belobug#346",
+      "commit": "4bd60465",
+      "switch": "VICTORY_WAIT_RESIDENT=textures",
+      "effect": "Buffers skip the residency wait"
+    },
+    {
+      "id": "card-pad",
+      "title": "Padding past each card copy",
+      "category": "stability",
+      "status": "ready",
+      "source": "grimygunnz 7c030137",
+      "commit": "a31ba178",
+      "switch": "VICTORY_CARD_PAD_KB=64",
+      "effect": "Against page-fault device removals"
+    },
+    {
+      "id": "spares-headroom",
+      "title": "Spare texture blocks scale with free VRAM",
+      "category": "memory",
+      "status": "ready",
+      "source": "avatarmanz#94 / PR #119",
+      "commit": "2f65cd92",
+      "switch": "VICTORY_SPARES_HEADROOM=1",
+      "effect": "Late textures near the 12 GB budget"
+    },
+    {
+      "id": "div-fixup",
+      "title": "v_div_fixup priority order (0/x no longer +-Inf)",
+      "category": "shaders",
+      "status": "ready",
+      "source": "dng-nguyn 472518cb",
+      "commit": "0d4c1fc4",
+      "switch": "VICTORY_DIV_FIXUP=1",
+      "effect": "NaN in the picture (2060 / 4070 reports)"
+    },
+    {
+      "id": "nan-scrub",
+      "title": "NaN scrubbed from colour outputs",
+      "category": "shaders",
+      "status": "ready",
+      "source": "aleksesipenko 59609080",
+      "commit": "5cb3e52a",
+      "switch": "VICTORY_NAN_SCRUB=1",
+      "effect": "NaN dots and blobs (4070 TiS, 3060 reports); test for the dots on hair"
+    },
+    {
+      "id": "flicker-fetch-check",
+      "title": "Suspect: torn copy-backs with RELAY_COPY + CARD_BUFFERS_MIN_KB",
+      "category": "rendering",
+      "status": "planned",
+      "source": "fxceless#1268",
+      "switch": "VICTORY_FETCH_CHECK=1",
+      "effect": "One-frame black flashes on a 4080; our launcher sets exactly this pair (queue q8)"
+    },
+    {
+      "id": "flicker-card-steps",
+      "title": "Suspect: CARD_STEPS=2 flicker and wrong faces",
+      "category": "rendering",
+      "status": "planned",
+      "source": "fxceless#1268 (2080S, 4070 TiS, 5070 Ti)",
+      "switch": "VICTORY_CARD_STEPS=0",
+      "effect": "Fixes upstream, costs ~5 fps (queue q9)"
+    },
+    {
+      "id": "flicker-thin",
+      "title": "Suspect: async submit (THIN=1) road flicker",
+      "category": "rendering",
+      "status": "planned",
+      "source": "fxceless#912 (5060, 3070, 5070)",
+      "switch": "VICTORY_THIN=0",
+      "effect": "Stretched polygons, road flicker (queue q10)"
+    },
+    {
+      "id": "late-textures-port2",
+      "title": "Suspect: port 2 misses view records on NVIDIA",
+      "category": "rendering",
+      "status": "planned",
+      "source": "Belobug#346 (3080 10 GB)",
+      "switch": "VICTORY_PORT_DESCRIPTORS=0",
+      "effect": "427,634 missed view records: late textures (queue q11)"
     }
   ]
 }
