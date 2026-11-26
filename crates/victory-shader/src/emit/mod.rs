@@ -119,7 +119,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use loose_lds::{wave32_fixes, wave_lds_loose};
-pub use sampler::StaticSampler;
+pub use sampler::{StaticSampler, aniso_point_on as sampler_aniso_point, anisotropic as sampler_anisotropic, is_aniso_point as sampler_is_aniso_point};
 pub use lower::{div_fixup_order, host_settings, nan_scrub, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{

@@ -679,6 +679,16 @@ impl HostPipeline {
                 }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
+                // The filter from the sampler's words as decoded now
+                // (`VICTORY_SAMPLER_ANISO_POINT`), whichever decode the
+                // cached translation was made with.
+                let s = &match t.samplers.get(n) {
+                    Some(&words) => {
+                        crate::sampler::seen_immediate(words);
+                        s.refiltered(words)
+                    }
+                    None => *s,
+                };
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),

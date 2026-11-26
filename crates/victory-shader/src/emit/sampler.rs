@@ -13,6 +13,59 @@
 //! Comparison is the sampling instruction's, not the sampler's: the console
 //! encodes a comparison function in every sampler (D3D's default, less or
 //! equal, when unused).
+//!
+//! Anisotropic point (2) in the magnification or minification field is
+//! point sampling on that axis: bit 0 of each field is linear, and only
+//! anisotropic linear (3) asks for anisotropy. A title (or the console's
+//! driver, for a point filter with a maximum anisotropy set) writes 2 for
+//! lookup tables, G-buffer fetches and dither or noise textures that must
+//! not blend; D3D12 has no anisotropic point min/mag filter, so 2 becomes
+//! plain point ([`anisotropic`]). The mip field (none, point, linear) has
+//! no anisotropic value. `VICTORY_SAMPLER_ANISO_POINT=0` restores the
+//! earlier decode, which took 2 as anisotropic linear ([`aniso_point_on`]).
+
+/// Whether anisotropic point (2) in a sampler's magnification or
+/// minification filter is point sampling (`VICTORY_SAMPLER_ANISO_POINT`; on
+/// by default, `=0` takes it as anisotropic linear as before). Read for the
+/// immediate samplers of translations and for the console's sampler
+/// descriptions alike. Not in the shader cache's key: the host re-derives
+/// each immediate sampler's filter from its words when it makes a root
+/// signature ([`StaticSampler::refiltered`]), so a cached translation
+/// follows the switch whichever decode it was cached with.
+pub fn aniso_point_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ANISO_POINT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_ANISO_POINT").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`aniso_point_on`], for its thread only.
+    pub(super) static TEST_ANISO_POINT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a sampler with these magnification and minification filters
+/// (0 point, 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear) is an
+/// anisotropic D3D12 sampler. With `aniso_point` (the fix): only when
+/// neither axis is point (bit 0 clear: 0 or 2) and one is anisotropic
+/// linear; D3D12's anisotropic filters are linear on both axes, so a point
+/// axis never takes one. Without: whenever either is 2 or 3, as before.
+pub fn anisotropic(mag: u32, min: u32, aniso_point: bool) -> bool {
+    if aniso_point {
+        let linear = |f: u32| f == 1 || f == 3;
+        linear(mag) && linear(min) && (mag == 3 || min == 3)
+    } else {
+        mag >= 2 || min >= 2
+    }
+}
+
+/// Whether the field is anisotropic point (2), for the diagnostics counts.
+pub fn is_aniso_point(mag: u32, min: u32) -> bool {
+    mag == 2 || min == 2
+}
 
 /// A static sampler in D3D12 terms; the integers are the `D3D12_FILTER`,
 /// `D3D12_TEXTURE_ADDRESS_MODE`, `D3D12_COMPARISON_FUNC` and
@@ -46,23 +99,55 @@ impl StaticSampler {
         }
     }
 
-    /// Decodes the four sampler words.
+    /// Decodes the four sampler words ([`aniso_point_on`] decides how
+    /// anisotropic point is taken).
     pub fn from_words(w: [u32; 4]) -> Self {
-        let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
-        // wrap, mirror, clamp, mirror once; the half-border modes have no
-        // D3D form and become their nearest.
-        let address = |m: u32| [1, 2, 3, 5, 3, 5, 4, 5][m as usize];
-        let (mag, min, mip) = (bits(w[2], 20, 2), bits(w[2], 22, 2), bits(w[2], 26, 2));
-        let reduction = match bits(w[0], 29, 2) {
+        Self::from_words_as(w, aniso_point_on())
+    }
+
+    /// The magnification and minification filter fields of the words.
+    pub fn mag_min(w: [u32; 4]) -> (u32, u32) {
+        (w[2] >> 20 & 3, w[2] >> 22 & 3)
+    }
+
+    /// The D3D12 filter of the words, without the comparison bit (that is
+    /// the sampling instruction's, added by the translation): anisotropic
+    /// point taken as point with `aniso_point` ([`anisotropic`]).
+    pub fn filter_of(w: [u32; 4], aniso_point: bool) -> u32 {
+        let (mag, min) = Self::mag_min(w);
+        let mip = w[2] >> 26 & 3;
+        let reduction = match w[0] >> 29 & 3 {
             1 => 2,
             2 => 3,
             _ => 0,
         };
-        let filter = if mag >= 2 || min >= 2 {
+        if anisotropic(mag, min, aniso_point) {
             0x54 | u32::from(mip == 2) | reduction << 7
         } else {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
-        };
+        }
+    }
+
+    /// This sampler with its filter decoded again from its words `w` as
+    /// [`aniso_point_on`] says now, keeping the comparison bit (0x80) the
+    /// translation gave it. The host does this when it makes a root
+    /// signature, so translations cached under either decode give the same
+    /// filter and the switch needs no place in the shader cache's key.
+    pub fn refiltered(&self, w: [u32; 4]) -> Self {
+        StaticSampler {
+            filter: Self::filter_of(w, aniso_point_on()) | self.filter & 0x80,
+            ..*self
+        }
+    }
+
+    /// [`Self::from_words`] with the decode of anisotropic point given.
+    pub fn from_words_as(w: [u32; 4], aniso_point: bool) -> Self {
+        let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
+        // wrap, mirror, clamp, mirror once; the half-border modes have no
+        // D3D form and become their nearest.
+        let address = |m: u32| [1, 2, 3, 5, 3, 5, 4, 5][m as usize];
+        let mip = bits(w[2], 26, 2);
+        let filter = Self::filter_of(w, aniso_point);
         let lod = |v: u32| v as f32 / 256.0;
         // Without a mip filter the base level is sampled.
         let (min_lod, max_lod) = if mip == 0 {
@@ -148,9 +233,86 @@ mod tests {
             let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
             assert_eq!(s.filter, base | 1, "reduction={reduction} mip=2");
         }
-        // Mixed anisotropic mag (2) with linear min (1) and point mip (1).
-        let mixed = StaticSampler::from_words([0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0]);
-        assert_eq!(mixed.filter, 0x54);
+        // Anisotropic point mag (2) with linear min (1) and point mip (1):
+        // point magnification and linear minification, no anisotropy; the
+        // earlier decode took it as anisotropic.
+        let w = [0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0];
+        assert_eq!(StaticSampler::from_words_as(w, true).filter, 0x10);
+        assert_eq!(StaticSampler::from_words_as(w, false).filter, 0x54);
+    }
+
+    /// Every magnification x minification pair (0 point, 1 bilinear, 2
+    /// anisotropic point, 3 anisotropic bilinear), with each mip filter and
+    /// reduction: point stays point on its axis and never makes the filter
+    /// anisotropic; the earlier decode (switch off) is kept as it was.
+    #[test]
+    fn aniso_point_is_point_for_all_filter_pairs() {
+        for mag in 0..4u32 {
+            for min in 0..4u32 {
+                for mip in 0..3u32 {
+                    for (r, red) in [(0u32, 0u32), (1, 0x100), (2, 0x180)] {
+                        let w = [r << 29 | 4 << 9, 0x00FF_F000, mip << 26 | min << 22 | mag << 20, 0];
+                        let mip_bit = u32::from(mip == 2);
+                        let point_or_linear = |f: u32| f & 1;
+                        let fixed = if (mag, min) == (3, 3) || (mag, min) == (1, 3) || (mag, min) == (3, 1) {
+                            0x54 | mip_bit
+                        } else {
+                            point_or_linear(min) << 4 | point_or_linear(mag) << 2 | mip_bit
+                        } | red;
+                        let old = if mag >= 2 || min >= 2 {
+                            0x54 | mip_bit
+                        } else {
+                            min << 4 | mag << 2 | mip_bit
+                        } | red;
+                        let s = StaticSampler::from_words_as(w, true);
+                        assert_eq!(s.filter, fixed, "fixed mag={mag} min={min} mip={mip} r={r}");
+                        assert_eq!(StaticSampler::from_words_as(w, false).filter, old, "old mag={mag} min={min} mip={mip} r={r}");
+                        // An anisotropic D3D12 filter only when neither axis is point.
+                        if s.filter & 0x40 != 0 {
+                            assert!(mag & 1 == 1 && min & 1 == 1, "mag={mag} min={min}");
+                        }
+                        // The fix changes the filter only where 2 appears or a
+                        // point axis met anisotropic linear.
+                        if !(mag == 2 || min == 2 || (mag == 0 && min == 3) || (mag == 3 && min == 0)) {
+                            assert_eq!(fixed, old, "mag={mag} min={min}");
+                        }
+                        // A point axis comes out point on the host.
+                        if mag & 1 == 0 {
+                            assert_eq!(s.filter & 0x4, 0, "mag={mag} min={min}");
+                        }
+                        if min & 1 == 0 {
+                            assert_eq!(s.filter & 0x10, 0, "mag={mag} min={min}");
+                        }
+                        // Maximum anisotropy and the LOD range are not the filter's.
+                        assert_eq!(s.max_anisotropy, 16);
+                        assert_eq!(s.max_lod, if mip == 0 { 0.0 } else { 4095.0 / 256.0 });
+                    }
+                }
+            }
+        }
+        for mag in 0..4 {
+            for min in 0..4 {
+                assert_eq!(anisotropic(mag, min, true), mag & 1 == 1 && min & 1 == 1 && (mag == 3 || min == 3));
+                assert_eq!(anisotropic(mag, min, false), mag >= 2 || min >= 2);
+            }
+        }
+    }
+
+    /// The host's re-decode from the words follows the switch and keeps the
+    /// comparison bit the translation added.
+    #[test]
+    fn refiltered_follows_the_switch_and_keeps_comparison() {
+        let w = [0, 0x00FF_F000, 2 << 26 | 2 << 22 | 2 << 20, 0];
+        let was = TEST_ANISO_POINT.replace(Some(false));
+        let mut cached = StaticSampler::from_words(w);
+        assert_eq!(cached.filter, 0x55);
+        cached.filter |= 0x80;
+        TEST_ANISO_POINT.set(Some(true));
+        assert_eq!(cached.refiltered(w).filter, 0x81, "point min and mag, linear mip, comparison");
+        assert_eq!(StaticSampler::from_words(w).filter, 0x01);
+        TEST_ANISO_POINT.set(Some(false));
+        assert_eq!(cached.refiltered(w), cached);
+        TEST_ANISO_POINT.set(was);
     }
 
     #[test]
