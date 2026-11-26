@@ -9412,7 +9412,10 @@ impl Meter {
             tracing::warn!(?status, "swap chain did not present the frame");
         }
         self.last_present = status;
-        if status != S_OK {
+        // DXGI_STATUS_OCCLUDED is a success: the frame was taken. A window born covered got it for
+        // the whole run, the meter counted nothing, the caption never came and the autopilot took
+        // loaded runs for hung ones (fortysix, fortyseven).
+        if status.is_err() {
             return false;
         }
         self.frame(hwnd);
@@ -9742,11 +9745,12 @@ mod present_status_tests {
         let mut meter = Meter::new();
         let hwnd = HWND::default();
         assert!(meter.record_present(hwnd, S_OK));
-        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
+        // Occluded is a success code: the frame was taken and is counted.
+        assert!(meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
         assert!(!meter.record_present(hwnd, E_FAIL));
         assert!(!meter.record_present(hwnd, E_FAIL));
         assert!(meter.record_present(hwnd, S_OK));
-        assert_eq!(meter.frames, 2);
+        assert_eq!(meter.frames, 3);
         assert_eq!(meter.last_present, S_OK);
     }
 }
