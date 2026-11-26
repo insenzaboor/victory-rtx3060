@@ -206,6 +206,15 @@ fn submit_cut(this: This, lists: &[This]) {
     release_held(false);
 }
 
+/// Whether [`submit_split`] gives the slots of the lists it runs at once back
+/// (`VICTORY_SPLIT_TABLES`, on by default; `0`: they keep them until the
+/// title resets the lists, as before).
+#[cfg(windows)]
+fn split_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_TABLES").is_none_or(|v| v != "0"))
+}
+
 /// A submission to a queue that honours waits, list by list ([`split`]).
 /// shortcut: a wait still holds its whole list, not only the commands
 /// after it; and lists named twice among those held stay in one piece.
@@ -244,6 +253,16 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // They have run: their descriptor tables' slots are free again, as
+        // in `submit_cut` (which does this after the same call, for the same
+        // reason: these lists are not detached, so nothing else gives their
+        // fresh tables' dynamic slots back before the title resets them, and
+        // NVIDIA's 262,144-slot ring runs out: tables refused, draws dropped).
+        // After fxceless/victory-fork af23c652 (PR #1320). On by default
+        // (fork main has it); `VICTORY_SPLIT_TABLES=0`: as before.
+        if split_tables() {
+            crate::list::tables_done(&lists[..cut]);
+        }
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);

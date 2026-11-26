@@ -83,10 +83,33 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_by(memory, keep, spares_headroom())
+}
+
+/// [`spares`], with `headroom` as [`spares_headroom`] says.
+fn spares_by(memory: Option<[u64; 4]>, keep: bool, headroom: bool) -> usize {
     match memory {
+        Some([budget, used, ..]) if keep && headroom => {
+            // As many as fit in half of the room left below 85 % of the
+            // budget, at least SPARE and at most SPARE_KEPT.
+            let ceiling = (u128::from(budget) * 85 / 100) as u64;
+            let fit = (ceiling.saturating_sub(used) / 2 / BLOCK) as usize;
+            fit.clamp(SPARE, SPARE_KEPT)
+        }
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
     }
+}
+
+/// Whether the empty texture blocks kept scale with the card's room left
+/// (`VICTORY_SPARES_HEADROOM=1`; off by default: up to [`SPARE_KEPT`], 4 GiB,
+/// whenever use is under 85 % of the budget). On a 12 GB card at 7 GB of
+/// 10.8 that is 4 GiB of empty blocks against about 1.1 GiB with it, room the
+/// textures then wait for. After avatarmanz/VIctory-7900XTX issue #94 / pull
+/// request #119 (26884eae; open there).
+fn spares_headroom() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPARES_HEADROOM").is_some_and(|v| v == "1"))
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -1139,6 +1162,25 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn empty_blocks_scale_with_the_room_left_when_asked() {
+        const GIB: u64 = 1 << 30;
+        // Ample room: as before.
+        assert_eq!(spares_by(Some([24 * GIB, 10 * GIB, 0, 0]), true, true), SPARE_KEPT);
+        // 8 GiB-class card at 5.5 GiB of 7.25: 5 blocks, not 64.
+        assert_eq!(spares_by(Some([7424 << 20, 5632 << 20, 0, 0]), true, true), 5);
+        // 12 GB card at 7 GiB of 10.8: 17 blocks (1,088 MiB), not 64.
+        assert_eq!(spares_by(Some([11_059 << 20, 7 * GIB, 0, 0]), true, true), 17);
+        // At or over 85 %, without keeping, or unknown: SPARE.
+        assert_eq!(spares_by(Some([100 * GIB, 85 * GIB, 0, 0]), true, true), SPARE);
+        assert_eq!(spares_by(Some([100 * GIB, 95 * GIB, 0, 0]), true, true), SPARE);
+        assert_eq!(spares_by(Some([0, 0, 0, 0]), true, true), SPARE);
+        assert_eq!(spares_by(Some([24 * GIB, 2 * GIB, 0, 0]), false, true), SPARE);
+        assert_eq!(spares_by(None, true, true), SPARE);
+        // Off: the yes/no rule.
+        assert_eq!(spares_by(Some([7424 << 20, 5632 << 20, 0, 0]), true, false), SPARE_KEPT);
     }
 
     #[test]

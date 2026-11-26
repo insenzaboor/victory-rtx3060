@@ -1527,6 +1527,32 @@ pub fn host_settings() -> [u32; 4] {
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
 }
 
+/// `VICTORY_DIV_FIXUP=1`: `v_div_fixup_f32` in the hardware's order, a quotient
+/// that is NaN coming after `0 / x` and `x / Inf` (which give zero) instead of
+/// before them. The division sequence's `v_div_scale_f32` and
+/// `v_fma_f32(-Inf, 0, 1)` make a NaN quotient for exactly those, so without
+/// this `0 / x` came out as ±Infinity, which later arithmetic turns into NaN
+/// dots in the picture. After dng-nguyn/victory-rtx2060-dlssg 472518cb (also
+/// FluffyCyanNova/VIctory-RTX3060-Intel12100F b44/0010). Off by default;
+/// part of the shader cache's key while on (`victory-gpu`'s `shader_cache`).
+pub fn div_fixup_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIV_FIXUP").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_NAN_SCRUB=1`: NaN and ±Infinity become 0 in pixel shaders' colour
+/// exports and in f32 image stores, so a NaN that one pass makes is not
+/// spread by the passes that read it (bright or black dots on hair and skin,
+/// black blobs, white-outs on NVIDIA). A workaround, not a fix: the value is
+/// still wrong, only no longer spreading. After aleksesipenko/VIctory-RTX
+/// 59609080 (from trustno1-coder 77e13a9 / miaohaixiang1 db556df), here with an
+/// integer test so a host driver's fast-math cannot fold it away (as
+/// [`Lower::is_nan_f32`]). Off by default; part of the shader cache's key while on.
+pub fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
@@ -4514,6 +4540,23 @@ impl<'a> Lower<'a> {
         let abs = self.s.m.bin(c, Bin::And, bits, mask);
         let inf = self.s.m.i32(0x7F80_0000);
         self.s.m.cmp(c, pred::IUGT, abs, inf)
+    }
+
+    /// `f`, or 0 where it is NaN or ±Infinity, with `VICTORY_NAN_SCRUB=1`
+    /// ([`nan_scrub`]); `f` as it is otherwise. Tested in integer arithmetic,
+    /// as [`Self::is_nan_f32`].
+    fn scrub_nan(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mask);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::IUGE, abs, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
     }
 
     /// The median of three. With a NaN among them the hardware gives the
@@ -9135,16 +9178,21 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+                // (`VICTORY_DIV_FIXUP=1`, [`div_fixup_order`]: a NaN quotient
+                // below `make_zero` in priority, as the hardware has it:
+                // n_nan, d_nan, invalid, make_inf, make_zero, q_nan, signed_q.)
+                let fixed = div_fixup_order();
                 let make_inf = {
                     let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
+                    if fixed { t } else { self.s.m.bin(c, Bin::Or, t, q_nan) }
                 };
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                let r = if fixed { self.s.m.select(c, q_nan, signed_inf, signed_q) } else { signed_q };
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);
@@ -11793,6 +11841,10 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            // (`VICTORY_NAN_SCRUB=1`: no NaN or ±Infinity stored.)
+            for v in &mut vals {
+                *v = self.scrub_nan(*v);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -13118,6 +13170,8 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // (`VICTORY_NAN_SCRUB=1`: a pixel shader's colours without NaN or ±Infinity.)
+        let colour = self.s.pixel && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13136,13 +13190,16 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };

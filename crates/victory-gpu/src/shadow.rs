@@ -542,11 +542,27 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     // Not zeros at need (`Host::card_buffer`): [`carded`] sends it up whole.
-    let buffer = host.card_buffer(size);
+    // (With [`card_pad`] bytes past the end that nothing writes.)
+    let buffer = host.card_buffer(size + card_pad());
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+/// Bytes of room past the end of each title buffer's copy in the card's
+/// memory (`VICTORY_CARD_PAD_KB`; 0, the default, none). A shader that reads
+/// past a buffer through a root view (which has no bounds) found the next
+/// allocation's bytes in the PC's memory, but an unmapped address on the card
+/// once buffers had copies there: the driver logged MMU faults in shaders and
+/// the device was removed (0x887A0006), four runs in nineteen on an RTX 3070
+/// Ti 8 GB. After grimygunnz/nvidia-3070-VI 7c030137 (which pads 64 KiB by
+/// default); try `64` when card copies are on and the device goes.
+fn card_pad() -> u64 {
+    static PAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAD.get_or_init(|| {
+        std::env::var("VICTORY_CARD_PAD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(1 << 20) << 10
+    })
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
