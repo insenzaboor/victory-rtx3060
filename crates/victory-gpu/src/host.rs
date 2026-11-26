@@ -154,6 +154,25 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// [`available_physical_ram`] read at most every 250 ms, for hot paths (a
+/// list's reset gives its scratch back, thousands of times a second).
+pub(crate) fn available_physical_ram_recent() -> Option<u64> {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    use std::sync::atomic::AtomicU64;
+    static AT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static VALUE: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let at = AT_MS.load(Ordering::Relaxed);
+    if at == u64::MAX || now.saturating_sub(at) >= 250 {
+        AT_MS.store(now, Ordering::Relaxed);
+        VALUE.store(available_physical_ram().unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+    match VALUE.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        v => Some(v),
+    }
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -377,18 +396,18 @@ static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic:
 /// title memory). Kept are: empty blocks of textures ([`crate::pool`]) below
 /// 85 % of the card's budget, windows of title memory and staging buffers
 /// for five minutes with 12 GiB of the PC's memory free, and 1 GiB of
-/// scratch chunks.
+/// scratch chunks with as much free, less below ([`spare_most_for`]).
+pub(crate) fn keep_freed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
+}
+
 /// Whether a list always has a view heap and a sampler heap bound, ours of
-/// one slot for one the title did not set (, from
+/// one slot for one the title did not set (VICTORY_FALLBACK_HEAPS=1, from
 /// codec-d/cool_fox 641835a4; off by default).
 pub(crate) fn fallback_heaps() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
-}
-
-pub(crate) fn keep_freed() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
 }
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
@@ -1978,6 +1997,25 @@ const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
+/// The most bytes of scratch chunks kept while no list holds them, with
+/// `avail_phys` of the PC's memory free: [`SPARE_KEPT`] with [`keep_freed`]
+/// while 12 GiB is free, as [`ram_idle_for`] keeps windows; less as the PC
+/// fills, in steps, since a chunk given back can still be read by a shader
+/// seconds later and lose the device; [`SPARE_MOST`] without `keep`.
+fn spare_most_for(avail_phys: Option<u64>, keep: bool) -> u64 {
+    const GIB: u64 = 1 << 30;
+    if !keep {
+        return SPARE_MOST;
+    }
+    match avail_phys {
+        None => SPARE_KEPT,
+        Some(a) if a >= 12 * GIB => SPARE_KEPT,
+        Some(a) if a >= 8 * GIB => 512 << 20,
+        Some(a) if a >= 4 * GIB => 256 << 20,
+        Some(_) => SPARE_MOST,
+    }
+}
+
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
 /// is reset or dropped, for the next list. Before, a list kept every chunk
@@ -2020,6 +2058,18 @@ impl<T> Spare<T> {
         self.kept.push((thing, size));
         None
     }
+
+    /// The things given longest ago, until at most `most` bytes are kept.
+    fn trim(&mut self, most: u64) -> Vec<(T, u64)> {
+        let mut gone = 0;
+        let mut bytes = self.bytes;
+        while bytes > most && gone < self.kept.len() {
+            bytes -= self.kept[gone].1;
+            gone += 1;
+        }
+        self.bytes = bytes;
+        self.kept.drain(..gone).collect()
+    }
 }
 
 /// Scratch chunks no list holds.
@@ -2046,22 +2096,26 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
-/// without the pool.
+/// or dropped): kept for the next list, or freed past [`spare_most_for`]
+/// and without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
     let mut freed = Vec::new();
+    let most = spare_most_for(available_physical_ram_recent(), keep_freed() && !crate::residency::limited_host_ram());
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        // Kept while the PC had more room: let go down to what it has now.
+        for (chunk, size) in spare.trim(most) {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            freed.push(chunk);
+        }
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
-                spare.give(chunk, size, limit)
-            } else {
-                Some(chunk)
-            };
+            let back = if scratch_pool() { spare.give(chunk, size, most) } else { Some(chunk) };
             match back {
                 None => {
                     ALIVE[3].fetch_add(1, Ordering::Relaxed);
@@ -11102,6 +11156,45 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn spare_scratch_follows_the_free_memory_in_steps() {
+        let gib = 1u64 << 30;
+        let kept = |avail| super::spare_most_for(avail, true);
+        assert_eq!(kept(Some(12 * gib)), super::SPARE_KEPT);
+        assert_eq!(kept(None), super::SPARE_KEPT);
+        assert_eq!(kept(Some(12 * gib - 1)), 512 << 20);
+        assert_eq!(kept(Some(8 * gib)), 512 << 20);
+        assert_eq!(kept(Some(8 * gib - 1)), 256 << 20);
+        assert_eq!(kept(Some(4 * gib)), 256 << 20);
+        assert_eq!(kept(Some(4 * gib - 1)), super::SPARE_MOST);
+        assert_eq!(kept(Some(0)), super::SPARE_MOST);
+        // Without keep_freed, as before.
+        assert_eq!(super::spare_most_for(Some(64 * gib), false), super::SPARE_MOST);
+    }
+
+    #[test]
+    fn a_spare_pool_trims_the_oldest_first() {
+        let mut spare = super::Spare::new();
+        for (thing, size) in [(1, 4), (2, 4), (3, 2), (4, 4)] {
+            assert_eq!(spare.give(thing, size, 100), None);
+        }
+        assert_eq!(spare.bytes, 14);
+        assert!(spare.trim(14).is_empty());
+        assert_eq!(spare.trim(9), vec![(1, 4), (2, 4)]);
+        assert_eq!(spare.bytes, 6);
+        assert_eq!(spare.take(2), Some(3));
+        assert_eq!(spare.trim(0), vec![(4, 4)]);
+        assert_eq!(spare.bytes, 0);
+        assert!(spare.trim(0).is_empty());
+    }
+
+    #[test]
+    fn the_recent_free_memory_reading_answers() {
+        let first = super::available_physical_ram_recent();
+        assert!(first.is_some_and(|a| a > 0));
+        assert!(super::available_physical_ram_recent().is_some());
     }
 }
 

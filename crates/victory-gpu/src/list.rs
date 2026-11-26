@@ -234,6 +234,23 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// The most host lists kept idle with `avail_phys` of the PC's memory free:
+/// [`IDLE_MOST`] while 12 GiB is free (or nothing is known), fewer as it
+/// fills. An idle list keeps its command allocators at the most they ever
+/// held, which nothing trims, so on a 32 GB PC the pool is memory the title
+/// runs short of; fewer lists cost making some again in a frame.
+#[cfg(windows)]
+fn idle_most_for(avail_phys: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match avail_phys {
+        None => 512,
+        Some(a) if a >= 12 * GIB => 512,
+        Some(a) if a >= 8 * GIB => 128,
+        Some(a) if a >= 4 * GIB => 64,
+        Some(_) => 16,
+    }
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -269,11 +286,22 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let most = idle_most_for(crate::host::available_physical_ram_recent());
+    // Kept while the PC had more room: the ones over `most` go (they have
+    // run), dropped outside the lock.
+    let surplus: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let over = idle.0.len().saturating_sub(most);
+        let gone: Vec<Idle> = idle.0.drain(..over).collect();
+        idle.1 -= gone.iter().map(|Idle(_, bytes)| bytes).sum::<u64>();
+        gone
+    };
+    drop(surplus);
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -281,7 +309,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -2377,6 +2405,20 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn the_idle_list_pool_shrinks_with_the_free_memory() {
+        let gib = 1u64 << 30;
+        assert_eq!(idle_most_for(None), IDLE_MOST.0);
+        assert_eq!(idle_most_for(Some(32 * gib)), IDLE_MOST.0);
+        assert_eq!(idle_most_for(Some(12 * gib)), 512);
+        assert_eq!(idle_most_for(Some(12 * gib - 1)), 128);
+        assert_eq!(idle_most_for(Some(8 * gib)), 128);
+        assert_eq!(idle_most_for(Some(8 * gib - 1)), 64);
+        assert_eq!(idle_most_for(Some(4 * gib)), 64);
+        assert_eq!(idle_most_for(Some(4 * gib - 1)), 16);
+        assert_eq!(idle_most_for(Some(0)), 16);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
