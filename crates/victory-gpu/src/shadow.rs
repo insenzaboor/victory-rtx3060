@@ -309,6 +309,18 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<Carded>> = Mutex::new(Vec::new());
 
+/// Copies in the card's memory whose `touched` is set (at times one more,
+/// while a change is being noted): [`card_dirty`] has nothing to take while
+/// it is zero.
+static TOUCHED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`card_dirty`] skips its pass while no copy changed
+/// (`VICTORY_CARD_DIRTY_SKIP=0`: never).
+fn card_dirty_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DIRTY_SKIP").is_none_or(|v| v != "0"))
+}
+
 /// A copy in the card's memory, with the title memory it holds, `[start,
 /// end)`: [`send_copied`] finds those a copy reaches without taking a hold of
 /// every one (once for each of the title's buffer copies).
@@ -633,7 +645,15 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
     let mut out = Vec::new();
+    // No copy changed since the last time (the copies that went are let go
+    // of every 64th time): the pass over every copy, an upgrade each, under
+    // the submission (run 29's profile: 6.5 % of the submission thread).
+    // `VICTORY_CARD_DIRTY_SKIP=0`: every time, as before.
+    if card_dirty_skip() && TOUCHED.load(Ordering::Acquire) == 0 && !CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+        return out;
+    }
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     carded.retain(|c| {
@@ -643,7 +663,13 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let ranges = shadow
             .card
             .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
+            .filter(|c| {
+                let was = c.touched.swap(false, Ordering::AcqRel);
+                if was {
+                    TOUCHED.fetch_sub(1, Ordering::AcqRel);
+                }
+                was
+            })
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = joined(std::mem::take(&mut *dirty));
@@ -2644,6 +2670,12 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Changes never taken leave the count of touched copies.
+        if let Some(card) = &self.card
+            && card.touched.load(Ordering::Acquire)
+        {
+            TOUCHED.fetch_sub(1, Ordering::AcqRel);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -4422,7 +4454,12 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        // Counted first: [`card_dirty`] passes over the copies only while
+        // the count is not zero, and a change made before it is never left.
+        TOUCHED.fetch_add(1, Ordering::AcqRel);
+        if card.touched.swap(true, Ordering::AcqRel) {
+            TOUCHED.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -5689,13 +5726,26 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
-    const LATELY: u64 = 512;
+    // 512 askings is a third of a frame in the world (run 30: 1,200-1,800
+    // askings a frame, 50-90 copies made anew a frame, each a new buffer
+    // made resident and waited for, and the one let go a kernel call):
+    // `VICTORY_EXACT_LATELY` keeps them for more askings (8192: ~5 frames).
+    static LATELY_ASKED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let lately = *LATELY_ASKED.get_or_init(|| {
+        std::env::var("VICTORY_EXACT_LATELY").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512).max(1)
+    });
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    // Copies the sweep lets go of, dropped after the lock: the last
+    // reference to a buffer is a kernel call (`Release`), and every list
+    // thread asking for a copy waited behind those (run 29's profile: a
+    // fifth of the list threads' waits on this lock, `Arc::drop_slow` under
+    // it). Declared before the guard, so dropped after it.
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
         let (tick, map) = &mut *guard;
@@ -5713,10 +5763,16 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             // Held by the map alone (no list), its buffer by the copy alone (no
             // slot shows it), and not asked for lately.
             map.retain(|_, (shadow, used)| {
-                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+                let keep =
+                    Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + lately > now;
+                if !keep {
+                    gone.push(shadow.clone());
+                }
+                keep
             });
         }
     }
+    drop(gone);
     // Made (or taken from the pool) outside the lock: a new shared buffer is
     // made resident and waited for on the card (`host::mapped`), and every
     // list thread asking for a copy waited behind that (4.9 s of waits in 4
