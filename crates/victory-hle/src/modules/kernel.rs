@@ -434,6 +434,58 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// `GROUP_AFFINITY`, as the host lays it out.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "SetThreadGroupAffinity"]
+    fn HostSetThreadGroupAffinity(thread: *mut c_void, affinity: *const GroupAffinity, previous: *mut GroupAffinity) -> i32;
+    #[link_name = "GetProcessAffinityMask"]
+    fn HostGetProcessAffinityMask(process: *mut c_void, mine: *mut usize, system: *mut usize) -> i32;
+    #[link_name = "GetCurrentProcess"]
+    fn HostGetCurrentProcess() -> *mut c_void;
+}
+
+/// The title's thread affinities name the console's cores; here the same
+/// masks are the PC's first logical processors (its workers at 0xff: four
+/// cores of a 12-core Ryzen with their second threads), where 15 of its
+/// workers stood up to 13.7 ms at a time waiting for a turn while the other
+/// 16 processors had room (run twentythree's timeline, "woken, not running
+/// yet"). Widened to every processor the process may use
+/// (`VICTORY_TITLE_AFFINITY=1`: as the title asks).
+#[cfg(windows)]
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    affinity: *const GroupAffinity,
+    previous: *mut GroupAffinity,
+) -> i32 {
+    static AS_ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let as_asked = *AS_ASKED.get_or_init(|| std::env::var_os("VICTORY_TITLE_AFFINITY").is_some_and(|v| v == "1"));
+    if as_asked || affinity.is_null() {
+        // SAFETY: the title's own arguments.
+        return unsafe { HostSetThreadGroupAffinity(thread, affinity, previous) };
+    }
+    let (mut mine, mut system) = (0usize, 0usize);
+    // SAFETY: plain queries of this process.
+    let known = unsafe { HostGetProcessAffinityMask(HostGetCurrentProcess(), &mut mine, &mut system) } != 0;
+    // SAFETY: the title passes a valid GROUP_AFFINITY.
+    let mut wide = unsafe { *affinity };
+    if known && mine != 0 {
+        wide.mask = mine;
+        wide.group = 0;
+    }
+    // SAFETY: a valid GROUP_AFFINITY and the title's thread handle and output.
+    unsafe { HostSetThreadGroupAffinity(thread, &wide, previous) }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +494,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +522,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            #[cfg(windows)]
+            hle_export!(SetThreadGroupAffinity),
         ],
     }
 }
