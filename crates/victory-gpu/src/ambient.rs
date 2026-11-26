@@ -40,6 +40,13 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! The reflections too are the sky's, unoccluded, on every glossy surface:
+//! indoors a wooden floor and counters wore a white glaze five to ten times
+//! brighter than the room, and still water outdoors mirrors nothing, black.
+//! `VICTORY_AMBIENT_REFLECT=<most>[,<least>]` holds what the title's last
+//! reflection pass (`CS_UpdateHistory`) leaves between those parts of the
+//! light around (beloooo's 44dcd437, 0.5 there, and c3bd5612, 0 there).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -58,6 +65,8 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the reflections for the last time in a frame.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -69,6 +78,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -82,6 +93,24 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the last reflection pass writes the reflections (R9G9B9E5 as
+/// 32-bit integers).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+
+/// The most and the least of a reflection, as parts of the light around
+/// (`VICTORY_AMBIENT_REFLECT=<most>[,<least>]`; unset or 0: the title's
+/// reflections as they are). A least of 0 leaves dark reflections dark.
+/// shortcut: stands in for what the title's traced reflections would see.
+fn reflect() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default();
+        let mut parts = set.split(',').map(|v| v.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+        let most = parts.next().flatten().unwrap_or(0.0);
+        let least = parts.next().flatten().unwrap_or(0.0).min(most);
+        [most, least]
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -263,7 +292,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=18, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=20, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -275,6 +304,7 @@ cbuffer Set : register(b0) {
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt;
     float gain; float least; float power;
+    float reflect_most; float reflect_least;
 };
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are; at SKY_AT the sky's hue and mean.
@@ -422,7 +452,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -436,6 +466,38 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef HOLD
+// The reflections between parts of the light around (beloooo's 44dcd437
+// and c3bd5612): the set light (the sky's, the constant), or the estimate
+// gathered for the point seen there.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 around;
+    if (gain > 0.0 || least > 0.0) {
+        float4 s = cells[SKY_AT];
+        float3 hue = any(s.rgb > 0.0) ? s.rgb : float3(0.6, 0.75, 1.0);
+        around = hue * (gain * (s.w > 0.0 ? pow(s.w, power) : 0.0) + least);
+    } else if (constant > 0.0) {
+        around = float3(1.0, 0.98, 0.94) * constant;
+    } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        around = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w) * level;
+    }
+    float3 c = unpack(light[at.xy]);
+    float has = dot(c, LUMA);
+    float most = dot(around, LUMA) * reflect_most;
+    float3 floor_light = around * reflect_least;
+    if (has > most) light[at.xy] = pack(c * (most / max(has, 1e-6)));
+    else if (has < dot(floor_light, LUMA)) light[at.xy] = pack(floor_light);
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -548,6 +610,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     /// The sky's mean ([`Set::Sky`]), and the views it reads, in a heap of
     /// its own, used in turn: more than the passes of every list in flight
     /// (a view of the sky, a null view for the table the pass does not read).
@@ -588,6 +651,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let sky = pipeline("SKY", s!("sky_mean"))?;
+    let hold = pipeline("HOLD", s!("hold"))?;
     let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     // SAFETY: plain creations; null views in the heap's own slots.
     let (views, step) = unsafe {
@@ -619,6 +683,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        hold,
         sky,
         views,
         step,
@@ -696,6 +761,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (fixed || air() == 0.0) {
         return false;
     }
+    let [reflect_most, reflect_least] = reflect();
+    if role == Role::Reflect && reflect_most <= 0.0 {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -709,7 +778,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 18];
+    let mut words = [0u32; 20];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -722,7 +791,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
-    for (to, v) in words[15..].iter_mut().zip(follow_sky) {
+    for (to, v) in words[15..].iter_mut().zip(follow_sky.into_iter().chain([reflect_most, reflect_least])) {
         *to = v.to_bits();
     }
     let l = &list.list;
@@ -732,7 +801,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 18, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 20, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -750,6 +819,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| tracing::info!(reflect_most, reflect_least, "reflections held to the light around"));
+                run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
             Role::Resolve => {
                 if !fixed {
                     run(&pass.place, 8, 9, 1);
@@ -827,6 +901,7 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+        assert_eq!(role(b"..CS_UpdateHistory_0f3c.."), Some(Role::Reflect));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
