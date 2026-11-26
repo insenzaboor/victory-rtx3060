@@ -1343,6 +1343,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The most uses of the list in one recording since it was made: its
+    /// command allocator keeps room for that many for as long as it lives
+    /// (`crate::list::recycle`, `VICTORY_ALLOC_TRIM`).
+    peak_calls: AtomicU32,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3884,6 +3888,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::picked::log(frames);
+    crate::list::recycle_log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
@@ -4343,6 +4348,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                peak_calls: AtomicU32::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6623,6 +6629,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.peak_calls.fetch_max(self.list.take_calls(), Ordering::Relaxed);
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6664,6 +6671,33 @@ impl HostList {
     /// refreshed.
     pub(crate) fn changed_something(&self) {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// The most uses of the list in one recording, this one included.
+    pub(crate) fn peak_calls(&self) -> u32 {
+        self.peak_calls.load(Ordering::Relaxed).max(self.list.calls())
+    }
+
+    /// A new command allocator and D3D12 list in place of this list's, open
+    /// and empty, as after [`HostList::reset`]; the old ones come back to be
+    /// let go. An allocator keeps room for the most its list ever recorded;
+    /// everything else of the list (its buffers, budget, scratch) stays.
+    /// Only right after a reset: nothing recorded, no submission of the list
+    /// running. `None` (nothing changed) if the host refuses.
+    pub(crate) fn renew_allocator(&mut self) -> Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+        let device = &host()?.device;
+        // SAFETY: plain object creation.
+        let (allocator, list) = unsafe {
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+            (allocator, list)
+        };
+        let old_list = std::mem::replace(&mut self.list, rec::Rec::new(list)).into_inner();
+        let old_allocator = std::mem::replace(&mut self.allocator, allocator);
+        self.peak_calls.store(0, Ordering::Relaxed);
+        self.changed_something();
+        Some((old_allocator, old_list))
     }
 
     /// See [`HostList::changed_something`].
