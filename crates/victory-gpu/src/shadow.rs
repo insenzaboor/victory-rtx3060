@@ -5648,31 +5648,118 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= MANY {
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            map.retain(|_, (shadow, used)| {
+                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            });
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // Made (or taken from the pool) outside the lock: a new shared buffer is
+    // made resident and waited for on the card (`host::mapped`), and every
+    // list thread asking for a copy waited behind that (4.9 s of waits in 4
+    // frames of 16 list threads, run fourth's timeline, 50-70 made a frame).
+    let size = len.next_multiple_of(256);
+    let (buffer, data, pooled) = match exact_pooled(size) {
+        Some((buffer, data)) => (buffer, data, true),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            exact_pool_add(size, &buffer, data);
+            (buffer, data, false)
+        }
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    let now = *tick;
+    // Another thread made the same copy meanwhile: that one is used, and
+    // this one's buffer goes back to the pool when it is dropped.
+    if let Some((other, used)) = map.get_mut(&(address, len)) {
+        *used = now;
+        return Some(other.clone());
+    }
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    if pooled {
+        EXACT_REUSED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    }
     Some(shadow)
+}
+
+/// Buffers of copies of single views' bytes ([`exact`]), by size, to be
+/// used again: one whose only reference is the pool's is held by no copy, no
+/// list and no descriptor slot (`host::references`), so the card is done
+/// with it. A new copy marks every page as not copied yet, so what the
+/// buffer held before is never read. `VICTORY_EXACT_POOL_MB` bounds the
+/// bytes kept (64 MiB; 0: no pool, every copy a new buffer as before).
+#[allow(clippy::type_complexity)]
+static EXACT_POOL: Mutex<(u64, BTreeMap<u64, Vec<(ID3D12Resource, usize)>>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Copies of single views' bytes given a pooled buffer since the start.
+pub(crate) static EXACT_REUSED: AtomicU64 = AtomicU64::new(0);
+
+fn exact_pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_EXACT_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20
+    })
+}
+
+/// A pooled buffer of `size` bytes nothing else holds, if there is one.
+fn exact_pooled(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if exact_pool_most() == 0 {
+        return None;
+    }
+    let pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.1
+        .get(&size)?
+        .iter()
+        .find(|(buffer, _)| crate::host::references(buffer) == 1)
+        .map(|(buffer, data)| (buffer.clone(), *data as *mut u8))
+}
+
+/// Keeps a reference to a new copy's buffer for later copies of its size;
+/// past the pool's bound, free ones are let go first, and a buffer that does
+/// not fit is not kept.
+fn exact_pool_add(size: u64, buffer: &ID3D12Resource, data: *mut u8) {
+    let most = exact_pool_most();
+    if most == 0 || size > most {
+        return;
+    }
+    let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, sizes) = &mut *pool;
+    if *bytes + size > most {
+        for (&s, list) in sizes.iter_mut() {
+            list.retain(|(b, _)| {
+                let keep = crate::host::references(b) > 1;
+                if !keep {
+                    *bytes -= s;
+                }
+                keep
+            });
+        }
+        sizes.retain(|_, list| !list.is_empty());
+    }
+    if *bytes + size <= most {
+        sizes.entry(size).or_default().push((buffer.clone(), data as usize));
+        *bytes += size;
+    }
 }
 
 /// Copies of single views' bytes made since the start.
@@ -5687,9 +5774,12 @@ pub(crate) fn exact_line(frames: f64) {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let pooled = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner()).0 >> 20;
+    let reused = EXACT_REUSED.load(Ordering::Relaxed);
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; \
+         buffers pooled {pooled} MB, copies given a pooled buffer since the start {reused}",
         asked as f64 / frames,
         made as f64 / frames
     );

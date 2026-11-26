@@ -9061,7 +9061,14 @@ impl Meter {
         // ([`meter_lines`]), not by the presenting thread, the lane: about
         // 3 ms each second there (run ask-1), and 30 ms each 5 s (lane2-0).
         // Their counters are taken there, a moment after the frames counted.
-        let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        // `VICTORY_METER_EVERY=<s>`: the long lines that often (5). Gathering
+        // them holds locks the list threads wait for: 157 and 292 ms of two
+        // of four frames' chains in the world (run fifth's timeline).
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_METER_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5u64).max(1)
+        });
+        let five = self.logged.elapsed() >= std::time::Duration::from_secs(every);
         if five {
             self.logged = std::time::Instant::now();
         }
