@@ -539,6 +539,14 @@ struct Physical {
 }
 
 impl Physical {
+    /// Whether `at` is a view of one page of its own that shows `slice`
+    /// already: mapping it there again changes nothing ([`same_alias`]).
+    fn shows_alone(&self, at: usize, slice: &Slice) -> bool {
+        self.views
+            .get(&at)
+            .is_some_and(|(size, s)| *size == PAGE && Arc::ptr_eq(&s.section, &slice.section) && s.index == slice.index)
+    }
+
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
         self.views
@@ -1316,6 +1324,18 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
+    // Every page of `to` a view of its own that shows what `from` shows
+    // already: nothing to change (an unmap and a map a page, each waiting
+    // for the process's address-space lock, ~1 ms a page in the world).
+    if same_alias()
+        && from != 0
+        && len > 0
+        && (0..len).step_by(PAGE).all(|k| physical.slice_at(from + k).is_some_and(|s| physical.shows_alone(to + k, &s)))
+    {
+        ALIASES_SAME.fetch_add((len / PAGE) as u64, Ordering::Relaxed);
+        return true;
+    }
+    ALIASES_DONE.fetch_add((len / PAGE) as u64, Ordering::Relaxed);
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
@@ -1333,6 +1353,19 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     }
     true
 }
+
+/// Whether a page-mapping copy that would show at a page what it shows
+/// already is left out (`VICTORY_ALIAS_SAME=0`: done as before). The
+/// mapping is the same either way; the unmap and map are not made.
+fn same_alias() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_ALIAS_SAME").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Pages of page-mapping copies left out as already shown ([`same_alias`]),
+/// and done, since the start.
+pub(crate) static ALIASES_SAME: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ALIASES_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
@@ -1367,8 +1400,20 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
             touched.insert(to);
-            ops.push(Op::new(to, slice.flatten()));
             at += 1;
+            // Shown there already ([`same_alias`]).
+            if same_alias()
+                && let Some(Some(s)) = &slice
+                && physical.shows_alone(to, s)
+            {
+                ALIASES_SAME.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            ops.push(Op::new(to, slice.flatten()));
+        }
+        ALIASES_DONE.fetch_add(ops.len() as u64, Ordering::Relaxed);
+        if ops.is_empty() {
+            continue;
         }
         let _changing = victory_gpu::title_memory_remapping();
         ok &= change(&mut physical, ops);

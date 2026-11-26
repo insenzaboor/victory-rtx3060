@@ -816,7 +816,16 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
+            let aliases_same = super::xmem::ALIASES_SAME.swap(0, Ordering::Relaxed);
+            let aliases_done = super::xmem::ALIASES_DONE.swap(0, Ordering::Relaxed);
+            let bcpack_cached = bcpack_cache::COUNTS[0].swap(0, Ordering::Relaxed);
+            let bcpack_decoded = bcpack_cache::COUNTS[1].swap(0, Ordering::Relaxed);
+            tracing::info!(
+                aliases_same,
+                aliases_done,
+                bcpack_cached,
+                bcpack_decoded,
+                bcpack_cache_mb = bcpack_cache::bytes() >> 20,
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
@@ -1406,21 +1415,52 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    // Decoded before (`bcpack_cache`): no read, inflate or decode.
+    let key = if bc != 0 { bcpack_key(request, bc) } else { None };
+    if let Some(key) = &key
+        && let Some(kept) = bcpack_cache::get(key)
+        && kept.len() == size
+    {
+        let _span = victory_gpu::timeline::span("streaming: BCPack from the cache");
+        return into_destination(request, size, |out| {
+            out.copy_from_slice(&kept[..out.len()]);
+            Ok(out.len())
+        })
+        .map_err(|hr| fail(hr, "writing cached BCPack"));
+    }
+    // (The timeline splits a request into its read, inflate, BCPack decode
+    // and the writes into title memory around them.)
+    let span = victory_gpu::timeline::span("streaming: reading the source");
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    span.end();
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
+        let span = victory_gpu::timeline::span("streaming: zlib into a buffer");
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
+        span.end();
         Cow::Owned(packed)
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        Some(tables) => {
+            let _span = victory_gpu::timeline::span("streaming: BCPack decode");
+            let decoded = bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()));
+            if decoded.is_ok()
+                && let Some(key) = key
+            {
+                bcpack_cache::put(key, out);
+            }
+            decoded
+        }
+        None => {
+            let _span = victory_gpu::timeline::span("streaming: zlib");
+            inflate(&source, out).map_err(|hr| fail(hr, "zlib"))
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1494,6 +1534,142 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
             Err(E_NOTIMPL)
         }
     }
+}
+
+/// Decoded BCPack data of requests read from files, kept for the next
+/// request of the same bytes (`VICTORY_BCPACK_CACHE_MB`, 64; 0: none).
+///
+/// BCPack decode runs at ~32 MB/s a core (2.7 ms a request, 17x a zlib
+/// request; `examples/stream_bench.rs` over run fifth's streaming log), and
+/// the title asks for the same data again: 6,067 of 10,106 BCPack requests
+/// in that run repeated an earlier one (382 MB decoded again), half of them
+/// within 64 MB of other BCPack data. The game's files do not change while
+/// it runs: an entry is known by the file's volume and index (not our file
+/// object, whose address a later file can reuse), the offset, both sizes and
+/// the BC format. Requests from memory are never kept.
+mod bcpack_cache {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Volume serial, file index, offset, source bytes, destination bytes, BC format.
+    pub(super) type Key = (u32, u64, u64, u32, u32, u8);
+
+    #[derive(Default)]
+    struct Cache {
+        map: HashMap<Key, (Arc<[u8]>, u64)>,
+        order: BTreeMap<u64, Key>,
+        bytes: u64,
+        tick: u64,
+    }
+
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+    /// Requests served from the cache, and decoded, since the last asking.
+    pub(super) static COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    /// (Off in tests: they make and delete files, whose indices the file
+    /// system gives again.)
+    pub(super) fn most() -> u64 {
+        if cfg!(test) {
+            return 0;
+        }
+        static MOST: OnceLock<u64> = OnceLock::new();
+        *MOST.get_or_init(|| {
+            std::env::var("VICTORY_BCPACK_CACHE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20
+        })
+    }
+
+    /// The decoded bytes of `key`, if kept.
+    pub(super) fn get(key: &Key) -> Option<Arc<[u8]>> {
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.as_mut()?;
+        cache.tick += 1;
+        let tick = cache.tick;
+        let (bytes, used) = cache.map.get_mut(key)?;
+        cache.order.remove(used);
+        *used = tick;
+        cache.order.insert(tick, *key);
+        COUNTS[0].fetch_add(1, Ordering::Relaxed);
+        Some(bytes.clone())
+    }
+
+    /// Keeps `bytes` as `key`'s, letting the longest unused go past [`most`].
+    pub(super) fn put(key: Key, bytes: &[u8]) {
+        COUNTS[1].fetch_add(1, Ordering::Relaxed);
+        put_within(key, bytes, most());
+    }
+
+    fn put_within(key: Key, bytes: &[u8], most: u64) {
+        let len = bytes.len() as u64;
+        if len == 0 || len > most / 4 {
+            return;
+        }
+        let kept: Arc<[u8]> = Arc::from(bytes);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.get_or_insert_with(Cache::default);
+        if cache.map.contains_key(&key) {
+            return;
+        }
+        while cache.bytes + len > most {
+            let Some((_, old)) = cache.order.pop_first() else { break };
+            if let Some((gone, _)) = cache.map.remove(&old) {
+                cache.bytes -= gone.len() as u64;
+            }
+        }
+        cache.tick += 1;
+        cache.order.insert(cache.tick, key);
+        cache.map.insert(key, (kept, cache.tick));
+        cache.bytes += len;
+    }
+
+    /// The bytes kept now.
+    pub(super) fn bytes() -> u64 {
+        CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |c| c.bytes)
+    }
+
+    #[test]
+    fn kept_until_the_longest_unused_must_go() {
+        let key = |n: u64| (7u32, 9u64, n, 1u32, 4u32, 7u8);
+        for n in 1..=4 {
+            put_within(key(n), &[n as u8; 4], 16);
+        }
+        // 1 used last: 2 is the longest unused when 5 comes.
+        assert_eq!(get(&key(1)).as_deref(), Some(&[1u8; 4][..]));
+        put_within(key(5), &[5; 4], 16);
+        assert!(get(&key(2)).is_none());
+        for n in [1, 3, 4, 5] {
+            assert_eq!(get(&key(n)).as_deref(), Some(&[n as u8; 4][..]));
+        }
+        assert_eq!(bytes(), 16);
+        // Over a quarter of the bound: not kept.
+        put_within(key(6), &[6; 5], 16);
+        assert!(get(&key(6)).is_none());
+    }
+}
+
+/// The cache key of a BCPack request read from a file (`bcpack_cache`).
+fn bcpack_key(request: &Request, bc: u8) -> Option<bcpack_cache::Key> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+    if request.options & MEMORY_SOURCE != 0 || bcpack_cache::most() == 0 {
+        return None;
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    let files = &unsafe { &*request.source.cast::<Instance<File>>() }.state.files;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: an open file handle and room for its information.
+    if unsafe { GetFileInformationByHandle(files.first.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    Some((
+        info.dwVolumeSerialNumber,
+        u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+        request.offset,
+        request.source_size,
+        request.destination_size,
+        bc,
+    ))
 }
 
 /// The tables VIctory ships with.
@@ -1600,11 +1776,14 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
         // bytes are there.
+        let span = victory_gpu::timeline::span("streaming: opening the destination");
         let writing = victory_gpu::kernel_writing(request.destination as usize, len);
+        span.end();
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
+        let _told = victory_gpu::timeline::span("streaming: destination written, told");
         drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
@@ -1650,13 +1829,18 @@ fn into_pages(
 ) -> Result<(), HRESULT> {
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
+    let span = victory_gpu::timeline::span("streaming: opening the pages");
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        span.end();
         let filled = fill(window.bytes()).map(drop);
+        let _told = victory_gpu::timeline::span("streaming: pages written, told");
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
+    span.end();
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
+    let _writing = victory_gpu::timeline::span("streaming: writing physical pages");
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
