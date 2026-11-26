@@ -3906,6 +3906,21 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        // With port 1 (`VICTORY_PORT_CBV_DIRECT=1`): viewed
+                        // where it is, on 256 bytes and all of the view's
+                        // bytes in the buffer.
+                        let bytes = u64::from(crate::descriptor::host::constant_bytes(size));
+                        if bytes > 0
+                            && crate::port::cbv_direct()
+                            && crate::port::touches_at(address, bytes)
+                            && let Some(shadow) = crate::shadow::find(address, bytes).filter(|s| s.in_place())
+                            && shadow.gpu(address).is_multiple_of(256)
+                            && shadow.left(address) >= bytes
+                        {
+                            host.constant_at(index, &shadow.buffer, shadow.gpu(address), size);
+                            crate::port::direct_cbv(bytes);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

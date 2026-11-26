@@ -3543,6 +3543,14 @@ impl HostHeap {
         {
             return Some(view);
         }
+        // No view recorded there and none made: under the lock nothing
+        // would be done (below). Without it, for a heap sync that asks of
+        // thousands of such slots a frame (XaviFortes 3c89cc40). A slot made
+        // meanwhile was made after this look, as if the lock had been had
+        // first: the key is set under the lock.
+        if !for_draw && tag != VIEW_TAG && self.made.get(index) == Some(0) {
+            return None;
+        }
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
@@ -4510,7 +4518,7 @@ fn twin_uav(
 /// whole 256s, and at most the 64 KiB a shader can index. The host removes
 /// the device for a larger view, and the title's heap holds such sizes in
 /// slots it does not use.
-fn constant_bytes(size: u32) -> u32 {
+pub(crate) fn constant_bytes(size: u32) -> u32 {
     const LARGEST: u32 = 64 << 10;
     size.min(LARGEST).next_multiple_of(256)
 }
