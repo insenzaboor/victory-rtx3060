@@ -314,6 +314,21 @@ static CARDED: Mutex<Vec<Carded>> = Mutex::new(Vec::new());
 /// it is zero.
 static TOUCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Copies whose `touched` was newly set, by address, with the passes of
+/// [`card_dirty`] that did not find them among [`CARDED`] yet
+/// ([`card_dirty_list`]).
+static TOUCHED_LIST: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
+
+/// Whether [`card_dirty`] looks only at the copies changed since its last
+/// pass, by the addresses [`Shadow::card_changed_runs`] notes
+/// (`VICTORY_CARD_DIRTY_LIST=1`; off by default: every copy, an upgrade and
+/// a swap of its flag each, under the submission: run 30's profile, 12 % of
+/// the submission thread). Every 64th pass still looks at every copy.
+fn card_dirty_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DIRTY_LIST").is_some_and(|v| v == "1"))
+}
+
 /// Whether [`card_dirty`] skips its pass while no copy changed
 /// (`VICTORY_CARD_DIRTY_SKIP=0`: never).
 fn card_dirty_skip() -> bool {
@@ -651,16 +666,15 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     // of every 64th time): the pass over every copy, an upgrade each, under
     // the submission (run 29's profile: 6.5 % of the submission thread).
     // `VICTORY_CARD_DIRTY_SKIP=0`: every time, as before.
-    if card_dirty_skip() && TOUCHED.load(Ordering::Acquire) == 0 && !CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed);
+    if card_dirty_skip() && TOUCHED.load(Ordering::Acquire) == 0 && !calls.is_multiple_of(64) {
         return out;
     }
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|c| {
-        let Some(shadow) = c.shadow.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
+    // The changed offsets of `shadow`, taken, if its flag was set.
+    let take = |shadow: &Shadow| -> Vec<(usize, usize)> {
+        shadow
             .card
             .as_ref()
             .filter(|c| {
@@ -680,7 +694,46 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 }
                 ranges
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+    if card_dirty_list() && !calls.is_multiple_of(64) {
+        // Only the copies noted as changed: by address, without an upgrade
+        // or a swap of every other copy's flag.
+        let mut list = std::mem::take(&mut *TOUCHED_LIST.lock().unwrap_or_else(|e| e.into_inner()));
+        if list.is_empty() {
+            return out;
+        }
+        list.sort_unstable_by_key(|e| e.0);
+        list.dedup_by_key(|e| e.0);
+        let mut found = vec![false; list.len()];
+        for c in carded.iter() {
+            let at = c.shadow.as_ptr() as usize;
+            if let Ok(i) = list.binary_search_by_key(&at, |e| e.0) {
+                found[i] = true;
+                if let Some(shadow) = c.shadow.upgrade() {
+                    let ranges = take(&shadow);
+                    if !ranges.is_empty() {
+                        out.push((shadow, ranges));
+                    }
+                }
+            }
+        }
+        // Noted before the copy was among [`CARDED`]: looked for again, for
+        // 64 passes (then the full pass every 64th time takes it).
+        let mut back = TOUCHED_LIST.lock().unwrap_or_else(|e| e.into_inner());
+        back.extend(list.into_iter().zip(found).filter(|(e, f)| !f && e.1 < 64).map(|((at, n), _)| (at, n + 1)));
+        return out;
+    }
+    if card_dirty_list() {
+        // This pass looks at every copy (copies noted after this see their
+        // flag set and are taken next time, or are noted again).
+        TOUCHED_LIST.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    carded.retain(|c| {
+        let Some(shadow) = c.shadow.upgrade() else {
+            return false;
+        };
+        let ranges = take(&shadow);
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
@@ -4459,6 +4512,9 @@ impl Shadow {
         TOUCHED.fetch_add(1, Ordering::AcqRel);
         if card.touched.swap(true, Ordering::AcqRel) {
             TOUCHED.fetch_sub(1, Ordering::AcqRel);
+        } else if card_dirty_list() {
+            // Newly touched: [`card_dirty`] looks at this copy by its address.
+            TOUCHED_LIST.lock().unwrap_or_else(|e| e.into_inner()).push((std::ptr::from_ref(self) as usize, 0));
         }
     }
 
