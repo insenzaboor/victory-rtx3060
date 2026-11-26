@@ -6654,6 +6654,7 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        self.early_prelude();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6668,6 +6669,28 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+    }
+
+    /// A list that names textures (or depth twins) may need a prelude when
+    /// it is submitted: made here, on the thread that recorded it, where it
+    /// was made by the submission thread, one at a time, before
+    /// (run 29's profile: a fifth of the submission thread's running time
+    /// in `make_prelude`, the allocator and list creation in the kernel).
+    /// A list that needs none after all keeps it for its next recordings.
+    /// `VICTORY_EARLY_PRELUDE=0`: made at submission, as before.
+    fn early_prelude(&self) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_PRELUDE").is_none_or(|v| v != "0"))
+            || self.prelude.get().is_some()
+        {
+            return;
+        }
+        let names = !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        if names {
+            // (Made already on another thread meanwhile: this one is dropped.)
+            let _ = self.prelude.set(host().and_then(|h| h.make_prelude()));
         }
     }
 
