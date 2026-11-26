@@ -4,14 +4,19 @@
 //! for its packets and output, and then queues per-stream commands
 //! (activate, process, reset, deactivate) and dequeues one result per
 //! command. We decode each command when it is queued, so its result is ready
-//! at once; the order of results is the order of commands.
+//! at once; the order of results is the order of commands. With
+//! `VICTORY_APU_ASYNC=1` (off by default) a thread of the connection's own
+//! runs the commands in order instead, as the console's decoder does: the
+//! title's thread no longer decodes (run 52's profile: ~5% of the title
+//! threads' time in Opus), and a result not ready yet is `PENDING_RESULTS`,
+//! which titles handle (the console's decoder is asynchronous).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::Layout;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -128,13 +133,120 @@ pub struct Connection {
     options: u32,
     per_stream: u32,
     state: Mutex<State>,
+    /// [`async_decode`]: the thread that runs the commands, and the way to it.
+    worker: Option<Worker>,
+}
+
+/// `VICTORY_APU_ASYNC=1`: commands run on a thread of the connection's own.
+fn async_decode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_APU_ASYNC").is_some_and(|v| v == "1"))
+}
+
+/// A command as copied out of the title's memory when it is queued (the
+/// title may write its command block again once the call returns).
+#[derive(Clone, Copy)]
+enum Work {
+    Activate(u32),
+    Deactivate,
+    Reset,
+    Notify,
+    Process(Process),
+}
+
+/// A result, made, or still being made by the worker.
+enum Slot {
+    Ready(ApuResult),
+    Coming(Arc<Mutex<Option<ApuResult>>>),
+}
+
+impl Slot {
+    fn ready(&self) -> bool {
+        match self {
+            Slot::Ready(_) => true,
+            Slot::Coming(done) => done.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+        }
+    }
+
+    /// The result, if it is made.
+    fn take(&self) -> Option<ApuResult> {
+        match self {
+            Slot::Ready(result) => Some(*result),
+            Slot::Coming(done) => *done.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+}
+
+/// One command for the worker: what to run, the result so far, where it goes,
+/// and the event to set after (0: none).
+struct Job {
+    stream: usize,
+    work: Work,
+    result: ApuResult,
+    done: Arc<Mutex<Option<ApuResult>>>,
+    event: usize,
+}
+
+// SAFETY: the raw pointers are the title's packet and output in the
+// connection's memory, which lives until the worker is joined (`XApuDisconnect`).
+unsafe impl Send for Job {}
+
+struct Worker {
+    send: Mutex<Option<std::sync::mpsc::Sender<Job>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// The worker's loop: runs each job against the streams' decoders, in order.
+fn serve(jobs: std::sync::mpsc::Receiver<Job>, streams: usize, options: u32) {
+    let mut decoders: Vec<Option<OpusDecoder>> = (0..streams).map(|_| None).collect();
+    for mut job in jobs {
+        run(&mut decoders[job.stream], options, job.work, &mut job.result);
+        *job.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(job.result);
+        if job.event != 0 {
+            // SAFETY: the connection's event, closed only after the worker is joined.
+            unsafe { SetEvent(job.event as HANDLE) };
+        }
+    }
+}
+
+/// Runs one command against its stream's decoder, filling `result`.
+fn run(decoder: &mut Option<OpusDecoder>, options: u32, work: Work, result: &mut ApuResult) {
+    match work {
+        Work::Activate(channels) => {
+            result.error = if decoder.is_some() {
+                ALREADY_ACTIVE
+            } else if !(1..=2).contains(&channels) {
+                E_INVALIDARG
+            } else {
+                match OpusDecoder::new(48_000, channels as usize) {
+                    Ok(d) => {
+                        *decoder = Some(d);
+                        S_OK
+                    }
+                    Err(_) => E_INVALIDARG,
+                }
+            };
+        }
+        Work::Deactivate => *decoder = None,
+        Work::Reset => {
+            if let Some(d) = decoder {
+                let _ = d.reset_state();
+            }
+        }
+        Work::Notify => {}
+        Work::Process(command) => match decoder {
+            Some(d) => process(d, options, &command, result),
+            None => result.error = INVALID_STREAM,
+        },
+    }
 }
 
 struct State {
+    /// The streams' decoders (without [`async_decode`]; the worker has its own).
     streams: Vec<Option<OpusDecoder>>,
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
-    results: VecDeque<ApuResult>,
+    results: VecDeque<Slot>,
     commands: u32,
     dequeued: u32,
 }
@@ -196,14 +308,27 @@ pub extern "system" fn XApuConnect(
         streams,
         memory = input.memory,
         options = input.options,
-        "audio decoder connected"
+        "audio decoder connected (VICTORY_APU_ASYNC={})",
+        u8::from(async_decode())
     );
+    let worker = if async_decode() {
+        let (send, jobs) = std::sync::mpsc::channel::<Job>();
+        let options = input.options;
+        std::thread::Builder::new()
+            .name("victory-apu".into())
+            .spawn(move || serve(jobs, streams, options))
+            .ok()
+            .map(|thread| Worker { send: Mutex::new(Some(send)), thread: Mutex::new(Some(thread)) })
+    } else {
+        None
+    };
     let connection = Box::new(Connection {
         memory,
         layout,
         event,
         options: input.options,
         per_stream: input.commands_per_stream,
+        worker,
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
             queued: vec![0; streams],
@@ -229,6 +354,14 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     }
     // SAFETY: made by `XApuConnect`; disconnected once.
     let connection = unsafe { Box::from_raw(handle) };
+    // The worker's last jobs write into the memory and set the event: it is
+    // stopped and joined first.
+    if let Some(worker) = &connection.worker {
+        drop(worker.send.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if let Some(thread) = worker.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = thread.join();
+        }
+    }
     if !connection.event.is_null() {
         // SAFETY: our event.
         unsafe { CloseHandle(connection.event) };
@@ -269,51 +402,57 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
-    let decoder = &mut state.streams[stream];
-    match id.kind {
+    // The command, copied out of the title's memory now.
+    let work = match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
             let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
             tracing::debug!(stream, channels, "Opus stream activated");
-            result.error = if decoder.is_some() {
-                ALREADY_ACTIVE
-            } else if !(1..=2).contains(&channels) {
-                E_INVALIDARG
-            } else {
-                match OpusDecoder::new(48_000, channels as usize) {
-                    Ok(d) => {
-                        *decoder = Some(d);
-                        S_OK
-                    }
-                    Err(_) => E_INVALIDARG,
-                }
-            };
+            Work::Activate(channels)
         }
-        DEACTIVATE => *decoder = None,
-        RESET => {
-            if let Some(d) = decoder {
-                let _ = d.reset_state();
-            }
-        }
-        NOTIFY => {}
-        PROCESS => {
-            // SAFETY: a process command is this struct.
-            let command = unsafe { command.cast::<Process>().read_unaligned() };
-            match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
-                None => result.error = INVALID_STREAM,
-            }
-        }
+        DEACTIVATE => Work::Deactivate,
+        RESET => Work::Reset,
+        NOTIFY => Work::Notify,
+        // SAFETY: a process command is this struct.
+        PROCESS => Work::Process(unsafe { command.cast::<Process>().read_unaligned() }),
         _ => return INVALID_COMMAND,
-    }
+    };
+    let signal = id.options & SIGNAL != 0 && !connection.event.is_null();
+    let sender = connection.worker.as_ref().and_then(|w| w.send.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let slot = match sender {
+        Some(sender) => {
+            let done = Arc::new(Mutex::new(None));
+            let job = Job {
+                stream,
+                work,
+                result,
+                done: done.clone(),
+                event: if signal { connection.event as usize } else { 0 },
+            };
+            match sender.send(job) {
+                Ok(()) => Slot::Coming(done),
+                // The worker is gone (it never stops before disconnect): run it here.
+                Err(std::sync::mpsc::SendError(job)) => {
+                    run(&mut state.streams[stream], connection.options, job.work, &mut result);
+                    Slot::Ready(result)
+                }
+            }
+        }
+        None => {
+            run(&mut state.streams[stream], connection.options, work, &mut result);
+            Slot::Ready(result)
+        }
+    };
+    let ready = matches!(slot, Slot::Ready(_));
     state.queued[stream] += 1;
     state.commands = state.commands.wrapping_add(1);
-    state.results.push_back(result);
+    state.results.push_back(slot);
     if !total.is_null() {
         // SAFETY: optional out parameter.
         unsafe { total.write(state.commands) };
     }
-    if id.options & SIGNAL != 0 && !connection.event.is_null() {
+    // (A job the worker runs sets the event itself when its result is made.)
+    if signal && ready {
         // SAFETY: our event.
         unsafe { SetEvent(connection.event) };
     }
@@ -377,9 +516,11 @@ pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuR
     }
     // SAFETY: a connection from `XApuConnect`.
     let mut state = lock(unsafe { &*handle });
-    let Some(result) = state.results.pop_front() else {
+    // In order: the oldest result, once it is made.
+    let Some(result) = state.results.front().and_then(Slot::take) else {
         return PENDING_RESULTS;
     };
+    state.results.pop_front();
     let stream = result.id.stream as usize;
     state.queued[stream] -= 1;
     state.dequeued = state.dequeued.wrapping_add(1);
@@ -398,7 +539,8 @@ pub extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u
         // SAFETY: optional out parameter.
         unsafe { total.write(state.dequeued) };
     }
-    state.results.len() as u32
+    // The results that can be dequeued now: the made ones from the oldest on.
+    state.results.iter().take_while(|slot| slot.ready()).count() as u32
 }
 
 pub(crate) fn module() -> HleModule {
@@ -674,5 +816,56 @@ mod tests {
             );
             assert_eq!(XApuDisconnect(handle), S_OK);
         }
+    }
+
+    /// `VICTORY_APU_ASYNC=1`'s worker: commands run in order on its thread,
+    /// each result handed over when made, the event set after.
+    #[test]
+    fn the_worker_runs_commands_in_order() {
+        let (send, jobs) = std::sync::mpsc::channel::<Job>();
+        let worker = std::thread::spawn(move || serve(jobs, 2, 0));
+        let blank = ApuResult {
+            id: id(NOTIFY, 0),
+            state: 0,
+            state_data: 0,
+            usec: 0,
+            error: S_OK,
+            frames: 0,
+            output_length: 0,
+            output: std::ptr::null_mut(),
+            pitch: 1.0,
+            input_length: 0,
+            input: std::ptr::null(),
+        };
+        // A 20 ms mono packet of a 440 Hz tone, and room for its frames.
+        let tone: Vec<f32> = (0..960).map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5).collect();
+        let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let mut packet = vec![0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+        let mut out = vec![0u8; 960 * 4];
+        let process = Process {
+            id: id(PROCESS, 1),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: n as u32,
+            input: packet.as_ptr(),
+            output_length: out.len() as u32,
+            output: out.as_mut_ptr(),
+        };
+        let mut done = Vec::new();
+        for (stream, work) in [(1, Work::Activate(1)), (1, Work::Process(process)), (0, Work::Process(process))] {
+            let slot = Arc::new(Mutex::new(None));
+            send.send(Job { stream, work, result: blank, done: slot.clone(), event: 0 }).unwrap();
+            done.push(Slot::Coming(slot));
+        }
+        drop(send);
+        worker.join().unwrap();
+        let results: Vec<ApuResult> = done.iter().map(|s| s.take().expect("made")).collect();
+        let (e0, e1, f1, e2) = (results[0].error, results[1].error, results[1].frames, results[2].error);
+        // Activated, then decoded on that stream; stream 0 was never activated.
+        assert_eq!((e0, e1, f1, e2), (S_OK, S_OK, 960, INVALID_STREAM));
+        assert!(done.iter().all(Slot::ready));
     }
 }
