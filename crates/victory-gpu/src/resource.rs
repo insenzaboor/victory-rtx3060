@@ -1231,6 +1231,10 @@ struct Hosted {
     used: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
+    /// When the card last had no room for it (`crate::host::moment`; 0:
+    /// never): it is tried again on a use after [`NO_ROOM_AGAIN_MS`]
+    /// ([`NoTexture::ForNow`]).
+    no_room: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1573,6 +1577,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        // The card had no room for it a moment ago: not asked again on
+        // every use (`NO_ROOM_AGAIN_MS`).
+        let no_room = r.host.no_room.load(Relaxed);
+        if no_room != 0 && !crate::host::long_ago(no_room, NO_ROOM_AGAIN_MS, 0) {
+            return None;
+        }
         let clear = r
             .host
             .clear
@@ -1604,7 +1614,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1637,13 +1647,29 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some(texture),
+            Some(texture) => Ok(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
-            return None;
+        let texture = match texture {
+            Ok(texture) => texture,
+            Err(NoTexture::Refused) => {
+                r.host.refused.store(true, Relaxed);
+                return None;
+            }
+            // Upstream VIctory #3198 (after Th3C0D3R e4245f3c): a texture
+            // whose host texture could not be made kept that answer for the
+            // run, so a texture first asked for while the card was full read
+            // black to the end. Out of room is not a refusal: the texture is
+            // made on a later use.
+            Err(NoTexture::ForNow) => {
+                r.host.no_room.store(crate::host::moment().max(1), Relaxed);
+                NOT_MADE_FOR_NOW.fetch_add(1, Relaxed);
+                return None;
+            }
         };
+        if r.host.no_room.swap(0, Relaxed) != 0 {
+            MADE_AFTER_NO_ROOM.fetch_add(1, Relaxed);
+        }
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -2468,8 +2494,38 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     host_texture_as(desc, state, clear, false)
+}
+
+/// Why [`host_texture`] made no host texture.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoTexture {
+    /// The host will not make this description: not asked again.
+    Refused,
+    /// The card had no room then (`E_OUTOFMEMORY`), or there was no host
+    /// yet: asked again on a later use (upstream VIctory #3198).
+    ForNow,
+}
+
+/// How long a texture the card had no room for waits before it is asked
+/// for again ([`Hosted::no_room`]): each ask is a `CreateCommittedResource`.
+#[cfg(windows)]
+const NO_ROOM_AGAIN_MS: u64 = 1000;
+
+/// Host textures not made for lack of room, and made on a later use after
+/// that, since the start (for the memory line).
+#[cfg(windows)]
+pub(crate) static NOT_MADE_FOR_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+pub(crate) static MADE_AFTER_NO_ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a failed host texture creation means for the texture: only a card
+/// out of memory is worth asking again.
+#[cfg(windows)]
+fn no_texture(code: HRESULT) -> NoTexture {
+    if code == E_OUTOFMEMORY { NoTexture::ForNow } else { NoTexture::Refused }
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2480,13 +2536,13 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return Err(NoTexture::Refused);
     }
-    let host = crate::host::host()?;
+    let host = crate::host::host().ok_or(NoTexture::ForNow)?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2553,7 +2609,7 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Some(t);
+        return Ok(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2588,24 +2644,36 @@ fn host_texture_as(
             )
         }
     };
+    // Out of room may come back each second for many textures (upstream
+    // VIctory #3198): its first and then every power-of-two-th line only.
+    let say = |why: NoTexture| {
+        static NO_ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = (why == NoTexture::ForNow).then(|| NO_ROOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+        n.is_none_or(u64::is_power_of_two).then_some(n)
+    };
     if let Err(e) = &made {
         crate::residency::allocation_error(e);
-        tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+        let why = no_texture(e.code().0);
+        if let Some(times) = say(why) {
+            tracing::warn!(error = %e, desc = ?d, reserved, ?why, times, "no host texture");
+        }
+        return Err(why);
     }
     if !reserved
-        && made.is_ok()
         && let Some(t) = &texture
         && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
-        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        let why = no_texture(e.code().0);
+        if let Some(times) = say(why) {
+            tracing::warn!(error = %e, desc = ?d, ?why, times, "a host texture is not resident");
+        }
+        return Err(why);
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
+    let texture = texture.ok_or(NoTexture::Refused)?;
+    crate::host::name(&texture, || {
+        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    });
+    Ok(texture)
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2744,6 +2812,7 @@ fn hand_out_resource(
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
+            no_room: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3516,6 +3585,16 @@ mod tests {
             create(device, 0, &desc, u32::MAX, null, &RESOURCE_IIDS[0], &mut r),
             0
         );
+    }
+
+    /// Upstream VIctory #3198 (after Th3C0D3R e4245f3c): only a card out of
+    /// memory is asked again; any other failure is a refusal for good.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_card_without_room_is_asked_again() {
+        assert_eq!(no_texture(E_OUTOFMEMORY), NoTexture::ForNow);
+        assert_eq!(no_texture(E_INVALIDARG), NoTexture::Refused);
+        assert_eq!(no_texture(0x887A_0005_u32 as i32), NoTexture::Refused); // device removed
     }
 
     #[test]

@@ -856,15 +856,18 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap is still there and `id` says it is the one that took
+/// them ([`host::HostHeap::id`]): the title can release the heap a list's
+/// slots came from, and a later heap can be made at the same address before
+/// the list is reset (after Th3C0D3R e4245f3c).
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -910,6 +913,14 @@ impl Drop for Heap {
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
         crate::port_descriptors::let_go(self.start);
+        drop(heaps);
+        // Its run of title-memory views goes with it: a heap made later at
+        // the same address must not find this one's run (fork pull request
+        // #589, AscilCH; after Th3C0D3R e4245f3c).
+        #[cfg(windows)]
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
