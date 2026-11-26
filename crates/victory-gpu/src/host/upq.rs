@@ -156,7 +156,9 @@ pub(super) unsafe fn send(
     if slot.bounce.as_ref().is_none_or(|b| b.1 < total) {
         let size = total.next_power_of_two().max(LEAST);
         slot.bounce = None;
-        let Some(made) = host.uav_buffer(size) else {
+        // Not zeros at need (`Host::card_buffer`): each send copies its
+        // ranges in before the drawing queue copies them out.
+        let Some(made) = host.card_buffer(size) else {
             q.free.push(slot);
             STATS[3].fetch_add(1, Relaxed);
             return None;

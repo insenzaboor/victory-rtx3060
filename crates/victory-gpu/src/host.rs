@@ -4553,7 +4553,10 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                // Not zeros at need (`card_buffer`): every piece's hash is
+                // written below ("all of them the first time", `whole`)
+                // before a compare reads one.
+                let before = self.card_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -7484,7 +7487,10 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        // Not zeros at need (`card_buffer`): every recording writes its
+        // words zeros before its first clamp reads them
+        // ([`HostList::zero_card_budget`]), and only those words are read.
+        let buffer = host()?.card_buffer(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -7565,7 +7571,10 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        // Not zeros at need (`card_buffer`): the clamp writes every record
+        // an execution reads (those below its count) before it reads them,
+        // as in a buffer kept from recording to recording, which this is.
+        let buffer = host()?.card_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -7587,7 +7596,10 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            // Not zeros at need (`card_buffer`): a batch's clamp writes the
+            // records of its places before their executions read them, as
+            // in the buffers kept from recording to recording.
+            let made = host()?.card_buffer(size)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -10373,8 +10385,28 @@ impl Host {
     }
 
     /// A device-local buffer shaders may write (unordered access) and indirect
-    /// execution may read, starting in the common state.
+    /// execution may read, starting in the common state: an allocation of its
+    /// own, all zeros. For callers that count on that (counters shaders add
+    /// to, bytes read before anything wrote them); the others call
+    /// [`Self::card_buffer`].
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.card_buffer_of(size, false)
+    }
+
+    /// [`Self::uav_buffer`] for callers that write every byte they read
+    /// first (or send it up whole, `crate::shadow`'s copies in the card's
+    /// memory): with `VICTORY_CARD_HEAPS` placed in a heap made resident and
+    /// waited for once (`crate::pool::CARD`), and then not zeros where
+    /// another buffer lay before (`crate::pool::begins_as_zeros`). Each was
+    /// an allocation of its own, made resident and waited for until the card
+    /// has it mapped (`resident`, `mapped`): some 16,000 in run thirtyfour's
+    /// four and a half minutes, 7 GB.
+    pub(crate) fn card_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.card_buffer_of(size, true)
+    }
+
+    /// [`Self::uav_buffer`], or with `pooled` [`Self::card_buffer`].
+    fn card_buffer_of(&self, size: u64, pooled: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10395,6 +10427,11 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
+        if pooled && let Some(b) = crate::pool::CARD.card(&self.device, &desc, D3D12_RESOURCE_STATE_COMMON) {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&b, || "an unordered access buffer placed in a heap".into());
+            return Some(b);
+        }
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {

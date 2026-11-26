@@ -494,6 +494,10 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
+        // Buffers of their own, zeros (`uav_buffer`, not `card_buffer`): the
+        // probe's sums are counters shaders add to, and the cells keep a slow
+        // mean from frame to frame that starts from what they hold. (Made
+        // once: nothing to win.)
         make(&host.device, |bytes| host.uav_buffer(bytes))
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
