@@ -1298,8 +1298,48 @@ mod tests {
 }
 
 /// The batches of clamped records in one scratch buffer
-/// ([`HostList::batch_place`]).
-const BATCHES: u32 = 8;
+/// ([`HostList::batch_place`]): 8, or 32 with [`batch_pool`].
+fn batches() -> u32 {
+    if batch_pool() { 32 } else { 8 }
+}
+
+/// Whether the scratch buffers of batched clamps go to one pool when their
+/// list is reset, for any list to take, where each list kept its own from
+/// recording to recording, idle lists' too (`VICTORY_BATCH_POOL=1`; off by
+/// default), and hold 32 batches each, not 8. After Belobug e9428969, where
+/// it is on.
+fn batch_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The pool of [`batch_pool`]: buffers in the common state, whose lists'
+/// last submission has run.
+struct BatchBuf(ID3D12Resource);
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for BatchBuf {}
+static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
+
+fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
+    if batch_pool()
+        && let Some(BatchBuf(buffer)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop()
+    {
+        return Some(buffer);
+    }
+    // Not zeros at need (`card_buffer`): a batch's clamp writes the
+    // records of its places before their executions read them, as in the
+    // buffers kept from recording to recording.
+    let made = host()?.card_buffer(size)?;
+    name(&made, || format!("indirect batches {size:#x}"));
+    Some(made)
+}
+
+fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
+    let most: usize = if keep_freed() { 64 } else { 16 };
+    let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let room = most.saturating_sub(spare.len());
+    spare.extend(buffers.into_iter().take(room).map(BatchBuf));
+}
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
@@ -2447,8 +2487,10 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes; then
+    /// the list's prelude uploads it if it changed
+    /// (`crate::texture::prelude_uploads`).
+    Texture(crate::texture::PreludeUpload),
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
@@ -3244,8 +3286,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Step::Texture(upload) => {
+                    let (at, len) = upload.staging.memory();
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
@@ -3970,7 +4012,6 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -5983,9 +6024,9 @@ impl Host {
         stage.next("submit: the lists' steps");
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for (_run, list) in runs.iter().enumerate() {
-            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&uploads) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -6770,6 +6811,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        if batch_pool() {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            // (Closed lists left them in the common state, `batches_common`.)
+            let left = std::mem::take(&mut args.1);
+            let buffers = std::mem::take(&mut args.0);
+            drop(args);
+            if left == 0 {
+                give_batch_buffers(buffers);
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -6857,7 +6908,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_for(copy.flags(), wanted);
         self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -7084,8 +7135,11 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// from the other, if a list submitted earlier left it behind. Title
+    /// textures this submission found changed (`uploads`, with whether it
+    /// is their first upload) are copied from their staging buffers here,
+    /// right before the list runs (Belobug 5d6bd841).
+    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7111,6 +7165,7 @@ impl HostList {
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
+        let mut aliasing = Vec::new();
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
@@ -7140,13 +7195,42 @@ impl HostList {
                 }
             }
         }
+        for (upload, first_upload) in uploads {
+            let copy = &upload.copy;
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            // A texture cut from a block may lie where another did: what the
+            // card holds of that one is done with before the first upload
+            // into this one.
+            if crate::pool::on() && *first_upload && crate::pool::pooled(&copy.texture) {
+                aliasing.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                            pResourceBefore: std::mem::ManuallyDrop::new(None),
+                            // SAFETY: a borrowed pointer the barrier never releases.
+                            pResourceAfter: unsafe { std::mem::transmute_copy(&copy.texture) },
+                        }),
+                    },
+                });
+            }
+            let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                // Back to its real state if the list does not use it.
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+            copying.insert(key, COPY_DEST);
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -7161,11 +7245,17 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if !aliasing.is_empty() {
+                    list.ResourceBarrier(&aliasing);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (upload, _) in uploads {
+                    upload.record(self, list);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -7617,14 +7707,11 @@ impl HostList {
     pub(crate) fn batch_place(&self) -> Option<(ID3D12Resource, u32, D3D12_RESOURCE_STATES)> {
         use crate::indirect::batch::{JOBS, SLOT};
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
+        let batches = batches();
+        let (buffer, i) = ((args.1 / batches) as usize, args.1 % batches);
         if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
-            // Not zeros at need (`card_buffer`): a batch's clamp writes the
-            // records of its places before their executions read them, as
-            // in the buffers kept from recording to recording.
-            let made = host()?.card_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let size = u64::from(batches * JOBS * SLOT);
+            let made = take_batch_buffer(size)?;
             args.0.push(made);
         }
         args.1 += 1;
@@ -7638,7 +7725,7 @@ impl HostList {
     /// back to the common state, where the next recording expects them.
     fn batches_common(&self) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
+        let used = std::mem::take(&mut args.1).div_ceil(batches()) as usize;
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
             .iter()
             .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
@@ -7743,17 +7830,26 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// submitted (and with prelude uploads records its upload on the
+    /// list's prelude if it changed), keeping it and its host copy alive
+    /// until the list is reset.
+    pub(crate) fn defer_texture(&self, upload: crate::texture::PreludeUpload) {
+        self.deferred().copies.push(Step::Texture(upload));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
     /// `taken` names (by their place) are left out: they are done on the
-    /// card ([`card_steps`]).
-    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
+    /// card ([`card_steps`]). Returns the textures the list's prelude
+    /// uploads (`crate::texture::prelude_uploads`), each with whether it is
+    /// its first upload.
+    fn run_deferred(
+        &self,
+        batch: &mut Batch,
+        air: &[(usize, usize)],
+        taken: impl Fn(usize) -> bool,
+    ) -> Vec<(crate::texture::PreludeUpload, bool)> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -7761,6 +7857,7 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -7869,12 +7966,15 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        batch.due.push(staging.clone());
+                Step::Texture(upload) => {
+                    if batch.texture_due(&upload.staging) {
+                        batch.due.push(upload.staging.clone());
                         if !wide_textures() {
                             batch.refresh_textures();
                         }
+                    }
+                    if upload.prelude {
+                        textures.push(upload.clone());
                     }
                     continue;
                 }
@@ -7892,6 +7992,18 @@ impl HostList {
             add(C::RefreshBytes, refreshed);
             SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
         }
+        if textures.is_empty() {
+            return Vec::new();
+        }
+        // The textures still due are refreshed (a title write since their
+        // refresh in front made them due again), and those whose staging
+        // buffer changed are claimed: this list's prelude uploads them, on
+        // this very submission.
+        batch.refresh_textures();
+        textures
+            .into_iter()
+            .filter_map(|upload| upload.finish_refresh().map(|first| (upload, first)))
+            .collect()
     }
 }
 
@@ -8237,8 +8349,8 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
             Some(Touch::Refresh(key, *from, *from + *len))
         }
         Step::GpuWrite(shadow, ..) => Some(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-        Step::Texture(staging) if textures => {
-            staged.push(staging.clone());
+        Step::Texture(upload) if textures => {
+            staged.push(upload.staging.clone());
             None
         }
         _ => None,
@@ -8651,9 +8763,9 @@ impl Batch {
                         touches.push(Touch::Refresh(key, *at, *at + *len));
                     }
                     Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-                    Step::Texture(staging) if wide_textures() => {
-                        if self.texture_due(staging) {
-                            due.push(staging.clone());
+                    Step::Texture(upload) if wide_textures() => {
+                        if self.texture_due(&upload.staging) {
+                            due.push(upload.staging.clone());
                         }
                     }
                     _ => {}
@@ -9351,7 +9463,6 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -9424,7 +9535,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -10017,7 +10127,6 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -10066,7 +10175,6 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
             }
@@ -10124,7 +10232,6 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
         }
