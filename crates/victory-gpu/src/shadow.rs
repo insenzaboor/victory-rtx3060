@@ -5662,11 +5662,24 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
+    // What was counted for an arena that did not go on the card is given
+    // back (`VICTORY_BY_ADDRESS_COUNT=0`: kept, as before: one arena past
+    // the cap, or one the card refused, kept every later one off it;
+    // Belobug e9428969).
+    let give_back = by_address_count();
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         // Not zeros at need (`Host::card_buffer`): [`carded`] sends it up
         // whole, before any shader stores in it.
-        host.card_buffer(len)
+        host.card_buffer(len).or_else(|| {
+            if give_back {
+                USED.fetch_sub(len, Ordering::Relaxed);
+            }
+            None
+        })
     } else {
+        if room && give_back {
+            USED.fetch_sub(len, Ordering::Relaxed);
+        }
         None
     };
     let buffer = match on_card {
@@ -5693,6 +5706,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     carded(&shadow);
     Some(shadow)
+}
+
+/// Whether [`by_address`] counts only the arenas that went on the card
+/// against its cap (`VICTORY_BY_ADDRESS_COUNT`, on unless 0).
+fn by_address_count() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BY_ADDRESS_COUNT").is_none_or(|v| v != "0"))
 }
 
 /// Copies of title memory outside buffers, by (start, length).
