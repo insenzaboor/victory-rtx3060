@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="Loads, hangs, crashes: 100% done">
+<style>text{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;fill:#768390;font-size:12px} .t{fill:#768390;font-size:14px;font-weight:600}</style>
+<text class="t" x="10" y="20">Loads, hangs, crashes</text><text x="550" y="20" text-anchor="end">100% done · 4 of 4 landed</text>
+<rect x="10" y="30" width="540" height="16" rx="8" fill="#8c959f" fill-opacity="0.25"/>
+<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="540.0" height="16" fill="#2ea043"/></g>
+<text x="10" y="64">■ 4 done</text><text x="120" y="64" style="fill:#3b82f6">■ 0 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 0 planned</text>
+</svg>

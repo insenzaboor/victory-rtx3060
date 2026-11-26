@@ -1,155 +1,141 @@
-# VIctory on an RX 7900 XTX
+<div align="center">
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+<img src="docs/assets/screens/hero-yard-sunset.jpg" alt="Running natively on Windows: the prison yard at sunset, seen from a cell" width="100%">
 
-## The goal
+# victory-rtx3060
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+**An Xbox Series compatibility layer tuned for NVIDIA mid-range PCs.**<br>
+A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series title natively on Windows, measured and tuned run by run on an **RTX 3060 12 GB** with **32 GB of RAM** and **Resizable BAR off**.
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+[![fps](https://img.shields.io/badge/heavy%20scenes-10--12%20fps-2ea043?style=for-the-badge)](docs/data/runs.json)
+[![frame time](https://img.shields.io/badge/best%20frame-86.7%20ms%20%40%203k%20draws-3b82f6?style=for-the-badge)](docs/data/runs.json)
+[![load](https://img.shields.io/badge/load%20to%20world-67%20s-8957e5?style=for-the-badge)](docs/data/runs.json)
+<br>
+[![gpu](https://img.shields.io/badge/GPU-RTX%203060%2012%20GB-76b900?style=flat-square&logo=nvidia&logoColor=white)](#hardware)
+[![ram](https://img.shields.io/badge/RAM-32%20GB-informational?style=flat-square)](#hardware)
+[![license](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
+[![tracker](https://img.shields.io/badge/tracker-docs%2FTRACKER.md-orange?style=flat-square)](docs/TRACKER.md)
+[![dashboard](https://img.shields.io/badge/live-dashboard-ff69b4?style=flat-square)](https://nyxth254-png.github.io/victory-rtx3060/)
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+**[Live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)** · **[Port tracker](docs/TRACKER.md)** · **[How to run](#how-to-run)** · **[What made it fast](#what-made-it-fast)** · **[Credits](#credits)**
 
-## Where it stands (2026-11-26)
+</div>
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
+> [!IMPORTANT]
+> **This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated with or endorsed by the game's developer or publisher, or by Microsoft.
+
+## Where it stands
 
 | | |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
+| **Typical gameplay** | **10–11 fps** steady (87–104 ms at 2,800–4,750 draws per frame) |
+| **Best heavy scene** | **86.7 ms** at 3,093 draws (12 fps) |
+| **Heaviest scenes** | 126 ms at 5,900 draws · 139 ms at 6,950 draws |
+| **Load to world** | **67 s** |
+| **Shaders** | everything the title binds translates; the 27 wave64-only programs (particles, water volumes, hair shadows) translate with `VICTORY_WAVE_LDS_LOOSE=1` |
+| **Stability** | title load hang found and fixed (a lock the title's own code leaked); RAM monitor keeps the PC alive on out-of-memory |
+| **Frame time since the first world** | **430 ms → 87 ms** (5x) in one day of measured runs |
 
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+<p align="center"><img src="docs/assets/charts/frametime.png" alt="Frame time per measured run" width="90%"></p>
 
-### Renderer patches (off by default while they are tested)
+## Progress
 
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
+<!-- PROGRESS:START -->
 
-### Other switches
+<p align="center"><img src="docs/assets/progress/overall.svg" alt="overall progress"></p>
 
-| Switch | What it does |
-|---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| | Category | Done | In flight | Planned |
+|---|---|---|---|---|
+| <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 23 | 4 | 1 |
+| <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 1 | 3 | 2 |
+| <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 7 | 0 |
+| <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 0 | 0 |
+| <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 3 | 0 |
+| <img src="docs/assets/progress/tooling.svg" width="300"> | **Measurement and automation** | 4 | 1 | 0 |
 
-What is known to be wrong:
+**35 of 56** items done or decided, **18** merged and waiting for a game run, **3** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)**
 
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+<!-- PROGRESS:END -->
 
-## How to run it
+## Gallery
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+<table>
+<tr>
+<td width="50%"><img src="docs/assets/screens/cell-window.jpg" alt="Cell window at sunset"></td>
+<td width="50%"><img src="docs/assets/screens/cell-sunset.jpg" alt="Sunlight through the cell"></td>
+</tr>
+<tr>
+<td><img src="docs/assets/screens/cutscene-office.jpg" alt="Cutscene in an office"></td>
+<td><img src="docs/assets/screens/corridor.jpg" alt="Prison corridor"></td>
+</tr>
+<tr>
+<td><img src="docs/assets/screens/cutscene-interior.jpg" alt="Cutscene interior"></td>
+<td><img src="docs/assets/screens/cutscene-parking.jpg" alt="Cutscene in a parking lot"></td>
+</tr>
+<tr>
+<td><img src="docs/assets/screens/cell-door.jpg" alt="Cell block door"></td>
+<td><img src="docs/assets/screens/closeup-outdoor.jpg" alt="Outdoor close-up"></td>
+</tr>
+</table>
+
+<sub>Captured by the autopilot during measured runs on the hardware below, Series S profile, 1080p output. Known glitches remain: see the tracker's rendering section.</sub>
+
+## What made it fast
+
+Every step below was found with a timeline trace or a profile, changed, and measured in a game run. The full list, with switches and commits, is in **[docs/TRACKER.md](docs/TRACKER.md)**.
+
+| Run | Frame time @ ~3k draws | What changed |
+|---|---|---|
+| 2 | 430 ms | first world |
+| 7 | 300 ms | copies made outside locks, window lookups under read locks |
+| 10 | 160 ms | **title memory read from VRAM instead of over PCIe** (Resizable BAR is off) |
+| 24 | 153 ms | non-blocking logger, fence sweep for the title's GPU watchdog, title threads allowed on every core |
+| 36 | 138 ms | **buffers placed in heaps made resident once** (102,900 committed buffers and waits per run, gone) |
+| 37 | 137 ms | 16 MB heaps (2 GB less RAM wasted), structured views in place |
+| 48 | 87 ms | community ports (XaviFortes, Th3C0D3R), **load-hang fix**: a lock the title's own code leaked |
+
+## How to run
+
+**Needs:** Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+git clone https://github.com/nyxth254-png/victory-rtx3060
+cd victory-rtx3060
+cargo build --locked --release -p victory
+scripts\play-rtx3060.ps1 -Game "D:\path\to\your\dump" -Victory target\release\victory.exe
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+`-Experimental` adds the switches that are merged but not yet verified in a game run (new shader forms, lookup cache, async audio, early tables). `-Console SeriesX` uses the Series X profile.
 
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+> [!TIP]
+> On a 32 GB PC the title uses about 22–24 GB. Close other heavy programs first. The first run of a new build stutters while the driver makes pipelines; `victory warm --used` makes them ahead.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+## Hardware
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+Every number on this page is from one PC: **AMD Ryzen 9 5900X · 32 GB RAM · NVIDIA RTX 3060 12 GB · Resizable BAR off · Windows Server 2025**, Series S profile, 1080p output. It is CPU-bound: the card is often idle while the CPU translates and submits.
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+## Tracking
 
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+| Where | What |
+|---|---|
+| **[Live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)** | charts of every measured run, filterable list of every port |
+| **[docs/TRACKER.md](docs/TRACKER.md)** | every item by category and status, with source, switch, effect and commit |
+| **[Issues](https://github.com/nyxth254-png/victory-rtx3060/issues)** | one issue per open item, labelled by category and status |
+| [`docs/data/`](docs/data) | the single source of truth: `ports.json` and `runs.json`. `python scripts/tracker/build.py` rebuilds the tracker, progress bars and chart |
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+Built on the work of the community, with history and credit kept in every commit:
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**: the compatibility layer itself
+- **[avatarmanz](https://github.com/avatarmanz/VIctory-7900XTX)**: renderer ports 1–7, the measured base set, the pop-in fix
+- **[fxceless](https://github.com/fxceless/victory-fork)**, **[DexNom](https://github.com/DexNom/VIctory)**, **[Belobug](https://github.com/Belobug/VIctory-Belobug-AMD)**: much of the tree we build on
+- **[deynesdev](https://github.com/deynesdev/Protonida)**: structured views in place, loose-LDS wave64 forms
+- **[XaviFortes](https://github.com/XaviFortes/VIctory-RDNA)**: lock-free refresh fast path and more
+- **[Th3C0D3R](https://github.com/Th3C0D3R/victory-fork)**, **chabrune**, **cool_fox / CGBJ**, **Rubenpannen**, **SPOOKEXE**, **ApexIV**, **aleksesipenko** and every fork listed in the tracker
+
+The upstream README this fork started from is kept in [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0, as upstream. See [LICENSE](LICENSE).

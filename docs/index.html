@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>victory-rtx3060 dashboard</title>
+<meta name="description" content="Live progress of victory-rtx3060: frame time per measured run and every community port, tracked.">
+<style>
+:root {
+  --bg: #f6f8fa; --panel: #ffffff; --text: #1f2328; --muted: #59636e; --line: #d1d9e0;
+  --done: #1a7f37; --flight: #0969da; --planned: #8c959f; --nogain: #9a6700; --na: #59636e; --accent: #8250df;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1117; --panel: #151b23; --text: #e6edf3; --muted: #9198a1; --line: #30363d;
+    --done: #3fb950; --flight: #4493f8; --planned: #6e7681; --nogain: #d29922; --na: #9198a1; --accent: #a371f7;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1117; --panel: #151b23; --text: #e6edf3; --muted: #9198a1; --line: #30363d;
+  --done: #3fb950; --flight: #4493f8; --planned: #6e7681; --nogain: #d29922; --na: #9198a1; --accent: #a371f7;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+a { color: var(--flight); }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 16px 48px; }
+header.hero { position: relative; border-radius: 0 0 16px 16px; overflow: hidden; min-height: 260px; display: flex; align-items: flex-end; margin: 0 -16px 24px; }
+header.hero img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+header.hero .shade { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,0) 20%, rgba(0,0,0,.78)); }
+header.hero .title { position: relative; padding: 24px 28px; color: #fff; }
+header.hero h1 { margin: 0; font-size: clamp(26px, 5vw, 40px); letter-spacing: -.5px; }
+header.hero p { margin: 4px 0 0; color: #d0d7de; max-width: 720px; }
+.toolbar { display: flex; gap: 10px; justify-content: flex-end; margin: -8px 0 16px; flex-wrap: wrap; }
+.btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit; text-decoration: none; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+.card .k { color: var(--muted); font-size: 13px; }
+.card .v { font-size: 28px; font-weight: 700; letter-spacing: -.5px; }
+.card .s { color: var(--muted); font-size: 13px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 20px; }
+section h2 { margin: 0 0 12px; font-size: 18px; }
+.bar { height: 14px; border-radius: 7px; background: color-mix(in srgb, var(--planned) 25%, transparent); overflow: hidden; display: flex; }
+.bar span { display: block; height: 100%; }
+.cats { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px 24px; margin-top: 16px; }
+.cat .row { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 4px; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 10px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.chartbox { position: relative; height: 320px; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.filters select, .filters input { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+.filters input { flex: 1; min-width: 180px; }
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+td code { font-size: 12px; word-break: break-word; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; color: #fff; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.gallery img { width: 100%; border-radius: 8px; display: block; aspect-ratio: 16/9; object-fit: cover; }
+footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 24px; }
+@media (max-width: 600px) { header.hero { min-height: 200px; } .card .v { font-size: 24px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <img src="assets/screens/hero-yard-sunset.jpg" alt="The prison yard at sunset, rendered on an RTX 3060">
+    <div class="shade"></div>
+    <div class="title">
+      <h1>victory-rtx3060</h1>
+      <p>An Xbox Series compatibility layer tuned run by run on an RTX 3060, 32 GB RAM, Resizable BAR off. Every number here is measured.</p>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <a class="btn" href="https://github.com/nyxth254-png/victory-rtx3060">GitHub</a>
+    <a class="btn" href="https://github.com/nyxth254-png/victory-rtx3060/blob/main/docs/TRACKER.md">Tracker</a>
+    <button class="btn" id="theme" type="button">Theme</button>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <section>
+    <h2>Everything ported and evaluated</h2>
+    <div class="bar" id="overall"></div>
+    <div class="legend">
+      <span><i style="background:var(--done)"></i>done or decided</span>
+      <span><i style="background:var(--flight)"></i>merged or in flight</span>
+      <span><i style="background:var(--planned)"></i>planned</span>
+    </div>
+    <div class="cats" id="cats"></div>
+  </section>
+
+  <section>
+    <h2>Frame time per measured run</h2>
+    <div class="chartbox"><canvas id="chart" aria-label="Frame time per run"></canvas></div>
+    <p class="s" style="color:var(--muted);font-size:13px;margin:8px 0 0" id="metric"></p>
+  </section>
+
+  <section>
+    <h2>Every port and change</h2>
+    <div class="filters">
+      <select id="fcat" aria-label="Category"><option value="">All categories</option></select>
+      <select id="fstat" aria-label="Status"><option value="">All statuses</option></select>
+      <input id="fq" type="search" placeholder="Search title, source, switch..." aria-label="Search">
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Item</th><th>Status</th><th>Category</th><th>Source</th><th>Switch</th><th>Effect</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Gallery</h2>
+    <div class="gallery" id="gallery"></div>
+  </section>
+
+  <footer>No game files, code or assets are in this repository. Data: <a href="data/ports.json">ports.json</a> · <a href="data/runs.json">runs.json</a> · <span id="updated"></span></footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+(function () {
+  var root = document.documentElement;
+  try { var saved = localStorage.getItem("theme"); if (saved) root.setAttribute("data-theme", saved); } catch (e) {}
+  document.getElementById("theme").addEventListener("click", function () {
+    var dark = getComputedStyle(root).getPropertyValue("--bg").trim() === "#0d1117";
+    var next = dark ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("theme", next); } catch (e) {}
+    if (window._chart) draw(window._runs);
+  });
+
+  var STATUS = {
+    "shipped": ["shipped", "--done"], "default-untested": ["on, untested", "--flight"], "ready": ["ready to test", "--flight"],
+    "in-progress": ["in progress", "--accent"], "planned": ["planned", "--planned"], "no-gain": ["no gain", "--nogain"], "not-applicable": ["n/a", "--na"]
+  };
+  var DONE = { "shipped": 1, "no-gain": 1, "not-applicable": 1 }, FLIGHT = { "default-untested": 1, "ready": 1, "in-progress": 1 };
+  function css(v) { return getComputedStyle(root).getPropertyValue(v).trim(); }
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function counts(g) { var d = 0, f = 0; g.forEach(function (i) { if (DONE[i.status]) d++; else if (FLIGHT[i.status]) f++; }); return [d, f, g.length - d - f, g.length]; }
+  function bar(el, g) {
+    var c = counts(g);
+    el.innerHTML = '<span style="width:' + (100 * c[0] / c[3]) + '%;background:var(--done)"></span>' +
+      '<span style="width:' + (100 * c[1] / c[3]) + '%;background:var(--flight)"></span>';
+    return c;
+  }
+
+  function draw(runs) {
+    var ctx = document.getElementById("chart");
+    if (window._chart) window._chart.destroy();
+    if (!window.Chart) { ctx.parentNode.innerHTML = "<p>Chart library could not load.</p>"; return; }
+    var text = css("--muted"), line = css("--line"), blue = css("--flight"), green = css("--done");
+    window._chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: runs.runs.map(function (r) { return "run " + r.run; }),
+        datasets: [
+          { label: "ms per frame (~3,000 draws)", data: runs.runs.map(function (r) { return r.ms; }), borderColor: blue, backgroundColor: blue, tension: .25, pointRadius: 5 },
+          { label: "30 fps", data: runs.runs.map(function () { return 33.3; }), borderColor: green, borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: text } },
+          tooltip: { callbacks: { afterLabel: function (c) { var r = runs.runs[c.dataIndex]; return c.datasetIndex ? "" : r.label + " (" + r.method + ")"; } } }
+        },
+        scales: {
+          y: { beginAtZero: true, ticks: { color: text }, grid: { color: line }, title: { display: true, text: "ms per frame", color: text } },
+          x: { ticks: { color: text }, grid: { color: line } }
+        }
+      }
+    });
+  }
+
+  Promise.all([fetch("data/ports.json").then(function (r) { return r.json(); }), fetch("data/runs.json").then(function (r) { return r.json(); })])
+    .then(function (res) {
+      var ports = res[0], runs = res[1], items = ports.items;
+      window._runs = runs;
+      var h = runs.highlights, c = counts(items);
+      document.getElementById("cards").innerHTML = [
+        ["Typical gameplay", "10-11 fps", h.typical],
+        ["Best heavy scene", runs.runs[runs.runs.length - 1].ms + " ms", h.best_heavy_scene],
+        ["Since first world", Math.round(runs.runs[0].ms / runs.runs[runs.runs.length - 1].ms) + "x faster", runs.runs[0].ms + " ms → " + runs.runs[runs.runs.length - 1].ms + " ms"],
+        ["Load to world", h.load_time_s + " s", "measured, autopilot"],
+        ["Ported and evaluated", Math.round(100 * c[0] / c[3]) + "%", c[0] + " done · " + c[1] + " in flight · " + c[2] + " planned"]
+      ].map(function (k) { return '<div class="card"><div class="k">' + esc(k[0]) + '</div><div class="v">' + esc(k[1]) + '</div><div class="s">' + esc(k[2]) + "</div></div>"; }).join("");
+      bar(document.getElementById("overall"), items);
+      var cats = document.getElementById("cats"), fcat = document.getElementById("fcat"), fstat = document.getElementById("fstat");
+      Object.keys(ports.categories).forEach(function (k) {
+        var g = items.filter(function (i) { return i.category === k; });
+        var d = document.createElement("div"); d.className = "cat";
+        var cc = counts(g);
+        d.innerHTML = '<div class="row"><b>' + esc(ports.categories[k]) + '</b><span style="color:var(--muted)">' + cc[0] + "/" + cc[3] + ' done</span></div><div class="bar"></div>';
+        bar(d.querySelector(".bar"), g);
+        cats.appendChild(d);
+        fcat.insertAdjacentHTML("beforeend", '<option value="' + k + '">' + esc(ports.categories[k]) + "</option>");
+      });
+      Object.keys(STATUS).forEach(function (s) { fstat.insertAdjacentHTML("beforeend", '<option value="' + s + '">' + STATUS[s][0] + "</option>"); });
+      function render() {
+        var q = document.getElementById("fq").value.toLowerCase(), cv = fcat.value, sv = fstat.value;
+        var order = Object.keys(STATUS);
+        var rows = items.filter(function (i) {
+          return (!cv || i.category === cv) && (!sv || i.status === sv) &&
+            (!q || (i.title + " " + i.source + " " + (i.switch || "") + " " + (i.effect || "")).toLowerCase().indexOf(q) >= 0);
+        }).sort(function (a, b) { return order.indexOf(a.status) - order.indexOf(b.status); });
+        document.getElementById("rows").innerHTML = rows.map(function (i) {
+          var st = STATUS[i.status];
+          var commit = i.commit ? ' <a href="https://github.com/nyxth254-png/victory-rtx3060/commit/' + esc(i.commit) + '"><code>' + esc(i.commit) + "</code></a>" : "";
+          return "<tr><td>" + esc(i.title) + commit + '</td><td><span class="pill" style="background:var(' + st[1] + ')">' + st[0] + "</span></td><td>" +
+            esc(ports.categories[i.category]) + "</td><td>" + esc(i.source) + "</td><td>" + (i.switch ? "<code>" + esc(i.switch) + "</code>" : "") + "</td><td>" + esc(i.effect) + "</td></tr>";
+        }).join("") || '<tr><td colspan="6">Nothing matches.</td></tr>';
+      }
+      ["fq", "fcat", "fstat"].forEach(function (id) { document.getElementById(id).addEventListener("input", render); });
+      render();
+      draw(runs);
+      document.getElementById("metric").textContent = runs.metric + " Machine: " + runs.machine + ".";
+      document.getElementById("updated").textContent = "updated " + ports.updated;
+      var shots = ["cell-window", "cell-sunset", "cutscene-office", "corridor", "cutscene-interior", "cutscene-parking", "cell-door", "closeup-outdoor"];
+      document.getElementById("gallery").innerHTML = shots.map(function (s) { return '<a href="assets/screens/' + s + '.jpg"><img loading="lazy" src="assets/screens/' + s + '.jpg" alt="' + s.replace(/-/g, " ") + '"></a>'; }).join("");
+    })
+    .catch(function (e) { document.getElementById("cards").innerHTML = '<div class="card">Could not load the data: ' + esc(e.message) + "</div>"; });
+})();
+</script>
+</body>
+</html>

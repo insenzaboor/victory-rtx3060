@@ -1,0 +1,23 @@
+{
+  "updated": "2026-11-26",
+  "machine": "Ryzen 9 5900X, 32 GB RAM, RTX 3060 12 GB (Resizable BAR off), Windows Server 2025",
+  "metric": "Frame time in a heavy scene of about 3,000 draws per frame (lower is better). 'fit' = least-squares fit of walk captions evaluated at 3,000 draws; 'caption' = the window's meter at ~3,000 draws; 'raw' = early median before normalisation existed.",
+  "runs": [
+    {"run": 2,  "date": "2026-11-26", "ms": 430, "method": "raw", "label": "First world: residency on, low-memory windows"},
+    {"run": 7,  "date": "2026-11-26", "ms": 300, "method": "raw", "label": "Locks: exact copies outside the lock, window lookups under read locks"},
+    {"run": 10, "date": "2026-11-26", "ms": 160, "method": "fit", "label": "Title windows and small buffers in VRAM"},
+    {"run": 21, "date": "2026-11-26", "ms": 176, "method": "fit", "label": "Community ports + BCPack, alias skip off"},
+    {"run": 24, "date": "2026-11-26", "ms": 153, "method": "fit", "label": "Non-blocking logger, fence sweep, title affinity widened"},
+    {"run": 36, "date": "2026-11-26", "ms": 138, "method": "fit", "label": "Buffers in heaps made resident once, card_dirty list, more VRAM windows"},
+    {"run": 37, "date": "2026-11-26", "ms": 137, "method": "fit", "label": "16 MB heaps, structured views in place"},
+    {"run": 48, "date": "2026-11-26", "ms": 87,  "method": "caption", "label": "XaviFortes + Th3C0D3R ports, load-hang fix (title tracker unlock)"},
+    {"run": 49, "date": "2026-11-26", "ms": 87,  "method": "caption", "label": "Same build, roaming walk: steady 10-11 fps"}
+  ],
+  "highlights": {
+    "best_heavy_scene": "86.7 ms at 3,093 draws (12 fps), run 48",
+    "typical": "87-104 ms at 2,800-4,750 draws (10-11 fps), run 49",
+    "heaviest": "126 ms at 5,931 draws, 139 ms at 6,948 draws, run 49",
+    "load_time_s": 67,
+    "shaders_translating": "all title shaders except 195 never-used geometry shaders (27 wave64 programs translate with VICTORY_WAVE_LDS_LOOSE=1, offline probe)"
+  }
+}
