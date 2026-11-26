@@ -963,6 +963,79 @@ macro_rules! once {
     }};
 }
 
+/// Whether the stages of one draw share a table they both need made afresh
+/// (`VICTORY_TABLE_STAGES=1`; off by default: each stage makes its own, as
+/// before; from fxceless 5d659e0c). `alt`: twenty seconds with, twenty
+/// without, in turn, each change said in the log; `alt40`: forty and forty,
+/// so that a run can carry this switch and another one in turn and tell the
+/// two apart. In diagnostics builds an A/B run that names the switch
+/// (`crate::ab`) decides first.
+///
+/// A draw's stages read the same root tables, and each asks for slots up to
+/// the last entry it reads itself. The count is in the key of
+/// `State::fresh_tables`, so a mesh stage and a pixel stage that read one
+/// table to different depths made it twice, in dynamic slots of its own
+/// each time. With this both ask for the larger count ([`stage_spans`]),
+/// the second finds the first one's table, and one table is made. (The
+/// making loop makes every entry of the range from its record, so the
+/// longer table holds what either would have made.)
+fn table_stages() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLE_STAGES") {
+        return on;
+    }
+    /// 0 off, 1 on, 2 in turn every 20 s, 3 in turn every 40 s.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_STAGES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        Ok("alt40") => 3,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        mode => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let period = if mode == 3 { 40 } else { 20 };
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / period) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the stages of a draw share the tables they need made afresh from now (VICTORY_TABLE_STAGES=alt): {}",
+                    if on { "ON" } else { "off, each stage makes its own as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// For [`table_stages`]: per root table the stages of `p` read, the slots
+/// it has up to the last entry read by a stage that also reads a constant
+/// view in it (0: no stage does), and up to the last entry any stage reads:
+/// (root parameter, with constants, all).
+fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+    // One stage shares with none (as deynesdev e2bc5d7 has it).
+    if p.stages.len() < 2 {
+        return spans;
+    }
+    for stage in &p.stages {
+        for group in &stage.translated().tables.groups {
+            let n = group.max_dword / 8 + 1;
+            let with = if group.has_cbv { n } else { 0 };
+            match spans.iter_mut().find(|s| s.0 == group.slot) {
+                Some(s) => {
+                    s.1 = s.1.max(with);
+                    s.2 = s.2.max(n);
+                }
+                None => spans.push((group.slot, with, n)),
+            }
+        }
+    }
+    spans
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1751,16 +1824,24 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // With `table_stages`: what the stages of this draw read of each
+        // table, and the tables its earlier stages made afresh (address,
+        // slots). (Both empty with the switch off.)
+        let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
+        let mut staged: Vec<(u64, u32)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                // Which draws those are, in the frame line's list of drops.
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
                 return false;
             }
             if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
@@ -2020,6 +2101,8 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -2091,6 +2174,8 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -3550,6 +3635,8 @@ impl State {
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        spans: &[(u8, u32, u32)],
+        staged: &mut Vec<(u64, u32)>,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -3608,11 +3695,32 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
-            let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
-                || last.and_then(|handle| heap.index(handle)).is_none()
-            {
+            // The slots this stage reads of the table itself.
+            let own = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let fits = |n: u32| {
+                n <= crate::descriptor::host::DYNAMIC
+                    && table
+                        .checked_add(u64::from(n - 1) * 32)
+                        .and_then(|handle| heap.index(handle))
+                        .is_some()
+            };
+            // With `table_stages`: as many slots as the stage of this draw
+            // that reads furthest into the table needs among those that
+            // make it afresh too: the ones reading a constant view in it,
+            // or every stage where the table reaches past the host heap's
+            // slots (`spans` is empty with the switch off). A longer table
+            // that does not fit is not asked for: this stage's own is.
+            let n = match spans.iter().find(|s| s.0 == slot) {
+                Some(&(_, with_constants, all)) => {
+                    let past = heap
+                        .index(table)
+                        .is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
+                    let wider = if past { all } else { with_constants };
+                    if wider > own && fits(wider) { wider } else { own }
+                }
+                None => own,
+            };
+            if !fits(n) {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
@@ -3645,10 +3753,29 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                // Found in the table an earlier stage of this draw made
+                // ([`table_stages`]): the title's own slots this stage
+                // reads are stamped, and those of texture views made, as
+                // the making of a table of its own did it (below).
+                let staged_title = (!staged.is_empty() && staged.contains(&(table, n)))
+                    .then(|| heap.index(table).filter(|at| at + own <= host.count()))
+                    .flatten();
+                if let Some(title) = staged_title {
+                    for k in (0..own).filter(|&k| own <= 64 || group.entry(k).is_some()) {
+                        host.slot_tabled(title + k);
+                    }
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = staged_title
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            let k = u.table_offset_dwords / 8;
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                        }
                     }
                 }
                 for k in selected {
@@ -3686,16 +3813,26 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            if !spans.is_empty() {
+                staged.push((table, n));
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
-            // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // them it brings up to date here, in the dynamic slots. (With
+            // `table_stages`, a longer table that reaches past the host
+            // heap's slots leaves this stage the title slots of its own
+            // range, as before; `span` is `n` with the switch off.)
+            let (title_first, span) = match heap.index(table) {
+                Some(at) if at + n <= host.count() => (Some(at), n),
+                Some(at) if at + own <= host.count() => (Some(at), own),
+                _ => (None, n),
+            };
             // They are such a table's, whatever they hold. (Of a big one,
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                for k in (0..span).filter(|&k| span <= 64 || group.entry(k).is_some()) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -3737,6 +3874,7 @@ impl State {
                         }
                     }
                     if let Some(title) = title_first
+                        && k < span
                         && listed.texture
                         && listed.tabled != Some((title + k, kind.is_some()))
                     {
@@ -3790,6 +3928,7 @@ impl State {
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
                         if let Some(title) = title_first
+                            && k < span
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
