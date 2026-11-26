@@ -15,9 +15,9 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 [![ram](https://img.shields.io/badge/RAM-32%20GB-informational?style=flat-square)](#hardware)
 [![license](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![tracker](https://img.shields.io/badge/tracker-docs%2FTRACKER.md-orange?style=flat-square)](docs/TRACKER.md)
-[![dashboard](https://img.shields.io/badge/live-dashboard-ff69b4?style=flat-square)](https://nyxth254-png.github.io/victory-rtx3060/)
+[![dashboard](https://img.shields.io/badge/live-dashboard-ff69b4?style=flat-square)](https://insenzaboor.github.io/victory-rtx3060/)
 
-**[Live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)** · **[Port tracker](docs/TRACKER.md)** · **[How to run](#how-to-run)** · **[What made it fast](#what-made-it-fast)** · **[Credits](#credits)**
+**[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Port tracker](docs/TRACKER.md)** · **[How to run](#how-to-run)** · **[What made it fast](#what-made-it-fast)** · **[Credits](#credits)**
 
 </div>
 
@@ -53,7 +53,7 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 | <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 3 | 0 |
 | <img src="docs/assets/progress/tooling.svg" width="300"> | **Measurement and automation** | 4 | 1 | 0 |
 
-**35 of 56** items done or decided, **18** merged and waiting for a game run, **3** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)**
+**35 of 56** items done or decided, **18** merged and waiting for a game run, **3** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
 
 <!-- PROGRESS:END -->
 
@@ -99,7 +99,7 @@ Every step below was found with a timeline trace or a profile, changed, and meas
 **Needs:** Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/nyxth254-png/victory-rtx3060
+git clone https://github.com/insenzaboor/victory-rtx3060
 cd victory-rtx3060
 cargo build --locked --release -p victory
 scripts\play-rtx3060.ps1 -Game "D:\path\to\your\dump" -Victory target\release\victory.exe
@@ -118,9 +118,9 @@ Every number on this page is from one PC: **AMD Ryzen 9 5900X · 32 GB RAM · NV
 
 | Where | What |
 |---|---|
-| **[Live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)** | charts of every measured run, filterable list of every port |
+| **[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** | charts of every measured run, filterable list of every port |
 | **[docs/TRACKER.md](docs/TRACKER.md)** | every item by category and status, with source, switch, effect and commit |
-| **[Issues](https://github.com/nyxth254-png/victory-rtx3060/issues)** | one issue per open item, labelled by category and status |
+| **[Issues](https://github.com/insenzaboor/victory-rtx3060/issues)** | one issue per open item, labelled by category and status |
 | [`docs/data/`](docs/data) | the single source of truth: `ports.json` and `runs.json`. `python scripts/tracker/build.py` rebuilds the tracker, progress bars and chart |
 
 ## Credits

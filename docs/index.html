@@ -73,8 +73,8 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 2
   </header>
 
   <div class="toolbar">
-    <a class="btn" href="https://github.com/nyxth254-png/victory-rtx3060">GitHub</a>
-    <a class="btn" href="https://github.com/nyxth254-png/victory-rtx3060/blob/main/docs/TRACKER.md">Tracker</a>
+    <a class="btn" href="https://github.com/insenzaboor/victory-rtx3060">GitHub</a>
+    <a class="btn" href="https://github.com/insenzaboor/victory-rtx3060/blob/main/docs/TRACKER.md">Tracker</a>
     <button class="btn" id="theme" type="button">Theme</button>
   </div>
 
@@ -207,7 +207,7 @@ footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 2
         }).sort(function (a, b) { return order.indexOf(a.status) - order.indexOf(b.status); });
         document.getElementById("rows").innerHTML = rows.map(function (i) {
           var st = STATUS[i.status];
-          var commit = i.commit ? ' <a href="https://github.com/nyxth254-png/victory-rtx3060/commit/' + esc(i.commit) + '"><code>' + esc(i.commit) + "</code></a>" : "";
+          var commit = i.commit ? ' <a href="https://github.com/insenzaboor/victory-rtx3060/commit/' + esc(i.commit) + '"><code>' + esc(i.commit) + "</code></a>" : "";
           return "<tr><td>" + esc(i.title) + commit + '</td><td><span class="pill" style="background:var(' + st[1] + ')">' + st[0] + "</span></td><td>" +
             esc(ports.categories[i.category]) + "</td><td>" + esc(i.source) + "</td><td>" + (i.switch ? "<code>" + esc(i.switch) + "</code>" : "") + "</td><td>" + esc(i.effect) + "</td></tr>";
         }).join("") || '<tr><td colspan="6">Nothing matches.</td></tr>';

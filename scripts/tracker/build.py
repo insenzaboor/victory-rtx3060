@@ -13,7 +13,7 @@ import os
 import re
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-REPO = "https://github.com/nyxth254-png/victory-rtx3060"
+REPO = "https://github.com/insenzaboor/victory-rtx3060"
 DATA = os.path.join(ROOT, "docs", "data")
 
 ports = json.load(open(os.path.join(DATA, "ports.json"), encoding="utf-8"))
@@ -120,7 +120,7 @@ lines = [
     "# Port tracker",
     "",
     f"_Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/build.py` · updated {ports['updated']}_ · "
-    f"**[Live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)**",
+    f"**[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**",
     "",
     "![overall](assets/progress/overall.svg)",
     "",
@@ -150,7 +150,7 @@ if os.path.exists(readme):
         cd, cf, cp, cn = counts([i for i in items if i["category"] == cat])
         block.append(f'| <img src="docs/assets/progress/{cat}.svg" width="300"> | **{label}** | {cd} | {cf} | {cp} |')
     block += ["", f"**{d} of {n}** items done or decided, **{f}** merged and waiting for a game run, **{p}** planned · "
-              "full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://nyxth254-png.github.io/victory-rtx3060/)**", "",
+              "full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**", "",
               "<!-- PROGRESS:END -->"]
     text = re.sub(r"<!-- PROGRESS:START -->.*?<!-- PROGRESS:END -->", "\n".join(block), text, flags=re.S)
     write(readme, text)
