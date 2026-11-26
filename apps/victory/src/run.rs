@@ -181,6 +181,16 @@ pub fn run(
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
     }
+    // A bug of the title's: the frame tracker's present returns without its unlock when the
+    // tracker is empty, which hung the load (VICTORY_TRACKER_UNLOCK=0: left as it is).
+    #[cfg(windows)]
+    if execute && victory_loader::title_fixes::tracker_unlock() {
+        use victory_loader::title_fixes::{Applied, TRACKER_UNLOCK, apply};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        let done = unsafe { apply(image.base(), size, &TRACKER_UNLOCK) };
+        println!("title fix (frame tracker unlock): {}", if done == Applied::Done { "made" } else { "not made" });
+    }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS

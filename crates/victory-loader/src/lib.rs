@@ -38,6 +38,8 @@ mod stacks;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]
+pub mod title_fixes;
+#[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
 mod tls;
