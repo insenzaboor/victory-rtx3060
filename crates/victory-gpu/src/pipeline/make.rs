@@ -55,6 +55,52 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// One of the title's skin and decoration bake ([`bake_waits`]).
+    bake: bool,
+}
+
+/// Whether `shaders` are those of a draw of the title's skin and decoration
+/// bake (`draw::BAKE_PIXEL_SHADERS`).
+fn of_bake(shaders: &[Arc<Shader>]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "pixel" && crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str()))
+}
+
+/// Whether a draw of the title's skin and decoration bake waits for its
+/// pipeline however long it takes, instead of within the frame's budget
+/// (`VICTORY_BAKE_WAIT=0`: as any other draw, dropped once the budget is
+/// spent). The title bakes its characters' skin into textures of its own
+/// once, while it loads; a bake draw dropped because its pipeline was still
+/// being made bakes nothing for the rest of the run. After a cold start
+/// every character's face, neck and arms were missing (eyes, teeth, hair
+/// and clothes drawn), with or without the driver compiler's crashes and
+/// with a 20 s budget a frame; never after a warm start, where the pipeline
+/// is there from the start (GromX0 9dfbe7c6, runs stab-cold3, coldwait,
+/// coldkeepbad). The four bake pipelines are started at the title's
+/// creation of them already ([`scene_input`]); this only makes sure their
+/// first draw does not go without them.
+fn bake_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// Makes the bake pipeline `p` now if it is not made yet (on this thread,
+/// or waiting for the worker making it); the first waits are logged.
+fn wait_for_bake(p: &Pending) {
+    static WAITS: AtomicU64 = AtomicU64::new(0);
+    let began = Instant::now();
+    p.make();
+    let ms = began.elapsed().as_millis() as u64;
+    if ms > 0 && WAITS.fetch_add(1, Ordering::Relaxed) < 20 {
+        let made = p.made.get().is_some_and(|m| m.is_some());
+        tracing::info!(
+            ms,
+            made,
+            shaders = ?p.shaders,
+            "a draw of the title's skin and decoration bake waited for its pipeline (VICTORY_BAKE_WAIT=0: dropped while it is being made)"
+        );
+    }
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -126,7 +172,9 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let bake = of_bake(&shaders);
         Pending {
+            bake,
             screen,
             scene_input,
             left_out,
@@ -483,8 +531,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.bake && bake_waits() {
+            wait_for_bake(p);
+        } else {
+            start(p, REQUESTED);
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }

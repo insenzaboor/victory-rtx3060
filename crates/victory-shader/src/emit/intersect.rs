@@ -56,8 +56,9 @@ thread_local! {
 /// its first test, shadow rays find no occluder, and the answer is the same
 /// in every run. (The idea is fork pull request #994's, which asks a host
 /// word at run time; here it is a translation, since the builder's state
-/// does not change during a run of ours.)
-fn no_hit() -> bool {
+/// does not change during a run of ours.) Part of the translation: the
+/// shader cache keys on it when it is on ([`super::super::bvh_no_hit`]).
+pub(in crate::emit) fn no_hit() -> bool {
     #[cfg(test)]
     if TEST_NO_HIT.get() {
         return true;

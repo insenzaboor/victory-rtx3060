@@ -216,13 +216,22 @@ pub fn builder_bounds() -> bool {
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked: `127` is every pass with it), 128 descriptor
+///   handles reused within their block only (`bitcode::opt::BLOCK_HANDLES`).
+/// - `VICTORY_BLOCK_HANDLES=1` adds 128 to whatever the passes are.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
-/// does).
+/// does), and with neither switch set the value is the one before 128 was.
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        let passes = parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref());
+        if std::env::var_os("VICTORY_BLOCK_HANDLES").is_some_and(|v| v == "1") {
+            passes | bitcode::opt::BLOCK_HANDLES
+        } else {
+            passes
+        }
+    })
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -356,6 +365,70 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// With [`halves_on`]: table descriptors (root parameter, dword offset
+    /// in the table) whose buffer the shader reads or writes sixteen bits a
+    /// channel (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`, or
+    /// a format load whose result it reads only as halves), in order. On
+    /// the console each channel's 16 bits move as they are through a 16-bit
+    /// float view and through a 16-bit integer one alike (the title keeps
+    /// half floats, and indices beside them, in `R16G16B16A16_UINT` and
+    /// `R16_UINT` buffers). The DXIL moves them as unsigned integers, which
+    /// an unsigned 16-bit view carries unchanged; the host shows the shader
+    /// a 16-bit float or signed buffer view at these places as the unsigned
+    /// format of the same layout. Empty with the switch off.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
+}
+
+/// Whether 16-bit halves moved through a table's typed buffer view keep
+/// their bits (`VICTORY_HALVES=1`; off by default, on in tests): from
+/// fxceless/victory-fork #927 (tippythetaidum, "Mouths move", 58de9bf4c) as
+/// pr0vId3nce/VIctory-NVIDIA ported it (e49edcca, b85748d1, 19eea5d6,
+/// ba327cca, 77adfb81). The network that drives the title's faces
+/// (`compute_graph_ops`, then `ped_standard_head_cs`) keeps its tensors in
+/// `R16G16B16A16_UINT` / `R16_UINT` buffers reached through tables and moves
+/// them with d16 format accesses; by way of floats every value came out 0
+/// there (no mouth moved), and the head program's plain format loads of the
+/// output, read only as halves, read garbage (specks on faces). Part of the
+/// translation: the shader cache keys on it only when on.
+pub fn halves_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var_os("VICTORY_HALVES").is_some_and(|v| v == "1"))
+}
+
+/// Whether ray node tests answer "no hit" and read nothing
+/// (`VICTORY_BVH_NO_HIT=1` without `VICTORY_BVH_BUILDER=1`): part of the
+/// translation, so the shader cache keys on it when it is on.
+pub fn bvh_no_hit() -> bool {
+    lower::intersect::no_hit()
+}
+
+/// Whether an SDWA sign extension of a 16-bit result (dst_unused 1, sext,
+/// with WORD_0) copies bit 15 upward, and the reserved dst_unused 3 is
+/// refused (`VICTORY_SDWA_SEXT=1`; off by default: the upper word was zero,
+/// so a 16-bit -1 came out as 0x0000FFFF; upstream VIctory #3124, as
+/// fxceless/victory-fork 58de9bf4c and pr0vId3nce/VIctory-NVIDIA 77adfb81
+/// carry it). Part of the translation: keyed only when on.
+pub fn sdwa_sext() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SDWA_SEXT").is_some_and(|v| v == "1"))
+}
+
+/// Whether `v_interp_p1ll_f16`'s modifiers are lowered and the f16
+/// interpolation rounds as `VICTORY_F16_NEAREST` says
+/// (`VICTORY_INTERP_F16_FIXES=1`; off by default). DexNom/VIctory#81
+/// (BlueDragonReal, 2bc1252bc) as pr0vId3nce/VIctory-NVIDIA 75fa815b carries
+/// it: a first half with clamp, omod, abs or neg was folded into the
+/// interpolated pair, which skips lowering it, and its modifiers were
+/// dropped; such a pair now falls back to the weighted form, and the first
+/// half's f32 result is written with omod and clamp. shortcut: abs and neg
+/// on it are still not applied. Part of the translation: keyed only when on.
+pub fn interp_f16_fixes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INTERP_F16_FIXES").is_some_and(|v| v == "1"))
 }
 
 impl HostShader {
@@ -977,6 +1050,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1269,7 +1343,8 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("127")), all & !super::bitcode::opt::BLOCK_HANDLES);
+        assert_eq!(parse_shader_opt(Some("255")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
@@ -1847,6 +1922,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1859,6 +1935,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2468,6 +2545,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2603,6 +2681,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let views: Vec<super::host::View> = if raw {
@@ -2750,6 +2829,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3166,6 +3246,7 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
