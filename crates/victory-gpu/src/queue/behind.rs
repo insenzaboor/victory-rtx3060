@@ -84,6 +84,10 @@ pub(super) trait Work: Send {
     }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
+    /// Diagnostics: what it is and what it stands at.
+    fn describe(&self) -> String {
+        String::from("?")
+    }
 }
 
 struct Entry<W> {
@@ -107,6 +111,8 @@ struct State<W> {
     /// Presents and submissions in the line or being done.
     presents: usize,
     runs: usize,
+    /// Entries done since the start ([`Lane::stuck_report`]).
+    done: u64,
 }
 
 /// See the module's text.
@@ -129,6 +135,7 @@ impl<W: Work> Lane<W> {
                 served: 0,
                 presents: 0,
                 runs: 0,
+                done: 0,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
@@ -200,6 +207,39 @@ impl<W: Work> Lane<W> {
         while state.served < ticket {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// Diagnostics: if entries stand in the line and none was done since
+    /// `last` (entries done, when that was first seen), the head of each
+    /// queue and what it stands at. `None` while the line moves or is empty.
+    pub(super) fn stuck_report(&self, last: &mut (u64, Instant), after: Duration) -> Option<String> {
+        let state = self.lock();
+        if state.items.is_empty() || state.done != last.0 {
+            *last = (state.done, Instant::now());
+            return None;
+        }
+        if last.1.elapsed() < after {
+            return None;
+        }
+        let mut heads: Vec<String> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for e in &state.items {
+            if seen.contains(&e.queue) {
+                continue;
+            }
+            seen.push(e.queue);
+            let behind = state.items.iter().filter(|o| o.queue == e.queue).count();
+            heads.push(format!("queue {:#x} #{} ({behind} in line): {}", e.queue, e.number, e.what.describe()));
+        }
+        Some(format!(
+            "{} entries, {} presents, {} submissions, running {:?}, {} done; heads: {}",
+            state.items.len(),
+            state.presents,
+            state.runs,
+            state.running.map(|q| format!("{q:#x}")),
+            state.done,
+            heads.join(" | ")
+        ))
     }
 
     /// Waits until at most `most` presents are in the line.
@@ -363,6 +403,7 @@ impl<W: Work> Lane<W> {
         entry.what.go(forced);
         {
             let mut state = self.lock();
+            state.done += 1;
             state.running = None;
             state.presents -= usize::from(shows);
             state.runs -= runs;
@@ -456,6 +497,24 @@ impl Work for Job {
 
     fn shows(&self) -> bool {
         matches!(self, Job::Present(..))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            &Job::Wait(fence, value) => {
+                format!("wait for fence {fence:#x} to reach {value} (it is at {})", crate::fence::completed(fence as This))
+            }
+            Job::Value(wait) => format!("wait for a memory value {wait:?} (met: {})", super::value_met(wait)),
+            Job::Run(_, lists, _) => format!("a submission of {} lists", lists.len()),
+            Job::Lists(_, recordings) => format!(
+                "a submission of {} lists being translated ({} done)",
+                recordings.len(),
+                recordings.iter().filter(|r| r.done()).count()
+            ),
+            Job::Joined(_, lists, _, _, signals) => format!("{} joined lists, {} signals behind", lists.len(), signals.len()),
+            &Job::Signal(fence, value) => format!("signal fence {fence:#x} to {value}"),
+            Job::Present(..) => String::from("a present"),
+        }
     }
 
     fn runs(&self) -> bool {
@@ -684,6 +743,24 @@ fn started() -> bool {
                 crate::host::fail(format_args!("the thread that prepares and sends submissions panicked"));
             }
         };
+        // Diagnostics: a line that stands still for 3 s with entries in it is
+        // logged, head by head, every 5 s while it stands (the title's load
+        // hung or its GPU watchdog ended it, "GPU Loc Sig", in 5 of 19 runs of
+        // 2026-11-26, a cross-queue barrier unsignalled).
+        let _ = std::thread::Builder::new().name("victory-line-watch".into()).spawn(|| {
+            let mut last = (u64::MAX, Instant::now());
+            let mut said = 0u32;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if let Some(report) = LANE.stuck_report(&mut last, Duration::from_secs(3)) {
+                    if said < 60 {
+                        said += 1;
+                        tracing::warn!("the submission line stands still: {report}");
+                    }
+                    std::thread::sleep(Duration::from_secs(4));
+                }
+            }
+        });
         match std::thread::Builder::new().name("victory-submit".into()).spawn(worker) {
             Ok(_) => {
                 tracing::info!(
