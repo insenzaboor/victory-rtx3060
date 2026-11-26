@@ -10086,18 +10086,41 @@ impl<'a> Lower<'a> {
         };
         let mut high = v.opsel >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // (pad; a sign extension above the high word adds nothing). With
+        // `VICTORY_SDWA_SEXT=1` ([`super::sdwa_sext`]): bit 15 copied upward
+        // for sext (dst_unused 1) with WORD_0, and the reserved dst_unused 3
+        // refused (upstream VIctory #3124: a 16-bit -1 written with sext came
+        // out as 0x0000FFFF).
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
-            match (sd.dst_sel, sd.dst_unused) {
-                (4, 2) => {}
-                (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
-                _ => return Err("an SDWA destination of a 16-bit operation"),
+            if super::sdwa_sext() {
+                match (sd.dst_sel, sd.dst_unused) {
+                    (4, 2) => {}
+                    (5, 2) => high = true,
+                    (4, 1) => (keep, sext) = (false, true),
+                    (4, 0) | (6, 0..=2) => keep = false,
+                    (5, 0 | 1) => (high, keep) = (true, false),
+                    _ => return Err("an SDWA destination of a 16-bit operation"),
+                }
+            } else {
+                match (sd.dst_sel, sd.dst_unused) {
+                    (4, 2) => {}
+                    (5, 2) => high = true,
+                    (4 | 6, _) => keep = false,
+                    (5, _) => (high, keep) = (true, false),
+                    _ => return Err("an SDWA destination of a 16-bit operation"),
+                }
             }
         }
         let c = self.cur;
+        if sext {
+            let k16 = self.s.m.i32(16);
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            let r = self.s.m.bin(c, Bin::AShr, t, k16);
+            self.write_placed(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
             Some(Ok(o)) if keep => o,
             _ => self.s.m.i32(0),
@@ -11423,15 +11446,26 @@ impl<'a> Lower<'a> {
                         None => Ok(None),
                     }
                 };
+                // (With `VICTORY_INTERP_F16_FIXES=1` rounded to 16 bits as
+                // `VICTORY_F16_NEAREST` says, like the other f16 results.)
+                let fixes = super::interp_f16_fixes();
                 let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    if fixes && f16_nearest_on() {
+                        l.f16_nearest(f)
+                    } else {
+                        let i32t = l.s.t.i32;
+                        l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    }
                 };
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
-                    // An f32 result from 16-bit vertex values.
+                    // An f32 result from 16-bit vertex values (with the fixes:
+                    // through `write_f`, which applies omod and clamp).
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    if fixes {
+                        return self.write_f(inst, f, None);
+                    }
                     self.as_int(f)
                 } else if f16 {
                     let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;

@@ -399,6 +399,31 @@ pub fn halves_on() -> bool {
     cfg!(test) || *ON.get_or_init(|| std::env::var_os("VICTORY_HALVES").is_some_and(|v| v == "1"))
 }
 
+/// Whether an SDWA sign extension of a 16-bit result (dst_unused 1, sext,
+/// with WORD_0) copies bit 15 upward, and the reserved dst_unused 3 is
+/// refused (`VICTORY_SDWA_SEXT=1`; off by default: the upper word was zero,
+/// so a 16-bit -1 came out as 0x0000FFFF; upstream VIctory #3124, as
+/// fxceless/victory-fork 58de9bf4c and pr0vId3nce/VIctory-NVIDIA 77adfb81
+/// carry it). Part of the translation: keyed only when on.
+pub fn sdwa_sext() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SDWA_SEXT").is_some_and(|v| v == "1"))
+}
+
+/// Whether `v_interp_p1ll_f16`'s modifiers are lowered and the f16
+/// interpolation rounds as `VICTORY_F16_NEAREST` says
+/// (`VICTORY_INTERP_F16_FIXES=1`; off by default). DexNom/VIctory#81
+/// (BlueDragonReal, 2bc1252bc) as pr0vId3nce/VIctory-NVIDIA 75fa815b carries
+/// it: a first half with clamp, omod, abs or neg was folded into the
+/// interpolated pair, which skips lowering it, and its modifiers were
+/// dropped; such a pair now falls back to the weighted form, and the first
+/// half's f32 result is written with omod and clamp. shortcut: abs and neg
+/// on it are still not applied. Part of the translation: keyed only when on.
+pub fn interp_f16_fixes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INTERP_F16_FIXES").is_some_and(|v| v == "1"))
+}
+
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.

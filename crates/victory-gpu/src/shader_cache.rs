@@ -165,6 +165,15 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::halves_on() {
             bytes.extend_from_slice(b"VICTORY_HALVES=1");
         }
+        // Likewise (same source): SDWA's sign extension of a 16-bit result,
+        // and `v_interp_p1ll_f16`'s modifiers with the f16 interpolation's
+        // rounding.
+        if victory_shader::emit::sdwa_sext() {
+            bytes.extend_from_slice(b"VICTORY_SDWA_SEXT=1");
+        }
+        if victory_shader::emit::interp_f16_fixes() {
+            bytes.extend_from_slice(b"VICTORY_INTERP_F16_FIXES=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

@@ -603,10 +603,17 @@ impl Halves<'_> {
                     attr,
                     ..
                 } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
-                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
-                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
-                    _ => return Err("an interpolation without its first half"),
-                },
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => {
+                    // A first half with modifiers is lowered on its own
+                    // (`VICTORY_INTERP_F16_FIXES=1`): the pair would skip it.
+                    if crate::emit::interp_f16_fixes() && (v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0) {
+                        kind = None;
+                    }
+                    match v.src.get(1) {
+                        Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
+                        _ => return Err("an interpolation without its first half"),
+                    }
+                }
                 _ => return Err("an interpolation without its first half"),
             };
             if a != *attr {
