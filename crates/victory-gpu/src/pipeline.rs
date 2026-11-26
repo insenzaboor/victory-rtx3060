@@ -64,6 +64,10 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// It draws the sky dome the stand-in's light may follow
+    /// ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
@@ -167,6 +171,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                draws_sky: stage != "compute"
+                    && crate::ambient::changes_heaps()
+                    && bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
                 #[cfg(windows)]

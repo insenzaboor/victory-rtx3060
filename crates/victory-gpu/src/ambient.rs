@@ -27,6 +27,13 @@
 //! - unset or `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
+//! - `sky[:<gain>,<least>,<power>]`: a light that follows the sky, as
+//!   beloooo's fork has it since 705a2d09, e48eb83e and 4f62c2a5: the mean
+//!   of the sky dome the title reflects (`ps_sky_paraboloid_reflection`,
+//!   128x128 R16G16B16A16_FLOAT), its level `gain * mean^power + least`
+//!   (0.36, 0.05, 0.4 unless given) with the sky's own hue, half washed out,
+//!   shaded in creases as the constant is. A constant either drowned the
+//!   shadows at night or left the day black.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
@@ -81,14 +88,71 @@ enum Set {
     Off,
     Estimate(f32),
     Constant(f32),
+    /// Gain, least level and power of the light that follows the sky.
+    Sky([f32; 3]),
 }
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    if let Some(rest) = set.strip_prefix("sky") {
+        // (Hand-set levels that looked right were 0.07 at night, 0.3 at dusk
+        // and 1.4 at noon, with sky means of 0.001 at night and 0.65 at dawn:
+        // beloooo's runs lum1, pr1, av1.)
+        let mut follow = [0.36, 0.05, 0.4];
+        let rest = rest.strip_prefix(':').unwrap_or(rest);
+        for (to, v) in follow.iter_mut().zip(rest.split(',')) {
+            if let Ok(v) = v.trim().parse::<f32>()
+                && v.is_finite()
+                && v >= 0.0
+            {
+                *to = v;
+            }
+        }
+        return if follow[0] > 0.0 || follow[1] > 0.0 { Set::Sky(follow) } else { Set::Off };
+    }
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
+    }
+}
+
+/// Whether the passes after the resolve set view heaps of their own (the
+/// sky's mean): the title's are to be set again before its next draw.
+pub(crate) fn changes_heaps() -> bool {
+    matches!(set(), Set::Sky(_))
+}
+
+/// The sky dome the title last drew (`ps_sky_paraboloid_reflection`): its
+/// host copy, held, since the title's object may go while a list still
+/// reads it. Only the dome is followed (R16G16B16A16_FLOAT, 2D): the program
+/// also draws another image of the sky a frame, three times brighter on
+/// average, and following the last one recorded made the light jump
+/// (beloooo's e48eb83e).
+static SKY_IMAGE: Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> = Mutex::new(None);
+
+/// The program that draws the sky as the title reflects it, by its name.
+pub(crate) const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
+
+/// A draw of [`SKY`] into `image` (a render target of the title's).
+pub(crate) fn sky_drawn(image: usize) {
+    if !changes_heaps() {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(image as crate::object::This) else {
+        return;
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 {
+        return;
+    }
+    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!(width = d.Width, height = d.Height, "the sky the stand-in's light follows"));
+        *held = Some(copy);
     }
 }
 
@@ -199,7 +263,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=18, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -210,11 +274,12 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt;
+    float gain; float least; float power;
 };
-Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are; at SKY_AT the sky's hue and mean.
 RWStructuredBuffer<float4> cells : register(u1);
+#define SKY_AT (2 * CELLS + 1)
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
@@ -222,6 +287,32 @@ RWStructuredBuffer<float4> points : register(u2);
 RWByteAddressBuffer stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
+#ifdef SKY
+// The sky dome's mean (beloooo's 705a2d09): its hue, half washed out (the
+// ground lights too; a dark sky has none worth following), and its luma.
+Texture2D<float4> sky : register(t0);
+groupshared float3 sky_sums[64];
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void sky_mean(uint3 at : SV_GroupThreadID, uint i : SV_GroupIndex) {
+    uint sw, sh;
+    sky.GetDimensions(sw, sh);
+    // The sun's own texels are held down: it lights by itself.
+    float3 there = sky.Load(int3((at.x * 2 + 1) * sw / 16, (at.y * 2 + 1) * sh / 16, 0)).rgb;
+    there = any(isnan(there)) ? 0.0 : clamp(there, 0.0, 8.0);
+    sky_sums[i] = there;
+    GroupMemoryBarrierWithGroupSync();
+    if (i != 0) return;
+    float3 sum = 0.0;
+    for (uint k = 0; k < 64; k++) sum += sky_sums[k];
+    float3 mean = sum / 64.0;
+    float m = dot(mean, LUMA);
+    const float3 NIGHT = float3(0.6, 0.75, 1.0);
+    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), mean / max(m, 1e-6), 0.5), saturate(m / 0.05));
+    cells[SKY_AT] = float4(hue, m);
+}
+#else
+Texture2D<float> depth : register(t0);
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
@@ -229,6 +320,7 @@ float3 seen(int2 p, float2 size) {
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
+#endif
 
 #ifdef KEEP
 RWTexture2D<float3> radiance : register(u0);
@@ -375,6 +467,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
+    if (gain > 0.0 || least > 0.0) {
+        // The light follows the sky: its mean as the last sky pass found it
+        // (a frame behind; until one has, the least level, bluish).
+        float4 s = cells[SKY_AT];
+        float3 hue = any(s.rgb > 0.0) ? s.rgb : float3(0.6, 0.75, 1.0);
+        found = hue * (gain * (s.w > 0.0 ? pow(s.w, power) : 0.0) + least) * open;
+        light[p] = pack(found);
+        return;
+    }
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
         light[p] = pack(found);
@@ -430,10 +531,14 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+/// (The cells, the slow mean, the cells' places, the sky's mean.)
+const CELL_BYTES: u64 = (2 * CELLS + 2) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
+
+/// Views of the sky in turn ([`Pass::views`]).
+const SKY_SLOTS: u32 = 1024;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -443,6 +548,13 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    /// The sky's mean ([`Set::Sky`]), and the views it reads, in a heap of
+    /// its own, used in turn: more than the passes of every list in flight
+    /// (a view of the sky, a null view for the table the pass does not read).
+    sky: ID3D12PipelineState,
+    views: ID3D12DescriptorHeap,
+    step: u32,
+    next: std::sync::atomic::AtomicU32,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -475,6 +587,29 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let sky = pipeline("SKY", s!("sky_mean"))?;
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: plain creations; null views in the heap's own slots.
+    let (views, step) = unsafe {
+        let views: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: SKY_SLOTS * 2,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?;
+        let step = device.GetDescriptorHandleIncrementSize(kind);
+        let start = views.GetCPUDescriptorHandleForHeapStart();
+        let null = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        for slot in 0..SKY_SLOTS {
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + ((2 * slot + 1) * step) as usize };
+            device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&null), at);
+        }
+        (views, step)
+    };
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -484,6 +619,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        sky,
+        views,
+        step,
+        next: std::sync::atomic::AtomicU32::new(0),
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -543,15 +682,18 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
+    let (level, constant, follow_sky) = match set() {
         Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+        Set::Estimate(level) => (level, 0.0f32, [0.0f32; 3]),
+        Set::Constant(level) => (0.0, level, [0.0; 3]),
+        Set::Sky(follow) => (0.0, 0.0, follow),
     };
-    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+    // A light set, not estimated: the constant or the sky's.
+    let fixed = constant > 0.0 || follow_sky[0] > 0.0 || follow_sky[1] > 0.0;
+    if role != Role::Radiance && !fixed && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (fixed || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -567,7 +709,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 18];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -580,6 +722,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    for (to, v) in words[15..].iter_mut().zip(follow_sky) {
+        *to = v.to_bits();
+    }
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -587,7 +732,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 18, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -606,15 +751,57 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
-                if constant == 0.0 {
+                if !fixed {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                if fixed && constant == 0.0 {
+                    sky_mean(list, pass);
+                }
             }
         }
     }
     true
+}
+
+/// The sky's mean for the next resolve, from the dome the title drew last
+/// ([`sky_drawn`]), in `list` after the passes above: with a view heap of its
+/// own, which the title's next draw replaces ([`changes_heaps`]). The root
+/// signature and its root views stay as the passes above set them.
+fn sky_mean(list: &HostList, pass: &Pass) {
+    use std::sync::atomic::Ordering;
+    let Some(copy) = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return;
+    };
+    let Some(host) = host() else { return };
+    const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+    list.settle(&copy, NON_PIXEL_SHADER_RESOURCE);
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SKY_SLOTS;
+    let l = &list.list;
+    // SAFETY: an open list; a live texture the list's states hold, in the
+    // state the view needs; a slot no list in flight reads.
+    unsafe {
+        let cpu = pass.views.GetCPUDescriptorHandleForHeapStart();
+        let gpu = pass.views.GetGPUDescriptorHandleForHeapStart();
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + (2 * slot * pass.step) as usize };
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: copy.texture.GetDesc().Format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        };
+        host.device.CreateShaderResourceView(&copy.texture, Some(&view), at);
+        l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.keep(&pass.views);
+        l.SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from(2 * slot * pass.step) });
+        l.SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from((2 * slot + 1) * pass.step) });
+        l.SetPipelineState(&pass.sky);
+        l.Dispatch(1, 1, 1);
+        uav_barrier(l);
+    }
 }
 
 #[cfg(test)]
@@ -629,6 +816,9 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(parse("sky"), Set::Sky([0.36, 0.05, 0.4]));
+        assert_eq!(parse("sky:0.5,0.1"), Set::Sky([0.5, 0.1, 0.4]));
+        assert_eq!(parse("sky:0,0"), Set::Off);
     }
 
     #[test]

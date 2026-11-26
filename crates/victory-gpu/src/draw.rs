@@ -1677,6 +1677,12 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // The sky dome the stand-in's light follows (`VICTORY_AMBIENT=sky`).
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -3124,6 +3130,13 @@ impl State {
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+            // Its own view heap for the sky's mean: the title's are set
+            // again, with its tables, before its next draw.
+            if crate::ambient::changes_heaps() {
+                self.host_heaps = [0; 2];
+                self.host_heaps_set = false;
+                self.host_roots = [0; 2];
+            }
         }
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
