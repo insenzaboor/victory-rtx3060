@@ -1614,6 +1614,7 @@ pub(crate) extern "system" fn create_sampler(_: This, desc: *const [u32; 13], ha
 /// Device method 0x1e8.
 pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], handle: u64) {
     if let Some(desc) = words(desc) {
+        crate::sampler::seen(&desc);
         record(handle, View::ConsoleSampler(desc));
     }
 }

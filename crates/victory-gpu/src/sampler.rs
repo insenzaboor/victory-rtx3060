@@ -3,12 +3,48 @@
 //! fields. (Immediate samplers in shader code come decoded with the
 //! translation.)
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::Win32::Graphics::Direct3D12::*;
+
+/// Samplers seen with anisotropic point (2) in their magnification or
+/// minification filter, since the start: console sampler descriptions the
+/// title made (`CreateSamplerX`), and immediate samplers in the root
+/// signatures we made. One run then shows whether the title uses it
+/// ([`line`]).
+pub(crate) static ANISO_POINT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Counts a console sampler description the title made.
+pub(crate) fn seen(words: &[u32; 27]) {
+    if victory_shader::emit::sampler_is_aniso_point(words[1], words[2]) {
+        ANISO_POINT[0].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Counts an immediate sampler put into a root signature.
+pub(crate) fn seen_immediate(words: [u32; 4]) {
+    let (mag, min) = victory_shader::emit::StaticSampler::mag_min(words);
+    if victory_shader::emit::sampler_is_aniso_point(mag, min) {
+        ANISO_POINT[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The counts' line, beside the frame rate's.
+pub(crate) fn line() {
+    let [made, immediate] = [0, 1].map(|i| ANISO_POINT[i].load(Ordering::Relaxed));
+    tracing::info!(
+        "samplers with anisotropic point (2) in their min or mag filter, since the start: {made} sampler descriptions \
+         (CreateSamplerX), {immediate} immediate samplers in root signatures made; taken as {} \
+         (VICTORY_SAMPLER_ANISO_POINT=0: anisotropic linear, as before)",
+        if victory_shader::emit::sampler_aniso_point() { "point" } else { "anisotropic linear" }
+    );
+}
 
 /// The fields both forms share.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Fields {
-    /// Point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3.
+    /// Point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3
+    /// (bit 0 linear; 2 is point on the host, [`Fields::host_as`]).
     mag: u32,
     min: u32,
     /// None 0, point 1, linear 2.
@@ -28,8 +64,17 @@ struct Fields {
 
 impl Fields {
     fn host(&self) -> D3D12_SAMPLER_DESC {
+        self.host_as(victory_shader::emit::sampler_aniso_point())
+    }
+
+    /// With `aniso_point` (`VICTORY_SAMPLER_ANISO_POINT`, on by default),
+    /// anisotropic point (2) is point on its axis and an anisotropic host
+    /// filter is chosen only when neither axis is point; without, 2 is
+    /// anisotropic linear as before. The mip field (none, point, linear) has
+    /// no anisotropic value and is read as it was.
+    fn host_as(&self, aniso_point: bool) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
-        let aniso = self.mag >= 2 || self.min >= 2;
+        let aniso = victory_shader::emit::sampler_anisotropic(self.mag, self.min, aniso_point);
         // The console compares when the instruction says so, with the
         // sampler's function; the host needs a comparison sampler for that.
         // A sampler given a real test (less ... greater-or-equal) is one;
@@ -104,6 +149,10 @@ fn finite_lod(value: f32, fallback: f32) -> f32 {
 /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
 /// and threshold, comparison, border color, then tuning words.
 pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
+    fields(words).host()
+}
+
+fn fields(words: &[u32; 27]) -> Fields {
     let f = |i: usize| f32::from_bits(words[i]);
     Fields {
         mag: words[1],
@@ -118,7 +167,6 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
         compare: words[16],
         border: [f(17), f(18), f(19), f(20)],
     }
-    .host()
 }
 
 #[cfg(test)]
@@ -143,6 +191,56 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    /// Every magnification x minification pair (0 point, 1 bilinear, 2
+    /// anisotropic point, 3 anisotropic bilinear) with each mip filter and an
+    /// anisotropy of 16: a point axis stays point and never makes the host
+    /// filter anisotropic; switched off, the earlier decode is kept.
+    #[test]
+    fn aniso_point_is_point_for_all_filter_pairs() {
+        for mag in 0..4u32 {
+            for min in 0..4u32 {
+                for mip in 0..3u32 {
+                    let mut w = [0u32; 27];
+                    w[1] = mag;
+                    w[2] = min;
+                    w[3] = mip;
+                    w[10] = 1000.0f32.to_bits();
+                    w[13] = 16;
+                    let mip_bit = u32::from(mip == 2);
+                    let both_linear_one_aniso = mag & 1 == 1 && min & 1 == 1 && (mag == 3 || min == 3);
+                    let d = fields(&w).host_as(true);
+                    let (filter, max_aniso) = if both_linear_one_aniso {
+                        (0x55, 16)
+                    } else {
+                        ((min & 1) << 4 | (mag & 1) << 2 | mip_bit, 1)
+                    };
+                    assert_eq!(
+                        (d.Filter.0 as u32, d.MaxAnisotropy),
+                        (filter, max_aniso),
+                        "fixed mag={mag} min={min} mip={mip}"
+                    );
+                    if mag & 1 == 0 || min & 1 == 0 {
+                        assert_ne!(d.Filter, D3D12_FILTER_ANISOTROPIC, "mag={mag} min={min}");
+                    }
+                    let old = fields(&w).host_as(false);
+                    let (filter, max_aniso) = if mag >= 2 || min >= 2 {
+                        (0x55, 16)
+                    } else {
+                        (min << 4 | mag << 2 | mip_bit, 1)
+                    };
+                    assert_eq!(
+                        (old.Filter.0 as u32, old.MaxAnisotropy),
+                        (filter, max_aniso),
+                        "old mag={mag} min={min} mip={mip}"
+                    );
+                    // A comparison sampler keeps its comparison bit either way.
+                    w[16] = 4;
+                    assert_eq!(fields(&w).host_as(true).Filter.0 & 0x180, 0x80);
+                }
+            }
+        }
     }
 
     #[test]
