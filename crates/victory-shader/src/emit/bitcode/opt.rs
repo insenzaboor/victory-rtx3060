@@ -55,10 +55,13 @@ pub const FIRST: u32 = 32;
 /// Not a pass over the module either: the lowering reads the dwords of one
 /// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
 /// `global_load_dwordx2` to `x4`) by one call for every four of them, not
-/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
-/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
-/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
-/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
+/// by a call each (`lower.rs`, `raw_dwords`). From fxceless/victory-fork
+/// c36971b2. NOT the same result on the card in every case: fxceless's run
+/// 277 had the water black with it (lead: a four-dword load whose last dwords
+/// lie past the view's end, which the card may answer with zeros for the
+/// whole call), so it stays off unless asked for. On an RX 7900 XTX it is
+/// worth nothing: the yard's frame replayed turn by turn, dispatches and
+/// draws 18.47 -> 18.45 ms (12 loops) and 18.23 -> 18.16 (5 loops).
 pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
