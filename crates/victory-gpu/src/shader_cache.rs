@@ -184,6 +184,13 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::interp_f16_fixes() {
             bytes.extend_from_slice(b"VICTORY_INTERP_F16_FIXES=1");
         }
+        // `VICTORY_F16_NEAREST=1` (named with its value above) now rounds
+        // every f32-to-f16 conversion the console rounds, not only the 16-bit
+        // ALU's results: translations cached under the earlier, partial switch
+        // must not be served. Only when on, so the default key stays.
+        if victory_shader::emit::f16_nearest() {
+            bytes.extend_from_slice(b"VICTORY_F16_NEAREST at every site");
+        }
         // Likewise, only when on: ray node tests that answer "no hit"
         // (`VICTORY_BVH_NO_HIT=1`, read at translation). It was not in the
         // key, so with a warm cache the switch did nothing: the ray passes

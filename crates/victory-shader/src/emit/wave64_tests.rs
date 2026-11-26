@@ -506,6 +506,85 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
     }
 }
 
+/// The f32-to-f16 conversions outside the 16-bit ALU's results follow `VICTORY_F16_NEAREST`
+/// too. The f32 1 + 1.75/1024 (0x3F80_3800) lies between the halves 0x3C01 and 0x3C02,
+/// nearer the second: the console gives 0x3C02, a conversion toward zero 0x3C01. With the
+/// switch the translation is longer (the rounding's instructions) and, on a device, gives
+/// the console's half for `v_cvt_f16_f32`, `v_fma_mixlo_f16` (v7 * 1.0 + 0) and both halves
+/// of `v_pk_add_f16` (0x3C03 + 0x4000 per half, the sum test's case: 0x4202).
+#[test]
+fn f32_to_f16_conversions_round_to_nearest_when_asked_to() {
+    let mov = |reg: u32, value: u32| [0x7E00_02FF | reg << 17, value];
+    let store = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16]; // buffer_store_dword v0
+    let cases: [(&str, Vec<u32>, u32, u32); 3] = [
+        (
+            "v_cvt_f16_f32",
+            [mov(7, 0x3F80_3800).as_slice(), &[0x7E00_1507], &store].concat(), // v_cvt_f16_f32 v0, v7
+            0xFFFF,
+            0x3C02,
+        ),
+        (
+            "v_fma_mixlo_f16",
+            // v_fma_mixlo_f16 v0, v7, 1.0, 0 (f32 sources)
+            [mov(0, 0).as_slice(), &mov(7, 0x3F80_3800), &[0xCC21_0000, 0x0201_E507], &store].concat(),
+            0xFFFF,
+            0x3C02,
+        ),
+        (
+            "v_pk_add_f16",
+            // v_pk_add_f16 v0, v7, v6
+            [mov(7, 0x3C03_3C03).as_slice(), &mov(6, 0x4000_4000), &[0xCC0F_4000, 0x1802_0D07], &store].concat(),
+            0xFFFF_FFFF,
+            0x4202_4202,
+        ),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, words, mask, console) in cases {
+        let native = native(&words);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == name), "{name} decoded");
+        let mut lengths = Vec::new();
+        for nearest in [false, true] {
+            let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
+            let shader = lowered(&native, &p, &HashSet::new());
+            lower::TEST_F16_NEAREST.set(was);
+            let shader = shader.unwrap_or_else(|e| panic!("{name}: lower: {e:?}"));
+            lengths.push(shader.dxil.len());
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            let Ok(host) = Host::new(false) else {
+                eprintln!("no SM 6.6 hardware device; {name} not run");
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                eprintln!("the hardware device does not take {name}; not run");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            let got = out[0][0] & mask;
+            eprintln!("{name} on the hardware device, nearest {nearest}: {got:#x}");
+            if nearest {
+                assert_eq!(got, console, "{name}");
+            }
+        }
+        assert!(lengths[1] > lengths[0], "{name}: the switch adds the rounding ({lengths:?})");
+    }
+}
+
 #[test]
 fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
     for (skip, name) in [(0xBF88_0000, "s_cbranch_execz"), (0xBF84_0000, "s_cbranch_scc0")] {
