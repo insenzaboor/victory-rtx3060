@@ -1742,6 +1742,13 @@ impl Staging {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
+            // The console's 10-bit float colour (4 bytes a texel) into its
+            // 16-bit float RGBA stand-in (8), row by row in place.
+            if crate::resource::ten_bit_float(self.shape[2]) && f.Format.0 == 10 {
+                for row in linear.chunks_mut(pitch).take(rows as usize * f.Depth as usize) {
+                    crate::resource::widen_ten_bit_float(self.shape[2], row, f.Width as usize);
+                }
+            }
         }
     }
 }

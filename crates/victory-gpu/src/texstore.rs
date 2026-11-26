@@ -216,6 +216,14 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
         let (at, pitch, rows) = (at as usize, pitch as usize, rows as usize);
         let len = (pitch * rows).min(end.saturating_sub(at));
         layout.detile(&tiled, i as u32, 0, &mut levels[at..at + len], pitch, len).ok()?;
+        // As the staging buffer has it (`crate::texture`): widened to the
+        // 16-bit float stand-in of the console's 10-bit float colour.
+        if crate::resource::ten_bit_float(shape[2]) {
+            let width = (shape[0] >> i).max(1) as usize;
+            for row in levels[at..at + len].chunks_mut(pitch.max(1)) {
+                crate::resource::widen_ten_bit_float(shape[2], row, width);
+            }
+        }
     }
     let bytes = Arc::new(levels);
     let entries: Vec<(Key, Entry)> = made.into_iter().map(|k| (k, Entry { blob, levels: k.level })).collect();

@@ -248,12 +248,101 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// Nor have its 10-bit float colour formats, R10G10B10 7e3 A2 (116) and
+/// R10G10B10 6e4 A2 (117): 16-bit float RGBA (10) stands in for both, which
+/// holds every value of either exactly (and the 2-bit alpha within a half's
+/// rounding). It is twice as wide, so what the title fills itself is
+/// widened on upload ([`widen_ten_bit_float`]); before, the console number
+/// went to the host as it was, which names no DXGI format there.
+/// shortcut: copies between such a texture and memory or a texture of
+/// another format move bytes unconverted, and nothing narrows the host copy
+/// back when the title reads it; convert them if a pass turns out to need it.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,
         other => other,
+    }
+}
+
+/// The console's 10-bit float colour formats ([`pc_format`]).
+pub(crate) fn ten_bit_float(format: u32) -> bool {
+    matches!(format, 116 | 117)
+}
+
+/// Logs the first texture made in each of the console's 10-bit float colour
+/// formats, so that a run shows whether the title uses them.
+fn note_ten_bit_float(desc: &ResourceDesc) {
+    static SAID: [std::sync::atomic::AtomicBool; 2] =
+        [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)];
+    if ten_bit_float(desc.format) && !SAID[(desc.format - 116) as usize].swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            format = desc.format,
+            width = desc.width,
+            height = desc.height,
+            flags = format_args!("{:#x}", desc.flags),
+            "the first texture in a console 10-bit float colour format (116: R10G10B10 7e3 A2, 117: 6e4 A2): \
+             16-bit float RGBA stands in, widened on upload"
+        );
+    }
+}
+
+/// One unsigned small float of `mantissa` mantissa bits and an exponent
+/// biased by `bias` above them, as an f32: 7e3 (116, bias 3, 0 to 31.875)
+/// and 6e4 (117, bias 7, 0 to 508). No sign, no infinity or NaN: the top
+/// exponent is an ordinary one; exponent 0 is denormal.
+fn small_float(bits: u32, mantissa: u32, bias: i32) -> f32 {
+    let m = bits & ((1 << mantissa) - 1);
+    let e = (bits >> mantissa) as i32;
+    let scale = |p: i32| f32::from_bits(((p + 127) as u32) << 23);
+    if e == 0 {
+        m as f32 * scale(1 - bias - mantissa as i32)
+    } else {
+        (1.0 + m as f32 / (1u32 << mantissa) as f32) * scale(e - bias)
+    }
+}
+
+/// A non-negative finite f32 below 65520 as a half, to nearest, ties to even.
+fn half_of(f: f32) -> u16 {
+    if f == 0.0 {
+        return 0;
+    }
+    let b = f.to_bits();
+    let e = (b >> 23) as i32 - 127;
+    if e < -14 {
+        // A denormal half: in steps of 2^-24 (scaling by 2^24 is exact).
+        return (f * 16_777_216.0).round_ties_even() as u16;
+    }
+    let m = b & 0x7F_FFFF;
+    let mut h = ((e + 15) as u32) << 10 | m >> 13;
+    let rest = m & 0x1FFF;
+    if rest > 0x1000 || rest == 0x1000 && h & 1 == 1 {
+        h += 1;
+    }
+    h as u16
+}
+
+/// One texel of 116 or 117 (red bits 0-9, green 10-19, blue 20-29, alpha
+/// 30-31 unsigned normalised) as 16-bit float RGBA.
+pub(crate) fn ten_bit_float_texel(format: u32, texel: u32) -> [u16; 4] {
+    let (mantissa, bias) = if format == 116 { (7, 3) } else { (6, 7) };
+    let channel = |at: u32| half_of(small_float(texel >> at & 0x3FF, mantissa, bias));
+    [channel(0), channel(10), channel(20), half_of((texel >> 30) as f32 / 3.0)]
+}
+
+/// Widens a row of `width` texels of 116 or 117, detiled at the start of
+/// `row`, into 16-bit float RGBA in place (`row` holds at least 8 bytes a
+/// texel). From the last texel back, so no texel is overwritten unread.
+pub(crate) fn widen_ten_bit_float(format: u32, row: &mut [u8], width: usize) {
+    let width = width.min(row.len() / 8);
+    for i in (0..width).rev() {
+        let texel = u32::from_le_bytes(row[4 * i..4 * i + 4].try_into().unwrap_or_default());
+        let rgba = ten_bit_float_texel(format, texel);
+        for (k, h) in rgba.iter().enumerate() {
+            row[8 * i + 2 * k..8 * i + 2 * k + 2].copy_from_slice(&h.to_le_bytes());
+        }
     }
 }
 
@@ -2665,6 +2754,7 @@ fn host_texture_as(
         }
         d.flags &= !UNORDERED;
     }
+    note_ten_bit_float(desc);
     d.format = pc_format(d.format);
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
@@ -3535,6 +3625,57 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn ten_bit_float_formats_map_to_half_rgba_and_widen() {
+        assert_eq!((pc_format(116), pc_format(117)), (10, 10));
+        // Still 4 bytes a texel in console memory.
+        assert_eq!((element(116), element(117)), (Some((4, 1)), Some((4, 1))));
+        let h = |f: f32| half_of(f);
+        assert_eq!((h(1.0), h(0.5), h(65504.0), h(2f32.powi(-24))), (0x3C00, 0x3800, 0x7BFF, 1));
+        // Ties to even, and 1/3 to nearest.
+        assert_eq!(h(1.0 + 2f32.powi(-11)), 0x3C00);
+        assert_eq!(h(1.0 + 3.0 * 2f32.powi(-11)), 0x3C02);
+        assert_eq!(h(1.0 / 3.0), 0x3555);
+        // 7e3: exponent 3 (the bias) is 1.0; the largest is 31.875; denormals in
+        // steps of 2^-9.
+        assert_eq!(small_float(3 << 7, 7, 3), 1.0);
+        assert_eq!(small_float(0x3FF, 7, 3), 31.875);
+        assert_eq!(small_float(1, 7, 3), 2f32.powi(-9));
+        assert_eq!(small_float(0x7F, 7, 3), 127.0 * 2f32.powi(-9));
+        assert_eq!(small_float(1 << 7, 7, 3), 0.25);
+        // 6e4: bias 7, the largest 508, denormals in steps of 2^-12.
+        assert_eq!(small_float(7 << 6, 6, 7), 1.0);
+        assert_eq!(small_float(0x3FF, 6, 7), 508.0);
+        assert_eq!(small_float(1, 6, 7), 2f32.powi(-12));
+        // Each value of either is exact as a half.
+        for bits in 0..0x400 {
+            for (m, b) in [(7, 3), (6, 7)] {
+                let f = small_float(bits, m, b);
+                let back = f16_value(half_of(f));
+                assert_eq!(back, f, "bits {bits:#x} m {m}");
+            }
+        }
+        // A row of two texels widened in place: red 1.0, green 0.5, blue 0,
+        // alpha 1; then 31.875 in red of 116 (508 of 117), alpha 1/3.
+        let t0 = 3 << 7 | (2 << 7) << 10 | 3 << 30;
+        let t1 = 0x3FF | 1 << 30;
+        let mut row = [0u8; 16];
+        row[..4].copy_from_slice(&u32::to_le_bytes(t0));
+        row[4..8].copy_from_slice(&u32::to_le_bytes(t1));
+        widen_ten_bit_float(116, &mut row, 2);
+        let halves: Vec<u16> = row.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(halves, [0x3C00, 0x3800, 0, 0x3C00, h(31.875), 0, 0, 0x3555]);
+        assert_eq!(ten_bit_float_texel(117, t1)[0], h(508.0));
+        assert_eq!(ten_bit_float_texel(117, 7 << 6)[0], 0x3C00);
+        assert!(ten_bit_float(116) && ten_bit_float(117) && !ten_bit_float(118));
+    }
+
+    /// A half's value (non-negative, finite), for the tests.
+    fn f16_value(h: u16) -> f32 {
+        let (e, m) = (i32::from(h >> 10), f32::from(h & 0x3FF));
+        if e == 0 { m * 2f32.powi(-24) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
