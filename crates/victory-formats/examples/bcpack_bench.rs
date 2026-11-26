@@ -50,11 +50,33 @@ fn main() {
         }
         best = best.min(all);
     }
-    let out: usize = corpus.iter().map(|c| c.1).sum();
+    // Side by side under the same load: each request with the AVX2 lanes and
+    // with the scalar ones (VICTORY_BCPACK_SCALAR), alternately.
+    let (mut vec_t, mut sca_t) = (Duration::ZERO, Duration::ZERO);
+    for _ in 0..rounds {
+        for (bc, dst_len, src, _) in &corpus {
+            let mut dst = vec![0u8; *dst_len];
+            // SAFETY: one thread reads and writes the environment here.
+            unsafe { std::env::remove_var("VICTORY_BCPACK_SCALAR") };
+            let t = Instant::now();
+            let _ = victory_formats::bcpack::decode(*bc, src, &mut dst, &tables);
+            vec_t += t.elapsed();
+            // SAFETY: as above.
+            unsafe { std::env::set_var("VICTORY_BCPACK_SCALAR", "1") };
+            let t = Instant::now();
+            let _ = victory_formats::bcpack::decode(*bc, src, &mut dst, &tables);
+            sca_t += t.elapsed();
+        }
+    }
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("VICTORY_BCPACK_SCALAR") };
     println!(
-        "lanes (entropy decode) {:.1} ms over {rounds} rounds",
-        victory_formats::bcpack::PROFILE_LANES_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+        "side by side: AVX2 lanes {:.1} ms, scalar lanes {:.1} ms (x{:.2})",
+        vec_t.as_secs_f64() * 1e3,
+        sca_t.as_secs_f64() * 1e3,
+        sca_t.as_secs_f64() / vec_t.as_secs_f64()
     );
+    let out: usize = corpus.iter().map(|c| c.1).sum();
     for (bc, (t, n, bytes)) in &by_bc {
         println!(
             "BC{bc}: {n:4} requests, {:7.3} ms each, {:6.1} MB/s out",
