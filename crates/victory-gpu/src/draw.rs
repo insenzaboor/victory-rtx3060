@@ -3871,24 +3871,35 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                // A view this list has made before: its descriptor copied,
-                // and nothing more if nothing changed in the list since.
-                if list_views
-                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
-                {
+                // How the draw reads a listed view, and whether that view is
+                // wanted to bring it up to date: decided while this thread's
+                // listed views are taken (`make_listed` hands the view out
+                // then, with no second look for it).
+                let decide = |listed: &crate::descriptor::host::Listed| {
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                    let tested = TESTED_DEPTH.get();
+                    let ready = kind == Some(ResourceType::Srv)
+                        && listed.ready.0 == list.epoch()
+                        && listed.ready.1 == tested.0;
+                    ((kind, tested, ready), kind.is_some() && !ready)
+                };
+                // A view this list has made before: its descriptor copied,
+                // and nothing more if nothing changed in the list since.
+                if list_views
+                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
+                    && let Some((mut listed, (kind, tested, ready), view)) =
+                        host.make_listed(recording, words, index, decide)
+                {
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
-                        let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                        if ready {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
+                        } else if let Some(view) = view {
                             TESTED_DEPTH.set((tested.0, false));
                             readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
