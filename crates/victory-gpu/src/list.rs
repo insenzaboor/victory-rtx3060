@@ -11,6 +11,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+use std::sync::atomic::Ordering;
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -283,37 +284,223 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
+    let mut gone: Vec<Box<dyn std::any::Any>> = Vec::with_capacity(lists.len() * 3);
     if !pools() {
+        for Detached { host, _uploads, _state } in lists {
+            drop(_state);
+            gone.push(Box::new(_uploads));
+            gone.push(Box::new(Unpooled(host)));
+        }
+        reap(gone);
         return;
     }
+    let trim = alloc_trim();
+    // With the allocators trimmed an idle list holds little: more are kept,
+    // and fewer made anew (each new list makes its own small buffers, and
+    // each of those waits for residency).
     let most = idle_most_for(crate::host::available_physical_ram_recent());
+    let most = if trim > 0 { most.max(TRIMMED_IDLE_MOST) } else { most };
     // Kept while the PC had more room: the ones over `most` go (they have
     // run), dropped outside the lock.
-    let surplus: Vec<Idle> = {
+    {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let over = idle.0.len().saturating_sub(most);
-        let gone: Vec<Idle> = idle.0.drain(..over).collect();
-        idle.1 -= gone.iter().map(|Idle(_, bytes)| bytes).sum::<u64>();
-        gone
-    };
-    drop(surplus);
+        let surplus: Vec<Idle> = idle.0.drain(..over).collect();
+        idle.1 -= surplus.iter().map(|Idle(_, bytes)| bytes).sum::<u64>();
+        gone.extend(surplus.into_iter().map(|s| Box::new(s) as Box<dyn std::any::Any>));
+    }
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
-        // The descriptor slots and the upload memory its commands named.
+        // The descriptor slots its commands named, here: the next frames'
+        // tables are made in them. The upload memory goes with the rest.
         drop(_state);
-        drop(_uploads);
+        gone.push(Box::new(_uploads));
+        let mut host = host;
+        note_recycled(host.peak_calls());
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
+            gone.push(Box::new(Unpooled(host)));
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        if trim > 0 && host.peak_calls() > trim {
+            // Its allocator keeps room for its biggest recording for as
+            // long as it lives: a new one in its place, the list's buffers
+            // kept.
+            if let Some(old) = host.renew_allocator() {
+                TRIMMED.fetch_add(1, Ordering::Relaxed);
+                gone.push(Box::new(Renewed(old)));
+            }
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+        } else {
+            drop(idle);
+            gone.push(Box::new(Unpooled(host)));
         }
     }
+    reap(gone);
+}
+
+/// A host list that is not kept, on its way to [`reap`].
+#[cfg(windows)]
+struct Unpooled(#[allow(dead_code)] crate::host::HostList);
+
+/// A kept list's old allocator and D3D12 list ([`alloc_trim`]), on their
+/// way to [`reap`]; the list's last submission has run.
+#[cfg(windows)]
+struct Renewed(
+    #[allow(dead_code)]
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator,
+        windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    ),
+);
+
+/// The idle lists kept at least, whatever the free memory, while
+/// [`alloc_trim`] keeps their allocators small.
+#[cfg(windows)]
+const TRIMMED_IDLE_MOST: usize = 256;
+
+/// What [`recycle`] lets go, for the reaper thread.
+#[cfg(windows)]
+struct Reaped(#[allow(dead_code)] Vec<Box<dyn std::any::Any>>);
+
+// SAFETY: D3D12 objects are free-threaded; everything here belongs to
+// submissions that have run (or to idle lists), and nobody else holds it:
+// it is only dropped.
+#[cfg(windows)]
+unsafe impl Send for Reaped {}
+
+/// Whether what [`recycle`] lets go (upload memory, host lists and their
+/// allocators; not descriptor slots) is dropped on a thread of its own instead of
+/// the landing thread that recycles (`VICTORY_REAP`: on by default; `0`:
+/// where recycled, as before). Freeing a list's allocators goes into the
+/// driver and the kernel: "landed lists reset and given back" was 817 ms
+/// of one helper's 4 s with 173 ms of it resets (run fourth's timeline),
+/// and on one frame's chain 125 ms. Later is never sooner than before.
+#[cfg(windows)]
+fn reaps() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_REAP") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REAP").is_none_or(|v| v != "0"))
+}
+
+/// Batches handed to the reaper and not dropped yet.
+#[cfg(windows)]
+static REAP_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// More batches waiting than this: dropped where they are, as before.
+#[cfg(windows)]
+const REAP_MOST: usize = 256;
+
+/// Drops `gone` on the reaper thread ([`reaps`]), or here.
+#[cfg(windows)]
+fn reap(gone: Vec<Box<dyn std::any::Any>>) {
+    if gone.is_empty() {
+        return;
+    }
+    if !reaps() || REAP_PENDING.load(Ordering::Relaxed) >= REAP_MOST {
+        drop(gone);
+        return;
+    }
+    static SEND: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Reaped>>>> =
+        std::sync::OnceLock::new();
+    let send = SEND.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Reaped>();
+        std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                for batch in rx {
+                    let _span = crate::timeline::span("reaper: what landed lists let go");
+                    drop(batch);
+                    REAP_PENDING.fetch_sub(1, Ordering::Relaxed);
+                }
+            })
+            .ok()
+            .map(|_| std::sync::Mutex::new(tx))
+    });
+    let Some(send) = send else {
+        drop(gone);
+        return;
+    };
+    REAP_PENDING.fetch_add(1, Ordering::Relaxed);
+    if let Err(std::sync::mpsc::SendError(batch)) = send.lock().unwrap_or_else(|e| e.into_inner()).send(Reaped(gone)) {
+        REAP_PENDING.fetch_sub(1, Ordering::Relaxed);
+        drop(batch);
+    }
+}
+
+/// Host lists whose biggest recording had more list calls than this get a
+/// new command allocator (and D3D12 list) when they are kept idle, their
+/// buffers kept (`VICTORY_ALLOC_TRIM=<calls>`; 0, the default: none), and
+/// at least [`TRIMMED_IDLE_MOST`] idle lists are kept. A command allocator
+/// keeps room for the most its list ever recorded and nothing trims it;
+/// idle lists are taken in any order, so in time every kept list's
+/// allocator is as big as the biggest recordings (run fourth: 103 private
+/// blocks of 32 MB, 2.6 GB, with 1,345 host lists alive). Dropping whole
+/// lists instead cost their remaking: each new list makes its own small
+/// buffers, each waiting for residency (run fifth: 0.9 s of 4.7 s of waits
+/// in list calls). The frame line's list sizes say where to set it.
+#[cfg(windows)]
+fn alloc_trim() -> u32 {
+    static TRIM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TRIM.get_or_init(|| std::env::var("VICTORY_ALLOC_TRIM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Since the frame line last took them: lists recycled, by the most calls
+/// of one recording (up to 256, 1,024, 4,096, 16,384, more), and the most;
+/// and allocators renewed by [`alloc_trim`].
+#[cfg(windows)]
+static RECYCLED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+#[cfg(windows)]
+static TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bucket of [`RECYCLED`] a list of `peak` calls counts in.
+fn peak_bucket(peak: u32) -> usize {
+    match peak {
+        0..=256 => 0,
+        257..=1024 => 1,
+        1025..=4096 => 2,
+        4097..=16384 => 3,
+        _ => 4,
+    }
+}
+
+#[cfg(windows)]
+fn note_recycled(peak: u32) {
+    RECYCLED[peak_bucket(peak)].fetch_add(1, Ordering::Relaxed);
+    RECYCLED[5].fetch_max(u64::from(peak), Ordering::Relaxed);
+}
+
+/// For the frame-rate line: the sizes of the lists recycled, and what the
+/// reaper and the trim did.
+#[cfg(windows)]
+pub(crate) fn recycle_log(frames: f64) {
+    let n: [u64; 6] = std::array::from_fn(|i| RECYCLED[i].swap(0, Ordering::Relaxed));
+    if n[..5].iter().sum::<u64>() == 0 {
+        return;
+    }
+    let per = |x: u64| x as f64 / frames;
+    tracing::info!(
+        "host lists recycled per frame, by their biggest recording's list calls (VICTORY_ALLOC_TRIM={}): {:.1} up to 256, {:.1} to 1,024, {:.1} to 4,096, {:.1} to 16,384, {:.1} more; the most {}; allocators renewed by the trim {:.1}; batches waiting for the reaper {} (VICTORY_REAP={})",
+        alloc_trim(),
+        per(n[0]),
+        per(n[1]),
+        per(n[2]),
+        per(n[3]),
+        per(n[4]),
+        n[5],
+        per(TRIMMED.swap(0, Ordering::Relaxed)),
+        REAP_PENDING.load(Ordering::Relaxed),
+        u8::from(reaps()),
+    );
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2418,6 +2605,31 @@ mod tests {
         assert_eq!(idle_most_for(Some(4 * gib)), 64);
         assert_eq!(idle_most_for(Some(4 * gib - 1)), 16);
         assert_eq!(idle_most_for(Some(0)), 16);
+    }
+
+    #[test]
+    fn recycled_lists_count_by_their_biggest_recording() {
+        assert_eq!([0, 256, 257, 1024, 1025, 4096, 4097, 16384, 16385, u32::MAX].map(peak_bucket), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]);
+    }
+
+    /// What goes to the reaper is dropped there, and the count of batches
+    /// waiting comes back to where it was.
+    #[test]
+    fn the_reaper_drops_what_it_is_given() {
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        reap(vec![Box::new(Flag(dropped.clone()))]);
+        let started = std::time::Instant::now();
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "never dropped");
+            std::thread::yield_now();
+        }
+        reap(Vec::new());
     }
 
     #[test]
