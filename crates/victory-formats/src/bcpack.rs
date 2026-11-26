@@ -100,6 +100,43 @@ pub struct Tables {
     bc5: Vec<Plain>,
     bc6: Vec<(Bc6Ep, Bc6Ix)>,
     bc7: Vec<(Bc7Ep, Bc7Ix)>,
+    /// The models as [`lanes_fast`] reads them, each in one place.
+    dec: Box<[Model; MODELS]>,
+    /// The models as flat `u32` tables for [`lanes_avx2`]'s gathers.
+    flat: Box<Flat>,
+}
+
+/// [`Model`]s as flat tables: by model, its 256 windows' first buckets, its
+/// buckets' next starts (10 a model), and per bucket (9 a model) start,
+/// frequency, first symbol, 32-bit reciprocal and whether the frequency is 1
+/// (no 32-bit reciprocal there: the quotient is the offset).
+struct Flat {
+    bucket: Vec<u32>,
+    next: Vec<u32>,
+    start: Vec<u32>,
+    freq: Vec<u32>,
+    base: Vec<u32>,
+    recip: Vec<u32>,
+    one: Vec<u32>,
+}
+
+/// One bucket of a model: its first slot, its symbols' frequency, the
+/// reciprocal that divides by it, and its first symbol. Bucket 0 starts at 1
+/// with frequency f0 - 1 and reciprocal 0 (symbol 0 owns slots 1 .. f0 - 1).
+#[derive(Clone, Copy, Default)]
+struct Bin {
+    start: u32,
+    freq: u32,
+    recip: u64,
+    base: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Model {
+    bins: [Bin; BUCKETS],
+    /// The next bucket's start for each bucket (65536 past the last).
+    next: [u32; BUCKETS + 1],
+    bucket: [u8; 256],
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -231,7 +268,43 @@ impl Tables {
                 (ep, ix)
             })
             .collect();
+        let dec = Box::new(std::array::from_fn(|m| {
+            let mut bins = [Bin::default(); BUCKETS];
+            for (b, bin) in bins.iter_mut().enumerate() {
+                *bin = if b == 0 {
+                    Bin { start: 1, freq: freq[m][0].wrapping_sub(1), recip: 0, base: 0 }
+                } else {
+                    Bin { start: start[m][b], freq: freq[m][b], recip: recip[m][b], base: 1 << (b - 1) }
+                };
+            }
+            let mut next = [1u32 << 16; BUCKETS + 1];
+            next[..BUCKETS].copy_from_slice(&start[m][1..]);
+            Model { bins, next, bucket: bucket[m] }
+        }));
+        let mut flat = Box::new(Flat {
+            bucket: Vec::with_capacity(MODELS * 256),
+            next: Vec::with_capacity(MODELS * (BUCKETS + 1)),
+            start: Vec::with_capacity(MODELS * BUCKETS),
+            freq: Vec::with_capacity(MODELS * BUCKETS),
+            base: Vec::with_capacity(MODELS * BUCKETS),
+            recip: Vec::with_capacity(MODELS * BUCKETS),
+            one: Vec::with_capacity(MODELS * BUCKETS),
+        });
+        for m in dec.iter() {
+            flat.bucket.extend(m.bucket.iter().map(|&b| u32::from(b)));
+            flat.next.extend_from_slice(&m.next);
+            for (b, bin) in m.bins.iter().enumerate() {
+                flat.start.push(bin.start);
+                flat.freq.push(bin.freq);
+                flat.base.push(bin.base);
+                let one = b > 0 && bin.freq == 1;
+                flat.recip.push(if one { 0 } else { bin.recip as u32 });
+                flat.one.push(if one { u32::MAX } else { 0 });
+            }
+        }
         Ok(Tables {
+            flat,
+            dec,
             freq,
             start,
             bucket,
@@ -275,8 +348,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     };
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    lanes_best(tables, widths, per, blocks, src, &mut records)?;
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
@@ -289,6 +361,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => bc7(records, out, t),
     }
 }
+
 
 // Lanes.
 
@@ -467,6 +540,369 @@ fn lanes(
         }
     }
     Ok(())
+}
+
+/// [`lanes`] with the lanes' states in arrays, input from `src` in order, and
+/// no `Option`s or `Result`s in the step: the same schedule, the same
+/// records (`lanes_fast_matches_lanes`). Three to four times as fast; the
+/// lanes stay one step at a time, since which lane takes the next byte
+/// depends on every lane's state.
+fn lanes_fast(t: &Tables, widths: &[u8], per: usize, blocks: usize, src: &[u8], records: &mut [u8]) -> Result<(), Error> {
+    const N: usize = 16;
+    let n = widths.len();
+    debug_assert!(n <= N && records.len() >= blocks * n * per);
+    let mut width = [0u8; N];
+    width[..n].copy_from_slice(widths);
+    let mut phase = [0u8; N];
+    let mut long = [false; N];
+    let mut reset = [false; N];
+    let mut model = [0usize; N];
+    let mut need = [true; N];
+    // A latched byte: 0x100 | byte, 0 for none (and likewise the symbol out).
+    let mut latch = [0u16; N];
+    let mut out = [0u16; N];
+    let mut stalled = [false; N];
+    let mut x = [0u32; N];
+    let mut left = [0u32; N];
+    let stride = n * per;
+    let full = (1u32 << n) - 1;
+    let (mut pos, mut done, mut idle) = (0usize, 0u32, 0u32);
+    let mut at = 0usize;
+    let mut ip = 0usize;
+    let total = blocks * per;
+    let dec = &t.dec;
+    while pos < total {
+        let mut taken = 0usize;
+        let mut moved = false;
+        for j in 0..n {
+            let bit = 1u32 << j;
+            let before = taken;
+            if !stalled[j] {
+                if phase[j] != 3 {
+                    if latch[j] != 0 {
+                        let b = latch[j] as u8;
+                        latch[j] = 0;
+                        need[j] = true;
+                        match phase[j] {
+                            0 => {
+                                let group = width[j] - (b >> 6);
+                                model[j] = usize::from(group * 16 + (b & 15));
+                                reset[j] = b & 0x10 != 0;
+                                long[j] = b & 0x20 != 0;
+                                left[j] = 0;
+                                phase[j] = 1;
+                            }
+                            1 if long[j] => {
+                                left[j] = b.into();
+                                phase[j] = 2;
+                            }
+                            1 => {
+                                left[j] = u32::from(b) + 1;
+                                phase[j] = 3;
+                            }
+                            _ => {
+                                left[j] = (u32::from(b) << 8 | left[j]) + 257;
+                                phase[j] = 3;
+                            }
+                        }
+                    }
+                } else {
+                    let mut xx = x[j];
+                    if xx < LOW && latch[j] != 0 {
+                        left[j] = left[j].wrapping_sub(1);
+                        xx = xx << 8 | u32::from(latch[j] as u8);
+                        latch[j] = 0;
+                    }
+                    need[j] = left[j] != 0 && latch[j] == 0;
+                    if xx > LOW {
+                        let m = &dec[model[j]];
+                        let slot = xx & 0xffff;
+                        let mut b = usize::from(m.bucket[(slot >> 8) as usize]);
+                        while m.next[b] <= slot {
+                            b += 1;
+                        }
+                        let k = &m.bins[b];
+                        // Bucket 0 is described like the others (start 1,
+                        // frequency f0 - 1, no division): one path for all.
+                        let offset = slot.wrapping_sub(k.start);
+                        let q = ((u64::from(offset) * k.recip) >> 32) as u32;
+                        let rem = offset.wrapping_sub(q.wrapping_mul(k.freq));
+                        x[j] = (xx >> 16).wrapping_mul(k.freq).wrapping_add(rem);
+                        out[j] = 0x100 | (k.base.wrapping_add(q) as u8 as u16);
+                    } else if left[j] != 0 {
+                        x[j] = xx;
+                    } else {
+                        // The fragment ends; a byte read in this step does not reach the carried state.
+                        phase[j] = 0;
+                        need[j] = latch[j] == 0;
+                        if reset[j] {
+                            x[j] = 0;
+                        }
+                    }
+                }
+            }
+            let waiting = out[j] != 0 && done & bit != 0;
+            if need[j] && !waiting && taken < ROUND_BYTES && ip < src.len() {
+                latch[j] = 0x100 | u16::from(src[ip]);
+                ip += 1;
+                taken += 1;
+            }
+            stalled[j] = (need[j] && before >= ROUND_BYTES) || waiting;
+            if !stalled[j] && out[j] != 0 {
+                records[at + j * per] = out[j] as u8;
+                out[j] = 0;
+                done |= bit;
+                moved = true;
+            }
+        }
+        if done == full {
+            pos += 1;
+            at += if pos.is_multiple_of(per) { stride - per + 1 } else { 1 };
+            done = 0;
+            moved = true;
+        }
+        idle = if taken > 0 || moved { 0 } else { idle + 1 };
+        if idle > 3 {
+            return Err(Error("the stream ends early or is corrupt"));
+        }
+    }
+    Ok(())
+}
+
+/// [`lanes_avx2`] where the CPU has AVX2 (the project needs it), else
+/// [`lanes_fast`].
+fn lanes_best(t: &Tables, widths: &[u8], per: usize, blocks: usize, src: &[u8], records: &mut [u8]) -> Result<(), Error> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::env::var_os("VICTORY_BCPACK_SCALAR").is_none() {
+        // SAFETY: AVX2 is there.
+        return unsafe { lanes_avx2(t, widths, per, blocks, src, records) };
+    }
+    lanes_fast(t, widths, per, blocks, src, records)
+}
+
+/// [`lanes_fast`] with each round's steps on eight lanes at a time: the
+/// lanes' steps within a round are apart (each reads its own latched byte),
+/// only the hand-out of the round's bytes ties them, and that is done on
+/// masks in lane order. Headers and fragment ends, rare, stay one lane at a
+/// time. The same records (`lanes_avx2_matches_lanes`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,popcnt")]
+unsafe fn lanes_avx2(t: &Tables, widths: &[u8], per: usize, blocks: usize, src: &[u8], records: &mut [u8]) -> Result<(), Error> {
+    // SAFETY: AVX2 is there (the caller checked); loads and stores stay in the
+    // 16-lane arrays (offsets 0 and 8), gathers in the tables (models below
+    // 128, windows below 256, buckets below 10), input below its length.
+    unsafe {
+    use std::arch::x86_64::*;
+    const N: usize = 16;
+    let n = widths.len();
+    if n > N || records.len() < blocks * n * per {
+        return Err(Error("bad lane layout"));
+    }
+    let full: u32 = (1u32 << n) - 1;
+    let f = &*t.flat;
+    let mut width = [0u8; N];
+    width[..n].copy_from_slice(widths);
+    let mut phase = [0u8; N];
+    let mut long = [false; N];
+    let mut reset = [false; N];
+    let mut model = [0u32; N];
+    let mut x = [0u32; N];
+    let mut left = [0u32; N];
+    // 0x100 | byte, or 0 for none; the same for the symbol out.
+    let mut latch = [0u32; N];
+    let mut out = [0u32; N];
+    let mut need: u32 = full;
+    let mut stalled: u32 = 0;
+    // Lanes in their payload (phase 3).
+    let mut payload: u32 = 0;
+    let stride = n * per;
+    let total = blocks * per;
+    let (mut pos, mut done, mut idle) = (0usize, 0u32, 0u32);
+    let (mut at, mut ip) = (0usize, 0usize);
+    let bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    let zero = _mm256_setzero_si256();
+    let ones = _mm256_set1_epi32(-1);
+    let sign = _mm256_set1_epi32(i32::MIN);
+    let low_s = _mm256_set1_epi32((LOW as i32) ^ i32::MIN);
+    let lo16 = _mm256_set1_epi32(0xffff);
+    let lo8 = _mm256_set1_epi32(0xff);
+    let flag = _mm256_set1_epi32(0x100);
+    let ten = _mm256_set1_epi32((BUCKETS + 1) as i32);
+    let nine = _mm256_set1_epi32(BUCKETS as i32);
+    let mulhi = |a: __m256i, b: __m256i| -> __m256i {
+        let even = _mm256_srli_epi64::<32>(_mm256_mul_epu32(a, b));
+        let odd = _mm256_mul_epu32(_mm256_srli_epi64::<32>(a), _mm256_srli_epi64::<32>(b));
+        _mm256_blend_epi32::<0b1010_1010>(even, odd)
+    };
+    while pos < total {
+        let step = !stalled & full;
+        // (Taken before the payload steps: a lane whose fragment ends in this
+        // round takes its next header byte in the next one.)
+        let headers = step & !payload;
+        // Payload steps, eight lanes at a time.
+        let vector = step & payload;
+        for h in 0..2usize {
+            let m8 = (vector >> (8 * h)) & 0xff;
+            if m8 == 0 {
+                continue;
+            }
+            let o = 8 * h;
+            let act = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(m8 as i32), bits), bits);
+            let xv = _mm256_loadu_si256(x.as_ptr().add(o).cast());
+            let lv0 = _mm256_loadu_si256(latch.as_ptr().add(o).cast());
+            let leftv0 = _mm256_loadu_si256(left.as_ptr().add(o).cast());
+            let mv = _mm256_loadu_si256(model.as_ptr().add(o).cast());
+            let below = _mm256_cmpeq_epi32(_mm256_srli_epi32::<24>(xv), zero);
+            let has = _mm256_xor_si256(_mm256_cmpeq_epi32(lv0, zero), ones);
+            let read = _mm256_and_si256(_mm256_and_si256(below, has), act);
+            let shifted = _mm256_or_si256(_mm256_slli_epi32::<8>(xv), _mm256_and_si256(lv0, lo8));
+            let xx = _mm256_blendv_epi8(xv, shifted, read);
+            let leftv = _mm256_add_epi32(leftv0, read);
+            let lv = _mm256_andnot_si256(read, lv0);
+            let left_nz = _mm256_xor_si256(_mm256_cmpeq_epi32(leftv, zero), ones);
+            let need_v = _mm256_and_si256(left_nz, _mm256_cmpeq_epi32(lv, zero));
+            let sym_m = _mm256_and_si256(_mm256_cmpgt_epi32(_mm256_xor_si256(xx, sign), low_s), act);
+            let slot = _mm256_and_si256(xx, lo16);
+            let mut b = _mm256_i32gather_epi32::<4>(
+                f.bucket.as_ptr().cast(),
+                _mm256_add_epi32(_mm256_slli_epi32::<8>(mv), _mm256_srli_epi32::<8>(slot)),
+            );
+            let mrow = _mm256_mullo_epi32(mv, ten);
+            loop {
+                let nb = _mm256_i32gather_epi32::<4>(f.next.as_ptr().cast(), _mm256_add_epi32(mrow, b));
+                // next <= slot: step on (both below 2^17: signed compare is fine).
+                let on = _mm256_and_si256(_mm256_xor_si256(_mm256_cmpgt_epi32(nb, slot), ones), sym_m);
+                if _mm256_testz_si256(on, on) != 0 {
+                    break;
+                }
+                b = _mm256_sub_epi32(b, on);
+            }
+            let idx = _mm256_add_epi32(_mm256_mullo_epi32(mv, nine), b);
+            let st = _mm256_i32gather_epi32::<4>(f.start.as_ptr().cast(), idx);
+            let fq = _mm256_i32gather_epi32::<4>(f.freq.as_ptr().cast(), idx);
+            let bs = _mm256_i32gather_epi32::<4>(f.base.as_ptr().cast(), idx);
+            let rc = _mm256_i32gather_epi32::<4>(f.recip.as_ptr().cast(), idx);
+            let one = _mm256_i32gather_epi32::<4>(f.one.as_ptr().cast(), idx);
+            let offset = _mm256_sub_epi32(slot, st);
+            let q = _mm256_blendv_epi8(mulhi(offset, rc), offset, one);
+            let rem = _mm256_sub_epi32(offset, _mm256_mullo_epi32(q, fq));
+            let nx = _mm256_add_epi32(_mm256_mullo_epi32(_mm256_srli_epi32::<16>(xx), fq), rem);
+            let sym = _mm256_and_si256(_mm256_add_epi32(bs, q), lo8);
+            let cont = _mm256_andnot_si256(sym_m, _mm256_and_si256(act, left_nz));
+            let mut xo = _mm256_blendv_epi8(xv, nx, sym_m);
+            xo = _mm256_blendv_epi8(xo, xx, cont);
+            let outv0 = _mm256_loadu_si256(out.as_ptr().add(o).cast());
+            let outv = _mm256_blendv_epi8(outv0, _mm256_or_si256(sym, flag), sym_m);
+            _mm256_storeu_si256(x.as_mut_ptr().add(o).cast(), xo);
+            _mm256_storeu_si256(out.as_mut_ptr().add(o).cast(), outv);
+            _mm256_storeu_si256(latch.as_mut_ptr().add(o).cast(), lv);
+            _mm256_storeu_si256(left.as_mut_ptr().add(o).cast(), leftv);
+            let need8 = _mm256_movemask_ps(_mm256_castsi256_ps(need_v)) as u32;
+            need = (need & !(m8 << o)) | ((need8 & m8) << o);
+            // Fragment ends: neither a symbol nor bytes left; x as it was (or 0 on a reset).
+            let ends = _mm256_andnot_si256(sym_m, _mm256_andnot_si256(left_nz, act));
+            let mut e = (_mm256_movemask_ps(_mm256_castsi256_ps(ends)) as u32) << o;
+            while e != 0 {
+                let j = e.trailing_zeros() as usize;
+                e &= e - 1;
+                phase[j] = 0;
+                payload &= !(1 << j);
+                if latch[j] == 0 {
+                    need |= 1 << j;
+                } else {
+                    need &= !(1 << j);
+                }
+                if reset[j] {
+                    x[j] = 0;
+                }
+            }
+        }
+        // Header and length steps, one lane at a time.
+        let mut hs = headers;
+        while hs != 0 {
+            let j = hs.trailing_zeros() as usize;
+            hs &= hs - 1;
+            if latch[j] == 0 {
+                continue;
+            }
+            let b = latch[j] as u8;
+            latch[j] = 0;
+            need |= 1 << j;
+            match phase[j] {
+                0 => {
+                    let group = width[j] - (b >> 6);
+                    model[j] = u32::from(group * 16 + (b & 15));
+                    reset[j] = b & 0x10 != 0;
+                    long[j] = b & 0x20 != 0;
+                    left[j] = 0;
+                    phase[j] = 1;
+                }
+                1 if long[j] => {
+                    left[j] = b.into();
+                    phase[j] = 2;
+                }
+                1 => {
+                    left[j] = u32::from(b) + 1;
+                    phase[j] = 3;
+                    payload |= 1 << j;
+                }
+                _ => {
+                    left[j] = (u32::from(b) << 8 | left[j]) + 257;
+                    phase[j] = 3;
+                    payload |= 1 << j;
+                }
+            }
+        }
+        // The round's bytes, in lane order, and what each lane does next.
+        let out_lo = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_xor_si256(
+            _mm256_cmpeq_epi32(_mm256_loadu_si256(out.as_ptr().cast()), zero),
+            ones,
+        ))) as u32;
+        let out_hi = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_xor_si256(
+            _mm256_cmpeq_epi32(_mm256_loadu_si256(out.as_ptr().add(8).cast()), zero),
+            ones,
+        ))) as u32;
+        let outs = (out_lo | out_hi << 8) & full;
+        let waiting = outs & done;
+        let mut eligible = need & !waiting & full;
+        let room = ROUND_BYTES.min(src.len() - ip);
+        let mut taken = 0usize;
+        let mut after = 0u32;
+        while eligible != 0 && taken < room {
+            let j = eligible.trailing_zeros() as usize;
+            eligible &= eligible - 1;
+            latch[j] = 0x100 | u32::from(*src.get_unchecked(ip));
+            ip += 1;
+            taken += 1;
+            if taken == ROUND_BYTES {
+                // Lanes after the eighth taker find the round's bytes gone.
+                after = full & !((2u32 << j) - 1);
+            }
+        }
+        stalled = (need & after) | waiting;
+        let wr = !stalled & outs;
+        let mut w = wr;
+        while w != 0 {
+            let j = w.trailing_zeros() as usize;
+            w &= w - 1;
+            *records.get_unchecked_mut(at + j * per) = out[j] as u8;
+            out[j] = 0;
+        }
+        done |= wr;
+        let mut moved = wr != 0;
+        if done == full {
+            pos += 1;
+            at += if pos.is_multiple_of(per) { stride - per + 1 } else { 1 };
+            done = 0;
+            moved = true;
+        }
+        idle = if taken > 0 || moved { 0 } else { idle + 1 };
+        if idle > 3 {
+            return Err(Error("the stream ends early or is corrupt"));
+        }
+    }
+    Ok(())
+    }
 }
 
 // Blocks.
@@ -1273,6 +1709,38 @@ mod tests {
             (2 * v) as u8
         } else {
             (-2 * v - 1) as u8
+        }
+    }
+
+    /// The array and AVX2 lanes give the records the one-lane-at-a-time
+    /// lanes give, on random records for 12 lanes x 1 and 16 lanes x 2.
+    #[test]
+    fn lanes_fast_and_avx2_match_lanes() {
+        let t = Tables::parse(&tables()).unwrap();
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let bc7: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        for (widths, per) in [(&BC4_LANES[..], 1usize), (&bc7[..], 2)] {
+            let records: Vec<Vec<u8>> = (0..700)
+                .map(|_| (0..widths.len() * per).map(|k| (rnd() as u16 & ((2u16 << widths[k / per]) - 1)) as u8).collect())
+                .collect();
+            let src = stream(&t, widths, per, &records);
+            let want = records.concat();
+            let mut got = vec![0; want.len()];
+            lanes_fast(&t, widths, per, records.len(), &src, &mut got).unwrap();
+            assert_eq!(got, want, "lanes_fast, {} lanes", widths.len());
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let mut got = vec![0; want.len()];
+                // SAFETY: AVX2 is there.
+                unsafe { lanes_avx2(&t, widths, per, records.len(), &src, &mut got) }.unwrap();
+                assert_eq!(got, want, "lanes_avx2, {} lanes", widths.len());
+            }
         }
     }
 
