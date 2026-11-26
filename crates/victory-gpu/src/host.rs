@@ -2781,9 +2781,28 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
+}
+
+/// Whether the flights get twice the room before "lists in the air"
+/// settles them ([`late_most`]) and at least 4,096 changed runs before the
+/// merge under shaders' writes gives up and settles them
+/// ([`stale_under_flights`]; with [`card_steps`] that is the cap already)
+/// (`VICTORY_SETTLE_ROOM=1`, or a `VICTORY_AB` switch; off by default).
+/// fxceless 06702fe measured -11.5 ms of the preparing thread's work at
+/// equal draws on an RTX 4070 (boat save: 4.9-6.6 ms a frame of settles).
+/// Lists in the air hold their dynamic slots, upload memory and scratch:
+/// watch "tables asked, N refused" and the memory line.
+fn settle_room() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SETTLE_ROOM") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_some_and(|v| v == "1"))
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3258,7 +3277,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = if card_steps::stage() > 0 || settle_room() { 4096 } else { 512 };
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
