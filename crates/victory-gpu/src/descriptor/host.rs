@@ -3088,11 +3088,30 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.at(index));
-            self.put(index);
+            self.put_null(index, NullKind::Texture2D);
         }
         self.clear_twin(index);
         self.keep(index, None);
+    }
+
+    /// Slot `to` (of views) becomes a null view of `kind`: copied from the
+    /// one made at the start ([`null_template`]), one call where making it
+    /// here and putting it took two; else as before.
+    fn put_null(&self, to: u32, kind: NullKind) {
+        let (Some(from), Some(host)) = (null_template(kind), host()) else {
+            match kind {
+                NullKind::Texture2D => null_view(self.at(to)),
+                NullKind::Buffer => null_buffer_view(self.at(to)),
+            }
+            return self.put(to);
+        };
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(to as usize) {
+            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: a slot of our heap, and one of the templates' heap, which
+        // the card does not see and nothing writes after it is made.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
 
     /// Where the raw twin of slot `index` is made.
@@ -3117,8 +3136,7 @@ impl HostHeap {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            null_buffer_view(self.at(self.raw + index));
-            self.put(self.raw + index);
+            self.put_null(self.raw + index, NullKind::Buffer);
         }
     }
 
@@ -3182,8 +3200,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
-        null_buffer_view(self.at(index));
-        self.put(index);
+        self.put_null(index, NullKind::Buffer);
         self.clear_twin(index);
         self.keep(index, None);
     }
@@ -5223,6 +5240,61 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         _ => {}
     }
     desc
+}
+
+/// The null views [`HostHeap::put_null`] copies.
+#[derive(Clone, Copy)]
+enum NullKind {
+    /// [`null_view`].
+    Texture2D = 0,
+    /// [`null_buffer_view`].
+    Buffer = 1,
+}
+
+/// Where the null view of `kind` was made once, in a heap the card does not
+/// see (`None`: no heap; made each time, as before). XaviFortes 8abd3671.
+///
+/// The same description makes the same descriptor wherever it is made, and
+/// a copy of it is that descriptor: a slot copied from here holds what
+/// making the view there and copying it in held.
+fn null_template(kind: NullKind) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    struct Templates {
+        start: usize,
+        step: usize,
+        _heap: ID3D12DescriptorHeap,
+    }
+    // SAFETY: descriptor heaps are free-threaded; this one is only read
+    // after it is made.
+    unsafe impl Send for Templates {}
+    // SAFETY: as above.
+    unsafe impl Sync for Templates {}
+    static TEMPLATES: std::sync::OnceLock<Option<Templates>> = std::sync::OnceLock::new();
+    let templates = TEMPLATES
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: plain heap creation.
+            let heap: ID3D12DescriptorHeap = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    ..Default::default()
+                })
+            }
+            .ok()?;
+            // SAFETY: a live heap, plain queries.
+            let (start, step) = unsafe {
+                (
+                    heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                    host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+                )
+            };
+            let at = |kind: NullKind| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + kind as usize * step };
+            null_view(at(NullKind::Texture2D));
+            null_buffer_view(at(NullKind::Buffer));
+            Some(Templates { start, step, _heap: heap })
+        })
+        .as_ref()?;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: templates.start + kind as usize * templates.step })
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read

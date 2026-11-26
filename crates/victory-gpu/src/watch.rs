@@ -3196,7 +3196,7 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let one = |block: usize| {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe {
@@ -3209,10 +3209,89 @@ fn unguard(g: &Guards, blocks: &[usize]) {
             }
         }
         PROTECTED.clear(block);
+    };
+    if blocks.len() > 1 && unguard_runs() {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut i = 0;
+        while i < sorted.len() {
+            let mut end = sorted[i] + 1;
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j] == end {
+                end += 1;
+                j += 1;
+            }
+            unguard_run(sorted[i], end, &one);
+            i = j;
+        }
+    } else {
+        blocks.iter().for_each(|&block| one(block));
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
         tally(8, started.elapsed().as_nanos() as u64);
+    }
+}
+
+/// Whether [`unguard`] gives write access back to neighbouring blocks with
+/// one `VirtualProtect` each run (`VICTORY_UNGUARD_RUNS=1`; off by default:
+/// one a block). Each call takes the process's address-space lock alone,
+/// which the title's own mappings of memory wait for. XaviFortes 8abd3671.
+fn unguard_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNGUARD_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// Of [`unguard`] with [`unguard_runs`]: blocks `[from, to)`, guarded ones,
+/// given write access back with as few calls as their regions allow; `one`
+/// does a block as without the switch.
+///
+/// A `VirtualProtect` of several blocks says only what the first one's
+/// protection was, and sets all of them: one in between that is not ours
+/// (code the title made executable, say) would lose its protection with
+/// nothing to tell. So the kernel is asked first: a region it answers holds
+/// pages of one allocation, all committed with the same protection, and a
+/// read-only or read-write one of two blocks or more is opened whole (what
+/// one call a block would have done to each). What is left, and a region
+/// of one block, goes block by block.
+fn unguard_run(from: usize, to: usize, one: &dyn Fn(usize)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    let mut at = from;
+    while at < to {
+        if to - at > 1 {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery((at * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+            let stop = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).min(to);
+            if n != 0
+                && info.State == MEM_COMMIT
+                && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+                && stop > at + 1
+            {
+                let mut old = 0;
+                // SAFETY: blocks we made read-only, of one region of one
+                // protection that is ours.
+                let done =
+                    unsafe { VirtualProtect((at * BLOCK) as *const _, (stop - at) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+                if done && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                    (at..stop).for_each(|block| PROTECTED.clear(block));
+                    at = stop;
+                    continue;
+                }
+                if done {
+                    // Its first block changed since the question: as it
+                    // was, and each block as without the switch.
+                    // SAFETY: as above.
+                    unsafe { VirtualProtect((at * BLOCK) as *const _, (stop - at) * BLOCK, old, &mut old) };
+                }
+            }
+        }
+        one(at);
+        at += 1;
     }
 }
 
@@ -5959,5 +6038,61 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
+mod unguard_run_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READONLY,
+        PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+    };
+
+    fn protection(block: usize) -> u32 {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a valid out pointer of the right size.
+        assert_ne!(unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) }, 0);
+        info.Protect
+    }
+
+    /// Read-only neighbours are opened a run at a time; a block between them
+    /// that is not ours keeps its protection, and every block is given to
+    /// the one-block way at most once.
+    #[test]
+    fn runs_open_whole_regions_and_leave_what_is_not_ours() {
+        const BLOCKS: usize = 6;
+        // SAFETY: fresh memory of our own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), BLOCKS * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert!(at != 0 && at.is_multiple_of(BLOCK));
+        let first = at / BLOCK;
+        let mut old = 0;
+        // SAFETY: our memory; only its protection changes.
+        unsafe {
+            VirtualProtect(at as *const _, BLOCKS * BLOCK, PAGE_READONLY, &mut old);
+            VirtualProtect(((first + 3) * BLOCK) as *const _, BLOCK, PAGE_EXECUTE_READ, &mut old);
+        }
+        let ones = std::sync::Mutex::new(Vec::new());
+        let one = |block: usize| {
+            ones.lock().unwrap().push(block);
+            let mut old = 0;
+            // SAFETY: as above; as `unguard` does a block.
+            unsafe {
+                if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+                    && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+                {
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+                }
+            }
+        };
+        unguard_run(first, first + BLOCKS, &one);
+        for i in [0, 1, 2, 4, 5] {
+            assert_eq!(protection(first + i), PAGE_READWRITE, "block {i} opened");
+        }
+        assert_eq!(protection(first + 3), PAGE_EXECUTE_READ, "not ours: as it was");
+        // 0..3 as one run; 3 alone (another protection); 4..6 as one run.
+        assert_eq!(*ones.lock().unwrap(), [first + 3]);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 }
