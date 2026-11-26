@@ -261,6 +261,23 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// Whether the constant buffer a fresh table copies into list scratch has
+/// the bytes of its host view past the title's size zeroed
+/// (`VICTORY_CBV_TAIL_ZERO=1`; off by default). A host constant buffer view
+/// is whole 256s, the title's sizes are not, and the scratch chunks are
+/// pooled: the tail held whatever an earlier list left there, where the
+/// console's buffer descriptor ends at the title's size and a read past it
+/// gives zeros. Lead from adanaport 906e6436 / 9d9803d9: on NVIDIA, with
+/// the driver's first compile kept (no background recompiles), hair was
+/// drawn too bright and the scene too warm through this copied path, and
+/// right when the same constant buffers were raw views of exactly their
+/// bytes (`VICTORY_PORT_CBV_SLOT`, which ends at the size). Not confirmed
+/// in a run: a read past the whole 256 still finds the next buffer's bytes.
+fn cbv_tail_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_TAIL_ZERO").is_some_and(|v| v == "1"))
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -4094,6 +4111,16 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
+                        if cbv_tail_zero() {
+                            // The view's bytes past the title's `size`, up
+                            // to its whole 256: zeros, not what the pooled
+                            // scratch chunk held last ([`cbv_tail_zero`]).
+                            let tail = (bytes as usize).saturating_sub(size as usize);
+                            // SAFETY: the scratch holds `size` rounded up to
+                            // 256 bytes, and `bytes` is no more than that;
+                            // the deferred fill writes only the first `size`.
+                            unsafe { std::ptr::write_bytes(to.add(size as usize), 0, tail) };
+                        }
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
