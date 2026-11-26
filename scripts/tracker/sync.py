@@ -47,4 +47,10 @@ for it in d["items"]:
     for f, v in (("Source", it["source"]), ("Switch", it.get("switch", "")), ("Effect", it.get("effect", "")), ("Commit", it.get("commit", ""))):
         if v: gh("project", "item-edit", "--id", iid, "--project-id", pid, "--field-id", F[f]["id"], "--text", v[:1000])
 json.dump(d, open(p, "w", encoding="utf-8", newline="\n"), indent=2, ensure_ascii=False)
+# Draft cards whose item was renamed or removed (issue cards are never deleted here).
+titles = {i["title"] for i in d["items"]}
+for c in json.loads(gh("project", "item-list", NUM, "--owner", OWNER, "--format", "json", "--limit", "500"))["items"]:
+    if c.get("content", {}).get("type") == "DraftIssue" and c.get("title") not in titles:
+        gh("project", "item-delete", NUM, "--owner", OWNER, "--id", c["id"])
+        print("removed stale card", c.get("title"))
 print("synced")
