@@ -1245,46 +1245,150 @@ mod host {
         }
     }
 
+    /// A key name of [`scripted`]'s lists, as a virtual key.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
+    /// One entry of `VICTORY_KEYS`: from, to, tap period (zero: held), key.
+    #[cfg(feature = "diagnostics")]
+    type Scripted = (Duration, Duration, Duration, u8);
+
+    /// `<seconds>:<key>`, `<from>-<to>:<key>` or `<from>-<to>/<period>:<key>`.
+    #[cfg(feature = "diagnostics")]
+    fn parse_keys(list: &str) -> Vec<Scripted> {
+        let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+        list.split(',')
+            .filter_map(|entry| {
+                let (at, key) = entry.split_once(':')?;
+                let vk = key_code(key)?;
+                let (span, period) = match at.split_once('/') {
+                    Some((span, period)) => (span, time(period)?),
+                    None => (at, Duration::ZERO),
+                };
+                let (from, to) = match span.split_once('-') {
+                    Some((from, to)) => (time(from)?, time(to)?),
+                    None => (time(span)?, time(span)? + Duration::from_millis(200)),
+                };
+                Some((from, to, period, vk))
+            })
+            .collect()
+    }
+
+    /// Whether an entry presses its key `now` after input started: held
+    /// through its span, or with a period tapped for 0.2 s (at most half
+    /// the period) at its start and every period after.
+    #[cfg(feature = "diagnostics")]
+    fn pressed(&(from, to, period, _): &Scripted, now: Duration) -> bool {
+        if !(from..to).contains(&now) {
+            return false;
+        }
+        if period.is_zero() {
+            return true;
+        }
+        let into = (now - from).as_nanos() % period.as_nanos();
+        into < Duration::from_millis(200).min(period / 2).as_nanos()
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time; `<from>-<to>/<period>:<key>`: tapped every period through it),
+    /// with or without focus. A key is a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table
+    /// maps them to buttons and sticks). `VICTORY_KEYS_LIVE=<file>`: lines
+    /// appended to that file while the title runs, each `<key>` or
+    /// `<key> <seconds>` (held that long, 0.2 s without), are pressed as
+    /// they are read (the file is looked at every 50 ms).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
-                let (from, to) = match at.split_once('-') {
-                    Some((from, to)) => (time(from)?, time(to)?),
-                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
-                };
-                Some((from, to, vk))
-            });
-            (Instant::now(), keys.collect())
-        });
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> =
+            LazyLock::new(|| (Instant::now(), parse_keys(&std::env::var("VICTORY_KEYS").unwrap_or_default())));
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
+        let mut down: Vec<u8> = keys.iter().filter(|k| pressed(k, now)).map(|k| k.3).collect();
+        for vk in live() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    /// The keys `VICTORY_KEYS_LIVE`'s file presses now.
+    #[cfg(feature = "diagnostics")]
+    fn live() -> Vec<u8> {
+        struct Live {
+            path: std::path::PathBuf,
+            read: u64,
+            looked: Option<Instant>,
+            held: Vec<(Instant, u8)>,
+        }
+        static LIVE: LazyLock<Option<Mutex<Live>>> = LazyLock::new(|| {
+            let path = std::path::PathBuf::from(std::env::var_os("VICTORY_KEYS_LIVE")?);
+            // What the file held before the run is not pressed.
+            let read = std::fs::metadata(&path).map_or(0, |m| m.len());
+            Some(Mutex::new(Live { path, read, looked: None, held: Vec::new() }))
+        });
+        let Some(live) = LIVE.as_ref() else {
+            return Vec::new();
+        };
+        let mut live = live.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if live.looked.is_none_or(|at| now - at >= Duration::from_millis(50)) {
+            live.looked = Some(now);
+            if let Ok(bytes) = std::fs::read(&live.path) {
+                let from = (live.read as usize).min(bytes.len());
+                // Only whole lines; a shorter file (rewritten) starts over.
+                let end = if bytes.len() < live.read as usize {
+                    0
+                } else {
+                    bytes[from..].iter().rposition(|&b| b == b'\n').map_or(from, |i| from + i + 1)
+                };
+                let text = String::from_utf8_lossy(&bytes[from.min(end)..end]).into_owned();
+                live.read = end as u64;
+                for line in text.lines() {
+                    let mut words = line.split_whitespace();
+                    let Some(vk) = words.next().and_then(key_code) else {
+                        continue;
+                    };
+                    let hold = words
+                        .next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                        .unwrap_or(Duration::from_millis(200));
+                    live.held.push((now + hold, vk));
+                }
+            }
+        }
+        live.held.retain(|&(until, _)| until > now);
+        live.held.iter().map(|&(_, vk)| vk).collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn scripted_keys_tap_and_hold() {
+        let keys = parse_keys("1:Enter,2-4:W,10-20/1.5:Enter,bad,3:Nope");
+        assert_eq!(keys.len(), 3);
+        let at = |s: f64| Duration::from_secs_f64(s);
+        assert!(pressed(&keys[0], at(1.1)) && !pressed(&keys[0], at(1.3)));
+        assert!(pressed(&keys[1], at(3.9)) && !pressed(&keys[1], at(4.0)));
+        // Taps: 0.2 s at 10, 11.5, 13, ...
+        assert!(pressed(&keys[2], at(10.1)) && !pressed(&keys[2], at(10.5)));
+        assert!(pressed(&keys[2], at(11.6)) && !pressed(&keys[2], at(12.0)));
+        assert!(!pressed(&keys[2], at(20.05)));
+        assert_eq!(keys[1].3, b'W');
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
