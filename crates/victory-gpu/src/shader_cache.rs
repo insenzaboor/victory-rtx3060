@@ -164,6 +164,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::div_fixup_order() {
             bytes.extend_from_slice(b"VICTORY_DIV_FIXUP=1");
         }
+        // And NaN and ±Infinity made 0 in colour exports and image stores
+        // (`VICTORY_NAN_SCRUB=1`, after aleksesipenko 59609080).
+        if victory_shader::emit::nan_scrub() {
+            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
