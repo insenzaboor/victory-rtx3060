@@ -63,14 +63,28 @@ pub const FIRST: u32 = 32;
 /// worth nothing: the yard's frame replayed turn by turn, dispatches and
 /// draws 18.47 -> 18.45 ms (12 loops) and 18.23 -> 18.16 (5 loops).
 pub const WIDE: u32 = 64;
+/// Not a pass of its own: with [`REUSE`], a call that makes a descriptor
+/// handle (`createHandleFromHeap`, `annotateHandle`, `createHandle`,
+/// `createHandleFromBinding`) is given the earlier one of its own block
+/// only, never one of a block above it, so each block makes its handles
+/// again as the lowering wrote them. The values are the same either way.
+/// From GromX0/victory-fork 1465c1f2: with handles made in one block and
+/// used in the blocks below it AMD's compiler (amdxc64.dll 32.0.32029.2010,
+/// +0x861b9f) crashed on 37 of the title's compute programs (35 of 35 saved
+/// containers offline; 0 with this, and 0 compiler crashes in a cold start
+/// there). No NVIDIA compiler crash is known to come from it, so it stays
+/// off unless asked for: `VICTORY_BLOCK_HANDLES=1` (or this bit in
+/// `VICTORY_SHADER_OPT`). Part of `shader_opt()`, so of the cache's key only
+/// when on.
+pub const BLOCK_HANDLES: u32 = 128;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST | WIDE;
+pub const ALL: u32 = MODULE | FIRST | WIDE | BLOCK_HANDLES;
 /// The passes that run when nothing says which: every one but [`WIDE`],
 /// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// for it), and [`BLOCK_HANDLES`] (`VICTORY_BLOCK_HANDLES=1`).
+pub const DEFAULT: u32 = ALL & !WIDE & !BLOCK_HANDLES;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -697,6 +711,20 @@ impl Module {
         }
     }
 
+    /// Whether `i` makes a descriptor handle ([`BLOCK_HANDLES`]).
+    fn makes_handle(&self, i: u32) -> bool {
+        let Op::Call(f, _) = &self.insts[i as usize].op else {
+            return false;
+        };
+        matches!(
+            &*self.funcs[*f as usize].name,
+            "dx.op.createHandleFromHeap"
+                | "dx.op.annotateHandle"
+                | "dx.op.createHandle"
+                | "dx.op.createHandleFromBinding"
+        )
+    }
+
     /// What kind of instruction `i` is for merging.
     fn class(&self, effects: &[Effect], i: u32) -> Effect {
         match &self.insts[i as usize].op {
@@ -804,6 +832,10 @@ impl Module {
         let mut known: HashMap<Key, V> = HashMap::new();
         // The reads of the block being walked since its last store.
         let mut read: HashMap<Key, V> = HashMap::new();
+        // With [`BLOCK_HANDLES`]: the descriptor handles the block being
+        // walked has made; one made again in a later block keeps its own.
+        let mut handles: HashMap<Key, V> = HashMap::new();
+        let block_handles = passes & BLOCK_HANDLES != 0;
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -844,6 +876,7 @@ impl Module {
                 None => v,
             };
             read.clear();
+            handles.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -898,7 +931,19 @@ impl Module {
                     continue;
                 }
                 let class = self.class(&effects, i);
-                if passes & REUSE != 0
+                if block_handles
+                    && passes & REUSE != 0
+                    && class == Effect::Pure
+                    && self.makes_handle(i)
+                    && let Some(key) = self.key(i)
+                {
+                    if let Some(&first) = handles.get(&key) {
+                        repl[i as usize] = Some(first);
+                        changed = true;
+                        continue;
+                    }
+                    handles.insert(key, V::Inst(i));
+                } else if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
                 {
@@ -1504,6 +1549,38 @@ mod tests {
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
         m.write();
+    }
+
+    #[test]
+    fn a_handle_is_reused_within_its_block_only_with_block_handles() {
+        // A handle made in the entry, then twice more in a block below it.
+        let made = |passes: u32| {
+            let Diamond {
+                k: Kit { mut m, b, writes, .. },
+                x,
+                y,
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let fty = m.func_ty(i32t, vec![i32t, i32t]);
+            let make = m.function("dx.op.createHandleFromHeap", fty, Some(Attr::ReadNone), false);
+            let top = m.call(b, make, vec![x, y]);
+            m.call(b, writes, vec![top, top]);
+            let below = m.call(then, make, vec![x, y]);
+            let beside = m.call(then, make, vec![x, y]);
+            m.call(then, writes, vec![below, beside]);
+            m.optimise(passes);
+            let got = stores(&m, then);
+            m.write();
+            (got, top, below)
+        };
+        // REUSE alone: the block below takes the entry's handle.
+        let (got, top, _) = made(REUSE);
+        assert_eq!(got, [[top, top]]);
+        // With BLOCK_HANDLES: the block makes its own, once.
+        let (got, _, below) = made(REUSE | BLOCK_HANDLES);
+        assert_eq!(got, [[below, below]]);
     }
 
     #[test]
