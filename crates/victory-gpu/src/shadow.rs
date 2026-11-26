@@ -5719,7 +5719,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// list and no descriptor slot (`host::references`), so the card is done
 /// with it. A new copy marks every page as not copied yet, so what the
 /// buffer held before is never read. `VICTORY_EXACT_POOL_MB` bounds the
-/// bytes kept (64 MiB; 0: no pool, every copy a new buffer as before).
+/// bytes kept (0 by default: no pool, every copy a new buffer as before).
+/// With 64 the title's loading screen never ended (run sixth: 5 minutes,
+/// against 64-94 s without): something still knows a reused buffer by what
+/// it was, not yet found.
 #[allow(clippy::type_complexity)]
 static EXACT_POOL: Mutex<(u64, BTreeMap<u64, Vec<(ID3D12Resource, usize)>>)> = Mutex::new((0, BTreeMap::new()));
 
@@ -5729,7 +5732,7 @@ pub(crate) static EXACT_REUSED: AtomicU64 = AtomicU64::new(0);
 fn exact_pool_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_EXACT_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20
+        std::env::var("VICTORY_EXACT_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
     })
 }
 
