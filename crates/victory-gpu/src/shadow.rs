@@ -5529,10 +5529,22 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // The window is there already (nearly always): readers share the lock,
+    // also when the window is found among those of the ask's cell (tails,
+    // fine windows). Those took the writers' lock for every ask: about 1 s
+    // of waits of the list threads in 4 frames (run fifth's timeline).
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end)
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
             note(shadow);
             return Some(shadow.clone());
         }
