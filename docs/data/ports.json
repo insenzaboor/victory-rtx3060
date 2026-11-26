@@ -635,7 +635,8 @@
       "source": "fxceless af23c652 (PR #1320)",
       "commit": "26b3d211",
       "switch": "VICTORY_SPLIT_TABLES (on)",
-      "effect": "Slot ring ran out on NVIDIA (262,144): flicker, missing geometry (avatarmanz#35)"
+      "effect": "Slot ring ran out on NVIDIA (262,144): flicker, missing geometry (avatarmanz#35)",
+      "issue": 28
     },
     {
       "id": "wait-resident-textures",
@@ -645,7 +646,8 @@
       "source": "Belobug#346",
       "commit": "4bd60465",
       "switch": "VICTORY_WAIT_RESIDENT=textures",
-      "effect": "Buffers skip the residency wait"
+      "effect": "Buffers skip the residency wait",
+      "issue": 29
     },
     {
       "id": "card-pad",
@@ -655,7 +657,8 @@
       "source": "grimygunnz 7c030137",
       "commit": "a31ba178",
       "switch": "VICTORY_CARD_PAD_KB=64",
-      "effect": "Against page-fault device removals"
+      "effect": "Against page-fault device removals",
+      "issue": 30
     },
     {
       "id": "spares-headroom",
@@ -665,7 +668,8 @@
       "source": "avatarmanz#94 / PR #119",
       "commit": "2f65cd92",
       "switch": "VICTORY_SPARES_HEADROOM=1",
-      "effect": "Late textures near the 12 GB budget"
+      "effect": "Late textures near the 12 GB budget",
+      "issue": 31
     },
     {
       "id": "div-fixup",
@@ -675,7 +679,8 @@
       "source": "dng-nguyn 472518cb",
       "commit": "0d4c1fc4",
       "switch": "VICTORY_DIV_FIXUP=1",
-      "effect": "NaN in the picture (2060 / 4070 reports)"
+      "effect": "NaN in the picture (2060 / 4070 reports)",
+      "issue": 32
     },
     {
       "id": "nan-scrub",
@@ -685,7 +690,8 @@
       "source": "aleksesipenko 59609080",
       "commit": "5cb3e52a",
       "switch": "VICTORY_NAN_SCRUB=1",
-      "effect": "NaN dots and blobs (4070 TiS, 3060 reports); test for the dots on hair"
+      "effect": "NaN dots and blobs (4070 TiS, 3060 reports); test for the dots on hair",
+      "issue": 33
     },
     {
       "id": "flicker-fetch-check",
@@ -694,7 +700,8 @@
       "status": "planned",
       "source": "fxceless#1268",
       "switch": "VICTORY_FETCH_CHECK=1",
-      "effect": "One-frame black flashes on a 4080; our launcher sets exactly this pair (queue q8)"
+      "effect": "One-frame black flashes on a 4080; our launcher sets exactly this pair (queue q8)",
+      "issue": 34
     },
     {
       "id": "flicker-card-steps",
@@ -703,7 +710,8 @@
       "status": "planned",
       "source": "fxceless#1268 (2080S, 4070 TiS, 5070 Ti)",
       "switch": "VICTORY_CARD_STEPS=0",
-      "effect": "Fixes upstream, costs ~5 fps (queue q9)"
+      "effect": "Fixes upstream, costs ~5 fps (queue q9)",
+      "issue": 35
     },
     {
       "id": "flicker-thin",
@@ -712,7 +720,8 @@
       "status": "planned",
       "source": "fxceless#912 (5060, 3070, 5070)",
       "switch": "VICTORY_THIN=0",
-      "effect": "Stretched polygons, road flicker (queue q10)"
+      "effect": "Stretched polygons, road flicker (queue q10)",
+      "issue": 36
     },
     {
       "id": "late-textures-port2",
@@ -721,7 +730,8 @@
       "status": "planned",
       "source": "Belobug#346 (3080 10 GB)",
       "switch": "VICTORY_PORT_DESCRIPTORS=0",
-      "effect": "427,634 missed view records: late textures (queue q11)"
+      "effect": "427,634 missed view records: late textures (queue q11)",
+      "issue": 37
     }
   ]
 }
