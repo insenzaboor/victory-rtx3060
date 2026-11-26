@@ -237,6 +237,44 @@ fn hook(hwnd: HWND) {
         let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        // A window made while another program has the foreground is born
+        // inactive (and covered): the title is told it is active, as a
+        // console title always is.
+        if always_active() {
+            wm::PostMessageW(hwnd, WM_ACTIVATEAPP, 1, 0);
+            wm::PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+        }
+    }
+}
+
+const WM_SIZE: u32 = 0x0005;
+const WM_ACTIVATE: u32 = 0x0006;
+const WM_KILLFOCUS: u32 = 0x0008;
+const WM_ACTIVATEAPP: u32 = 0x001C;
+const WA_INACTIVE: usize = 0;
+const WA_ACTIVE: usize = 1;
+const SIZE_MINIMIZED: usize = 1;
+
+/// Whether the title never hears that its window lost the foreground, the
+/// focus, or was minimised (`VICTORY_ALWAYS_ACTIVE=0`: it hears all, as
+/// before). A console title is never put behind another program. Each of
+/// three runs whose window was born covered (its first present came back
+/// DXGI_STATUS_OCCLUDED; 0 of 13 others) sat on the loading screen for good,
+/// its main thread waiting (runs sixth, ab15, ab16 of 2026-11-26).
+fn always_active() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALWAYS_ACTIVE").is_none_or(|v| v != "0"))
+}
+
+/// Messages a console title never gets: the window's deactivation, loss
+/// of the focus, minimising.
+fn hidden_from_title(message: u32, wparam: WPARAM) -> bool {
+    match message {
+        WM_ACTIVATEAPP => wparam == 0,
+        WM_ACTIVATE => wparam & 0xFFFF == WA_INACTIVE,
+        WM_KILLFOCUS => true,
+        WM_SIZE => wparam == SIZE_MINIMIZED,
+        _ => false,
     }
 }
 
@@ -260,6 +298,14 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    if always_active() && hidden_from_title(message, wparam) {
+        static SAID: AtomicUsize = AtomicUsize::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(message = format_args!("{message:#x}"), wparam, "a window message a console title never gets: kept from the title");
+        }
+        // SAFETY: the system's default procedure, called as the system would.
+        return unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -579,6 +625,21 @@ mod tests {
         }
         // SAFETY: the system's default procedure, called as the system would.
         unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    #[test]
+    fn deactivation_focus_loss_and_minimising_are_kept_from_the_title() {
+        use super::{hidden_from_title, WM_ACTIVATE, WM_ACTIVATEAPP, WM_KILLFOCUS, WM_SIZE};
+        assert!(hidden_from_title(WM_ACTIVATEAPP, 0));
+        assert!(!hidden_from_title(WM_ACTIVATEAPP, 1));
+        assert!(hidden_from_title(WM_ACTIVATE, 0));
+        assert!(hidden_from_title(WM_ACTIVATE, 0x0001_0000)); // inactive, minimised bit in the high word
+        assert!(!hidden_from_title(WM_ACTIVATE, 1));
+        assert!(!hidden_from_title(WM_ACTIVATE, 2));
+        assert!(hidden_from_title(WM_KILLFOCUS, 0));
+        assert!(hidden_from_title(WM_SIZE, 1));
+        assert!(!hidden_from_title(WM_SIZE, 0));
+        assert!(!hidden_from_title(wm::WM_PAINT, 0));
     }
 
     #[test]
