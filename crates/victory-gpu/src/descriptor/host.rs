@@ -1348,7 +1348,7 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 /// A typed view of 12-byte elements also needs its own copy when its start
 /// is a multiple of 16 but not a multiple of 12.
 fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, has_raw_twins: bool) -> bool {
-    let needs_raw = stride > 0 && stride.is_multiple_of(4) && !has_raw_twins;
+    let needs_raw = stride > 0 && stride.is_multiple_of(4) && !has_raw_twins && !structured_in_place();
     if raw || needs_raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
@@ -1356,6 +1356,15 @@ fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, has_raw_twins
     } else {
         element > 0 && !offset.is_multiple_of(element)
     }
+}
+
+/// Whether a structured view with no raw twin stays on its buffer's copy when
+/// it begins on a multiple of its stride, rather than getting a 16-byte aligned
+/// copy of its own (`VICTORY_STRUCT_IN_PLACE=1`, off by default; from deynesdev
+/// 175ebc49, which saw about 19,000 resources made for such copies).
+fn structured_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRUCT_IN_PLACE").is_some_and(|v| v == "1"))
 }
 
 /// Whether `view` has a raw twin when its host slot is made ([`raw_twins`]):
