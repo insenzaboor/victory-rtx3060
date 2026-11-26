@@ -1,0 +1,104 @@
+{
+  "about": [
+    "How a run ended, for tools/triage.py and tools/run-report.py. Signatures are tried by priority (lowest first); the first that matches is the verdict, the others are listed too.",
+    "Every key in 'match' must hold. 'fallback' (optional) is tried instead when the run's exe was rebuilt since the run, so symbols cannot be checked; a fallback match is marked heuristic.",
+    "Locations: 'title+0x...' = the title image (victory-image-<hash>.dll mapped at preferred 0x140000000), 'victory.exe+0x...' = the layer, or any module name; a module without +0x matches any offset.",
+    "Conditions: world (true/false), resources_regex (KILLED/CRITICAL lines of logs/resources.log in the run's window), log_regex (+ log_exclude) over the .err log, autopilot_regex, runlog_regex (the launcher's .log), setting (a VICTORY_* switch set), marker_regex ('VIctory: ...' lines), exception ('unhandled' or 'any'), exception_at, exception_module_regex, frames_module_regex, frames_before_layer_regex, symbols_regex (victory.exe frames of the faulting stack through addr2sym), thread + frames_in_order + within_top (a dumped thread's top frames, consecutive), exit_code (list), no_dump (true/false).",
+    "Classes: ok, hang, crash, killed, gpu, unknown. A class 'unknown' match prints the symbolized stacks of the faulting thread and title-main."
+  ],
+  "signatures": [
+    {
+      "id": "ram_kill",
+      "name": "Killed by the RAM monitor",
+      "class": "killed",
+      "priority": 10,
+      "match": { "resources_regex": "KILLED victory" },
+      "advice": "Not the build's fault unless its own memory grew: check the RAM section (who held the memory, modified pages, paging) before calling the switch bad. Two in a row stop the queue."
+    },
+    {
+      "id": "device_removed",
+      "name": "Device removed / TDR",
+      "class": "gpu",
+      "priority": 20,
+      "match": {
+        "log_regex": "device removed|DXGI_ERROR_DEVICE_REMOVED|0x887a0005|DRED device state|removal reason|GetDeviceRemovedReason",
+        "log_exclude": "crash tracing on"
+      },
+      "advice": "Read the DRED lines (breadcrumbs, page fault address) in the .err log; VICTORY_D3D12_DRED=light keeps them."
+    },
+    {
+      "id": "title_gpu_watchdog",
+      "name": "Title GPU watchdog crash (title+0x23cf683, 'GPU Loc Sig')",
+      "class": "crash",
+      "priority": 30,
+      "match": { "exception_at": "title+0x23cf683" },
+      "advice": "The title's own GPU watchdog: a CrossQueueBarrier or fence it waits on was never signalled (VICTORY_FENCE_SWEEP covers the known case)."
+    },
+    {
+      "id": "profiler_crash",
+      "name": "Profiler crash (the layer's stack walker, crash.rs / stacks.rs)",
+      "class": "crash",
+      "priority": 40,
+      "match": { "exception": "unhandled", "symbols_regex": "[\\\\/](crash|stacks)\\.rs" },
+      "fallback": {
+        "exception": "unhandled",
+        "setting": "VICTORY_PROFILE",
+        "marker_regex": "the profile begins",
+        "exception_module_regex": "^(ntdll\\.dll|KERNEL32\\.DLL|KERNELBASE\\.dll)$",
+        "frames_before_layer_regex": "^(ntdll\\.dll|KERNEL32\\.DLL|KERNELBASE\\.dll)$"
+      },
+      "advice": "Keep VICTORY_PROFILE (and late VICTORY_STACKS) out of measured runs; RtlVirtualUnwind on a suspended thread's stack can fault."
+    },
+    {
+      "id": "known_load_hang",
+      "name": "Known load hang (title-main waits at title+0x56a0d < +0x225130)",
+      "class": "hang",
+      "priority": 50,
+      "match": {
+        "world": false,
+        "thread": "title-main",
+        "frames_in_order": ["title+0x56a0d", "title+0x225130"],
+        "within_top": 6
+      },
+      "advice": "The title's frame-tracker lock leak (fixed by VICTORY_TRACKER_UNLOCK, on by default since run 46): seeing it again means the patch did not apply (bytes differ?) or was turned off."
+    },
+    {
+      "id": "stuck_no_dump",
+      "name": "Stuck load, no thread dump (the stuck limit came before VICTORY_STACKS)",
+      "class": "hang",
+      "priority": 70,
+      "match": { "world": false, "autopilot_regex": "^state: stuck", "no_dump": true },
+      "advice": "Set VICTORY_STACKS below StuckAfter (run-queue.ps1 does) so the next hang leaves its stacks."
+    },
+    {
+      "id": "stuck_unrecognised",
+      "name": "Stuck load, unrecognised wait",
+      "class": "unknown",
+      "priority": 75,
+      "match": { "world": false, "autopilot_regex": "^state: stuck" },
+      "advice": "A new hang: compare title-main and the layer's threads in the dump; add its frames as a signature."
+    },
+    {
+      "id": "crash_unrecognised",
+      "name": "Unrecognised crash",
+      "class": "unknown",
+      "priority": 80,
+      "match": { "exception": "unhandled" },
+      "advice": "New crash: see the faulting stack; add its location as a signature."
+    },
+    {
+      "id": "time_limit",
+      "name": "Good: reached the world, ended at the time limit",
+      "class": "ok",
+      "priority": 900,
+      "match": { "world": true, "runlog_regex": "^ended after \\d+ s" }
+    },
+    {
+      "id": "stopped_after",
+      "name": "Good: reached the world, stopped by the autopilot (-StopAfter)",
+      "class": "ok",
+      "priority": 910,
+      "match": { "world": true, "autopilot_regex": "^stopping victory\\.exe" }
+    }
+  ]
+}

@@ -132,11 +132,11 @@
     },
     {
       "id": "map-threads",
-      "title": "Page mapping on 8 threads (kept, measured)",
+      "title": "Page mapping threads: 8 (default) vs 1",
       "category": "performance",
-      "status": "shipped",
+      "status": "no-gain",
       "source": "ours",
-      "effect": "A/B run 48: 30.9 vs 37.7 ms per 1k draws with 1 thread"
+      "effect": "A/B run 48 with the first minute of streaming excluded: 31.0 vs 32.2 ms per 1k draws (noise); 8 kept. An earlier reading of 30.9 vs 37.7 included streaming phases."
     },
     {
       "id": "heap-gpu-start",

@@ -6,12 +6,12 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 
 | Status | Meaning | Count |
 |---|---|---|
-| 🟢 shipped | On by default, verified in game runs | 23 |
+| 🟢 shipped | On by default, verified in game runs | 22 |
 | 🔵 on, untested | On by default, merged, not yet verified in a game run | 7 |
 | 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 17 |
 | 🟡 in progress | Being ported or built | 0 |
 | ⬜ planned | Designed or queued, not started | 3 |
-| ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 10 |
+| ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 11 |
 | ⚫ n/a | Does not apply to NVIDIA / this title (documented why) | 2 |
 
 ## Frame time / CPU
@@ -32,12 +32,12 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Title thread affinity widened to all cores | 🟢 shipped | ours |  | Console masks pinned title workers to 4 cores; run 24 best of its day | [`76faf5f2`](https://github.com/insenzaboor/victory-rtx3060/commit/76faf5f2) |  |
 | BCPack decoder 1.56x | 🟢 shipped | ours |  | 27 -> 43 MB/s per thread, bit-exact | [`15eea45d`](https://github.com/insenzaboor/victory-rtx3060/commit/15eea45d) |  |
 | Lock-free fast path for refreshes that copy nothing | 🟢 shipped | XaviFortes fdfb306d |  | ~15k of ~16k refreshes a frame copy nothing; part of run 48/49 gains | [`4884d2a7`](https://github.com/insenzaboor/victory-rtx3060/commit/4884d2a7) |  |
-| Page mapping on 8 threads (kept, measured) | 🟢 shipped | ours |  | A/B run 48: 30.9 vs 37.7 ms per 1k draws with 1 thread |  |  |
 | Descriptor heap GPU start cached | 🔵 on, untested | aleksesipenko 41d8a1e |  | Small per-draw saving | [`31e16a63`](https://github.com/insenzaboor/victory-rtx3060/commit/31e16a63) | [#1](https://github.com/insenzaboor/victory-rtx3060/issues/1) |
 | Plain release build (no diagnostics) | 🔵 ready to test | cool_fox / CGBJ |  | Builds clean; autopilot keys now work in release builds | [`ca28c339`](https://github.com/insenzaboor/victory-rtx3060/commit/ca28c339) | [#2](https://github.com/insenzaboor/victory-rtx3060/issues/2) |
 | Per-thread lookup cache for host copies | 🔵 ready to test | fxceless 32be36d + bc6ee68 | `VICTORY_LOOKUP_CACHE=1` | Claimed -8 to -15 ms/frame on RTX 4070 | [`e1ac4e47`](https://github.com/insenzaboor/victory-rtx3060/commit/e1ac4e47) | [#3](https://github.com/insenzaboor/victory-rtx3060/issues/3) |
 | Audio decoded on a worker thread | 🔵 ready to test | ours | `VICTORY_APU_ASYNC=1` | Opus decode was ~5% of title thread time (run 52 profile) | [`c6ed52d8`](https://github.com/insenzaboor/victory-rtx3060/commit/c6ed52d8) | [#4](https://github.com/insenzaboor/victory-rtx3060/issues/4) |
 | Joined submissions 16 parts / 96 lists | ⬜ planned | Maykzera (RTX 3060) | `VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96` | 1% low +18%, P99 -15% on an RTX 3060 |  | [#5](https://github.com/insenzaboor/victory-rtx3060/issues/5) |
+| Page mapping threads: 8 (default) vs 1 | ⚪ no gain (off) | ours |  | A/B run 48 with the first minute of streaming excluded: 31.0 vs 32.2 ms per 1k draws (noise); 8 kept. An earlier reading of 30.9 vs 37.7 included streaming phases. |  |  |
 | Renderer port 7: heap journal | ⚪ no gain (off) | avatarmanz | `VICTORY_PORT_JOURNAL` | A/B run 49: 24.4 vs 24.8 ms per 1k draws |  |  |
 | Settle room | ⚪ no gain (off) | fxceless | `VICTORY_SETTLE_ROOM` | A/B run 49: no difference |  |  |
 | Placed order | ⚪ no gain (off) | Vice-Tay | `VICTORY_PLACED_ORDER` | A/B run 48: 39.0 vs 37.7 ms per 1k draws (worse) |  |  |
