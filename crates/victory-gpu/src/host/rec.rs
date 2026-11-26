@@ -47,16 +47,61 @@ pub(crate) struct Rec {
     /// Uses of the list since its last reset ([`Rec::take_calls`]): about
     /// the commands recorded, which its allocator keeps room for.
     calls: AtomicU32,
+    /// `calls` when the last wait for every earlier shader write was
+    /// recorded ([`Rec::wait_for_writes`]); `u32::MAX`: none since the reset.
+    last_wait: AtomicU32,
+}
+
+/// Since the last frame-rate line: waits for every earlier shader write
+/// recorded, and those left out for nothing recorded since the one before.
+pub(crate) static WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a wait for every earlier shader write with nothing recorded on
+/// the list since the last such wait is left out (`VICTORY_DEDUPE_WAITS`, on
+/// unless `0`; A/B-able). Every use of the list goes through [`Rec`]'s
+/// `Deref` and counts, so equal counts mean no draw, dispatch, copy or other
+/// command between the two: the second waits for nothing the first did not.
+/// Each one drains the card's pipeline; run twentyfour recorded 769 a frame
+/// for the title's syncs and barrier groups alone.
+fn dedupe_waits() -> bool {
+    crate::toggled!("VICTORY_DEDUPE_WAITS")
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())), calls: AtomicU32::new(0) }
+        Self {
+            list,
+            any: AtomicBool::new(false),
+            held: Mutex::new(Held(Vec::new())),
+            calls: AtomicU32::new(0),
+            last_wait: AtomicU32::new(u32::MAX),
+        }
     }
 
     /// Uses since the last reset, counted again from zero.
     pub(crate) fn take_calls(&self) -> u32 {
+        self.last_wait.store(u32::MAX, Relaxed);
         self.calls.swap(0, Relaxed)
+    }
+
+    /// Records `barrier`, a wait for every earlier shader write (a UAV
+    /// barrier naming no resource), unless the last such wait on this list
+    /// came with nothing recorded since ([`dedupe_waits`]). Whether it was
+    /// recorded.
+    ///
+    /// # Safety
+    /// As [`Rec::barriers`].
+    pub(crate) unsafe fn wait_for_writes(&self, barrier: &D3D12_RESOURCE_BARRIER) -> bool {
+        let now = self.calls.load(Relaxed);
+        if now != u32::MAX && self.last_wait.load(Relaxed) == now && dedupe_waits() {
+            WAITS[1].fetch_add(1, Relaxed);
+            return false;
+        }
+        // SAFETY: the caller's.
+        unsafe { self.barriers(std::slice::from_ref(barrier)) };
+        self.last_wait.store(now, Relaxed);
+        WAITS[0].fetch_add(1, Relaxed);
+        true
     }
 
     /// Uses since the last reset.
@@ -149,6 +194,12 @@ pub(crate) fn line(frames: f64) {
     if asked > 0.0 {
         tracing::info!(
             "barrier calls per frame (VICTORY_JOIN_BARRIERS): {asked:.0} asked for, {made:.0} made of them"
+        );
+    }
+    let [kept, left] = [0, 1].map(|i| WAITS[i].swap(0, Relaxed) as f64 / frames);
+    if kept + left > 0.0 {
+        tracing::info!(
+            "waits for every earlier shader write per frame (VICTORY_DEDUPE_WAITS): {kept:.0} recorded, {left:.0} left out (nothing recorded since the one before)"
         );
     }
 }
