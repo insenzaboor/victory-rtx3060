@@ -399,6 +399,13 @@ pub fn halves_on() -> bool {
     cfg!(test) || *ON.get_or_init(|| std::env::var_os("VICTORY_HALVES").is_some_and(|v| v == "1"))
 }
 
+/// Whether ray node tests answer "no hit" and read nothing
+/// (`VICTORY_BVH_NO_HIT=1` without `VICTORY_BVH_BUILDER=1`): part of the
+/// translation, so the shader cache keys on it when it is on.
+pub fn bvh_no_hit() -> bool {
+    lower::intersect::no_hit()
+}
+
 /// Whether an SDWA sign extension of a 16-bit result (dst_unused 1, sext,
 /// with WORD_0) copies bit 15 upward, and the reserved dst_unused 3 is
 /// refused (`VICTORY_SDWA_SEXT=1`; off by default: the upper word was zero,

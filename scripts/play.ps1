@@ -2,13 +2,21 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Build        target\diag (the default, the build all measurements are of) or target\release
+# -ProbeRays    with ray tracing off: the title's light probes are activated and their rays resolved as
+#               misses (no structure is built; every ray gets the title's sky result), which removes the
+#               violet or pink glow on bushes, trees and palms and the bright blue awnings (Op-lite
+#               victory-scarlett 50bd954). Costs frame time; the first start builds ~1,000 more pipelines.
+# -BakeWait     the title's character bake waits up to 10 s for the textures it picks (1.5 s otherwise):
+#               for faces or skin baked wrong after a cold start (Op-lite 50bd954's launcher setting)
+# -Build       target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$ProbeRays,
+    [switch]$BakeWait,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -24,6 +32,10 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($ProbeRays -and -not $RayTracing) {
+    $settings.VICTORY_ACTIVATE_RAYS = '1'; $settings.VICTORY_RT_RESOLVE = '1'; $settings.VICTORY_BVH_NO_HIT = '1'
+}
+if ($BakeWait) { $settings.VICTORY_BAKE_TEXTURES_MS = '10000' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

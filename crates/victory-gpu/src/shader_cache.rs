@@ -174,6 +174,15 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::interp_f16_fixes() {
             bytes.extend_from_slice(b"VICTORY_INTERP_F16_FIXES=1");
         }
+        // Likewise, only when on: ray node tests that answer "no hit"
+        // (`VICTORY_BVH_NO_HIT=1`, read at translation). It was not in the
+        // key, so with a warm cache the switch did nothing: the ray passes
+        // `scripts\play.ps1 -ProbeRays` turns on came from the cache as
+        // translated without it, walking whatever bytes lay where a
+        // structure would be.
+        if victory_shader::emit::bvh_no_hit() {
+            bytes.extend_from_slice(b"VICTORY_BVH_NO_HIT=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
