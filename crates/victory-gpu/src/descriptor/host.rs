@@ -173,6 +173,13 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Taken)>,
+    /// With `VICTORY_DYNAMIC_STRIPES=<n>` (1 or unset: none, `next` alone as
+    /// before): the dynamic slots in `n` parts, each with its own lock, the
+    /// search starting from its own cursor; a thread asks the part its
+    /// number picks first and the others after. Every recording thread takes
+    /// `next` for every fresh table, with the search under it.
+    /// `(first slot, lock of (cursor, taken))`, `next` then unused.
+    stripes: Box<[(u32, Mutex<(u32, Taken)>)]>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1451,7 +1458,11 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize);
+            let at = index - host.count;
+            let taken = match host.stripe_of(at) {
+                Some((base, s)) => s.lock().unwrap_or_else(|e| e.into_inner()).1.get((at - base) as usize),
+                None => host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get(at as usize),
+            };
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1540,6 +1551,31 @@ static GIVEN: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64:
 pub(crate) struct Taken {
     words: Vec<u64>,
     len: usize,
+}
+
+/// The parts of `extra` dynamic slots ([`HostHeap::stripes`]): none unless
+/// `VICTORY_DYNAMIC_STRIPES` asks for 2 to 64, each part a multiple of 64
+/// slots (the last takes the rest).
+fn make_stripes(extra: u32) -> Box<[(u32, Mutex<(u32, Taken)>)]> {
+    static PARTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let parts = *PARTS.get_or_init(|| {
+        let n = std::env::var("VICTORY_DYNAMIC_STRIPES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).clamp(1, 64);
+        if n > 1 {
+            tracing::info!(parts = n, "dynamic descriptor slots in parts with locks of their own (VICTORY_DYNAMIC_STRIPES)");
+        }
+        n
+    });
+    let each = (extra / parts) & !63;
+    if parts < 2 || each < 4096 {
+        return Box::new([]);
+    }
+    (0..parts)
+        .map(|i| {
+            let base = i * each;
+            let len = if i + 1 == parts { extra - base } else { each };
+            (base, Mutex::new((0, Taken::new(len as usize))))
+        })
+        .collect()
 }
 
 impl Taken {
@@ -1859,6 +1895,7 @@ impl HostHeap {
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, Taken::new(extra as usize))),
+            stripes: make_stripes(if sampler { 0 } else { extra }),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1975,6 +2012,18 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        if !self.stripes.is_empty() {
+            let found = self.dynamic_striped(n);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                if found.is_none() {
+                    add(C::DynamicRefused, 1);
+                }
+                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+            }
+            return found;
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -2024,6 +2073,59 @@ impl HostHeap {
         GIVEN[0].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// [`HostHeap::dynamic`] with the slots in parts ([`HostHeap::stripes`]):
+    /// the thread's own part first, then the others in turn; a run never
+    /// crosses parts. `too_long` is set only when every part refused.
+    fn dynamic_striped(&self, n: u32) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.free.load(Relaxed) < n || n >= self.too_long.load(Relaxed) {
+            return None;
+        }
+        thread_local! {
+            static PART: usize = {
+                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            };
+        }
+        let parts = self.stripes.len();
+        let first_part = PART.with(|p| *p) % parts;
+        let want = n as usize;
+        for k in 0..parts {
+            let (base, lock) = &self.stripes[(first_part + k) % parts];
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (next, taken) = &mut *guard;
+            let end = taken.len;
+            if want > end {
+                continue;
+            }
+            let cursor = (*next as usize).min(end);
+            let second_end = cursor.saturating_add(want - 1).min(end);
+            let Some(first) = taken.find(cursor, end, want).or_else(|| taken.find(0, second_end, want)) else {
+                continue;
+            };
+            taken.set(first, first + want, true);
+            self.free.fetch_sub(n, Relaxed);
+            GIVEN[0].fetch_add(u64::from(n), Relaxed);
+            *next = ((first + want) % end) as u32;
+            return Some(self.count + base + first as u32);
+        }
+        self.too_long.fetch_min(n, Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(n, parts, "no free dynamic descriptor slots in any part (VICTORY_DYNAMIC_STRIPES): a table is not made"));
+        None
+    }
+
+    /// The part of the dynamic slots `at` (counted from the first dynamic
+    /// one) lies in, and its first slot; `None` without parts.
+    fn stripe_of(&self, at: u32) -> Option<(u32, &Mutex<(u32, Taken)>)> {
+        if self.stripes.is_empty() {
+            return None;
+        }
+        let i = self.stripes.partition_point(|(base, _)| *base <= at).checked_sub(1)?;
+        let (base, lock) = &self.stripes[i];
+        Some((*base, lock))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2892,10 +2994,15 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (base, lock) = match self.stripe_of(at) {
+            Some((base, s)) => (base, s),
+            None => (0, &self.next),
+        };
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if (at as usize) < end {
-            let given = guard.1.set(at as usize, end, false) as u32;
+            // (A run lies in one part: `dynamic` searches within parts.)
+            let given = guard.1.set((at - base) as usize, end - base as usize, false) as u32;
             GIVEN[1].fetch_add(u64::from(given), std::sync::atomic::Ordering::Relaxed);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
