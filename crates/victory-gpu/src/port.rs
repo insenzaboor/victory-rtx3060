@@ -263,8 +263,40 @@ pub(crate) fn forget(at: usize, len: usize) {
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).
 fn touches(at: usize, len: usize) -> bool {
+    touches_at(at as u64, len as u64)
+}
+
+/// [`touches`] of a title address.
+pub(crate) fn touches_at(at: u64, len: u64) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
-    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
+    hi != 0 && at < hi && at.saturating_add(len) > BOUNDS[0].load(Ordering::Relaxed)
+}
+
+/// With port #1: whether a constant buffer a draw's table names, in title
+/// memory in place on 256 bytes, is viewed there instead of copied into the
+/// list's upload memory at submission (`VICTORY_PORT_CBV_DIRECT=1`; off by
+/// default). XaviFortes 3c89cc40, where it is on with the port.
+///
+/// What changes: the card reads the constants as the title memory holds
+/// them when the draw runs, as the console's does, not as they were when
+/// the list was submitted. A title that rewrites a constant buffer before
+/// the draws that name it have run (it waits for the card on the console's
+/// fences, which ours keep, so it should not) would be seen. Unlike
+/// renderer port 5 (`crate::port_cbv`) it needs no raw twins for every
+/// slot: the slot is a constant buffer view, made as for a copy.
+pub(crate) fn cbv_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_PORT_CBV_DIRECT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: constant buffers viewed in place
+/// ([`cbv_direct`]), and their bytes.
+static DIRECT_CBV: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A constant buffer of `len` bytes viewed in place ([`cbv_direct`]).
+pub(crate) fn direct_cbv(len: u64) {
+    DIRECT_CBV[0].fetch_add(1, Ordering::Relaxed);
+    DIRECT_CBV[1].fetch_add(len, Ordering::Relaxed);
 }
 
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
@@ -309,6 +341,13 @@ pub(crate) fn log(frames: f64) {
         s[6],
         s[7],
     );
+    if cbv_direct() {
+        let n = DIRECT_CBV[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let kb = DIRECT_CBV[1].swap(0, Ordering::Relaxed) as f64 / (1024.0 * frames);
+        tracing::info!(
+            "renderer port 1, VICTORY_PORT_CBV_DIRECT=1: per frame {n:.0} constant buffers of draws' tables viewed in place ({kb:.1} KB not copied)"
+        );
+    }
 }
 
 #[cfg(test)]
