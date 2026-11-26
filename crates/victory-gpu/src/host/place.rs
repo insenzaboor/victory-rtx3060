@@ -92,9 +92,14 @@ impl Placed {
         if !free {
             return None;
         }
-        copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
+        let whole = copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
-        // Title memory that is not all there was left alone.
+        if whole {
+            return Some(bytes);
+        }
+        // Title memory that is not all there was left alone, or written piece
+        // by piece: what it holds now is read back. (Only then: the read and
+        // compare of up to 8 MiB was done after every such copy.)
         let mut there = vec![0u8; self.len];
         (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
     }

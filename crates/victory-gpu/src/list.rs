@@ -1651,9 +1651,12 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    // (Nothing to copy: no barriers recorded, the list's refreshes kept, as
+    // for `buffer_copy`.)
+    if len != 0
         && dst != 0
         && src != 0
+        && let Some(list) = host_list(this)
     {
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {

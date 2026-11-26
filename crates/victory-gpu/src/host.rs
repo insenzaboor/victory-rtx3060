@@ -873,6 +873,13 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Takes `n` back from a [`PREPARING`] count, down to 0 at most: the frame-rate
+/// line may have taken the count (`swap(0)`) since `n` was added, and a plain
+/// `fetch_sub` then wraps to a huge figure.
+fn preparing_take_back(count: &std::sync::atomic::AtomicU64, n: u64) {
+    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| Some(now.saturating_sub(n)));
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -8595,8 +8602,8 @@ impl Batch {
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
         let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
-        PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
-        PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
+        preparing_take_back(&PREPARING[2], summed[1]);
+        preparing_take_back(&PREPARING[0], summed[0]);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -8641,7 +8648,7 @@ impl Batch {
         });
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        preparing_take_back(&PREPARING[0], summed.saturating_sub(started.elapsed().as_micros() as u64));
         #[cfg(feature = "diagnostics")]
         {
             let ns = began.elapsed().as_nanos() as u64;
@@ -8690,7 +8697,7 @@ impl Batch {
         let due = std::mem::take(&mut self.due);
         crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
         let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        preparing_take_back(&PREPARING[2], summed.saturating_sub(started.elapsed().as_micros() as u64));
     }
 
     fn flush(&mut self) {
@@ -8772,7 +8779,7 @@ impl Batch {
                 crate::shadow::wide_run(jobs);
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            preparing_take_back(&PREPARING[0], summed.saturating_sub(started.elapsed().as_micros() as u64));
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -8793,19 +8800,23 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
-pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+///
+/// True if the kernel copied all of it in one piece: the destination then
+/// holds the source's bytes. False if it was left alone, or if some of it was
+/// copied piece by piece (some pieces may not have been written).
+pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) -> bool {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
-            return;
+            return true;
         }
-        2 => return,
+        2 => return false,
         _ => {}
     }
     if len == 0 {
-        return;
+        return true;
     }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
@@ -8818,7 +8829,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let ask_first = title_dst
         && *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"));
     if ask_first && !crate::texture::committed(dst, len) {
-        return;
+        return false;
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
@@ -8833,14 +8844,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
-        return;
+        return true;
     }
     // The copy failed: a source page is not there, or the destination is
     // not all mapped. Then the destination stays as it is (the kernel may
     // have written its first pages).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
         crate::watch::lost("a copy of the title's", dst as usize, len);
-        return;
+        return false;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
@@ -8853,6 +8864,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+    false
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
