@@ -2508,7 +2508,8 @@ fn wide_merge() -> bool {
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
-    /// As declared (title addresses), for the statistics.
+    /// As declared (title addresses), for the statistics and
+    /// `crate::wcback`.
     declared: (usize, usize),
     span: crate::shadow::CardSpan,
     /// Its first piece's dword in the compare's results.
@@ -5178,11 +5179,18 @@ impl Host {
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
+                    // `VICTORY_SKIP_WC_BACK` (off): what shaders wrote to
+                    // write-combining title memory stays on the card.
+                    let left = crate::wcback::skips(r.declared);
                     for p in 0..r.span.pieces {
                         if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        if left && lo < hi {
+                            crate::wcback::skipped((hi - lo) as u64);
+                            continue;
+                        }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
@@ -5560,11 +5568,17 @@ impl Host {
         let mut total = 0u64;
         plan.picked_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
+            // `VICTORY_SKIP_WC_BACK` (off), as in the landing above.
+            let left = crate::wcback::skips(r.declared);
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                if left && lo < hi {
+                    crate::wcback::skipped((hi - lo) as u64);
+                    continue;
+                }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;

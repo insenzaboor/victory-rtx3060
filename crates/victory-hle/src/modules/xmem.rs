@@ -230,6 +230,11 @@ fn virtual_alloc(
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
+    if !at.is_null() && constrained {
+        // With `VICTORY_SKIP_WC_BACK`: the protection the title asked for,
+        // write-combining included (the host's has none of it).
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
@@ -2115,6 +2120,9 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::layout_probe::title_freed(address as usize, size);
         victory_gpu::title_memory_freed(address as usize, size);
+        if kind & MEM_RELEASE != 0 {
+            victory_gpu::title_memory_released(address as usize);
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
