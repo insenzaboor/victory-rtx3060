@@ -2551,6 +2551,17 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Ranges given to shaders of a copy that is the title's own memory
+    /// ([`crate::shadow::Shadow::direct_read`], `VICTORY_UMA_DIRECT=1`):
+    /// nothing is refreshed into it, and this is what the submission still
+    /// has to know about them. By the copy's number: the copy, from, to.
+    /// ([`blocked_by`] reads it: a flight's shaders that may write such a
+    /// range are waited for, as for a refresh.)
+    direct: ByCopy<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Such ranges given in this recording: the count and the bytes, for the
+    /// diagnostic line (`inplace::say`).
+    direct_requests: u64,
+    direct_bytes: u64,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -2578,7 +2589,59 @@ struct Deferred {
     indirect_readable: usize,
 }
 
+#[cfg(test)]
+mod direct_tests {
+    use super::Deferred;
+
+    /// `VICTORY_UMA_DIRECT=1`: a copy that is the title's own memory is read
+    /// directly only with the switch, and never once shaders were declared to
+    /// write it; a host copy never is. The ranges a list's shaders read of
+    /// one are kept in the title's addresses, joined per copy, with their
+    /// count and bytes.
+    #[test]
+    fn direct_reads_are_kept_per_copy_in_the_titles_addresses() {
+        const LEN: usize = 0x1_0000;
+        let on = crate::inplace::direct_on();
+        let backing = vec![0u8; LEN];
+        let copy = crate::shadow::Shadow::unbacked(0x8_0000_0000, backing.as_ptr() as *mut u8, LEN as u64, false);
+        let placed = crate::shadow::Shadow::placed_unbacked(0x7_0000_0000, LEN as u64);
+        assert!(!copy.direct_read(), "a host copy is never direct");
+        assert_eq!(placed.direct_read(), on, "in place and unwritten: the switch alone says");
+        let mut deferred = Deferred::default();
+        deferred.direct_read(&placed, 0x7_0000_0100, 0x100);
+        deferred.direct_read(&placed, 0x7_0000_0000, 0x40);
+        assert_eq!(deferred.direct_span(&placed), Some((0x7_0000_0000, 0x7_0000_0200)));
+        assert!(deferred.direct_span(&copy).is_none());
+        assert_eq!((deferred.direct_requests, deferred.direct_bytes), (2, 0x140));
+        assert_eq!(deferred.steps(), 0, "nothing is recorded as a step");
+    }
+}
+#[cfg(test)]
 impl Deferred {
+    /// Where `shadow`'s range is in `direct`, if it is: from, to.
+    pub(crate) fn direct_span(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> Option<(usize, usize)> {
+        self.direct.get(&(shadow.id() as usize)).map(|&(_, from, to)| (from, to))
+    }
+
+    /// How many steps the list recorded (refreshes among them).
+    pub(crate) fn steps(&self) -> usize {
+        self.copies.len()
+    }
+}
+
+impl Deferred {
+    /// `bytes` at `at` of a copy that is the title's own memory are given to
+    /// the list's shaders (`VICTORY_UMA_DIRECT=1`): nothing is refreshed into
+    /// it, and the range is kept for the submission's wait ([`blocked_by`]).
+    fn direct_read(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, at: usize, bytes: usize) {
+        let end = at + bytes;
+        let span = self.direct.entry(shadow.id() as usize).or_insert_with(|| (shadow.clone(), at, end));
+        span.1 = span.1.min(at);
+        span.2 = span.2.max(end);
+        self.direct_requests += 1;
+        self.direct_bytes += bytes as u64;
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -3289,7 +3352,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     // Whether a copy at its place waits for flights if a step reads it.
     let mut placed = false;
     for list in runs {
-        for step in &list.deferred().copies {
+        let recording = list.deferred();
+        // Ranges of the title's own memory given to the list's shaders
+        // (`VICTORY_UMA_DIRECT=1`, [`crate::shadow::Shadow::direct_read`]): a
+        // flight's shaders that may write them are waited for, exactly as for
+        // a refresh. Conservative on purpose: it may wait more than the copy
+        // would have needed.
+        if recording.direct.values().any(|&(_, from, to)| touches(written, from, to)) {
+            return Some(WHY_READ);
+        }
+        for step in &recording.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -7361,6 +7433,7 @@ impl HostList {
         {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
+                && deferred.direct.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
@@ -7482,6 +7555,13 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        // The title's own memory, read by the shaders themselves: there is
+        // nothing to bring up to date (`VICTORY_UMA_DIRECT=1`,
+        // [`crate::shadow::Shadow::direct_read`]).
+        if shadow.direct_read() {
+            deferred.direct_read(shadow, address, len);
+            return;
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -7896,6 +7976,14 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        // What `VICTORY_UMA_DIRECT` kept out of the steps: counted for the
+        // diagnostic line (`inplace::say`).
+        {
+            let recording = self.deferred();
+            if recording.direct_requests != 0 {
+                crate::inplace::skipped(recording.direct_requests, recording.direct_bytes);
+            }
+        }
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {

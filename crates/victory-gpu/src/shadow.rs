@@ -3393,6 +3393,19 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Whether what shaders read of it is the title's own memory, with
+    /// nothing to refresh: in place (`crate::inplace`), never declared
+    /// written by shaders, and `VICTORY_UMA_DIRECT=1` (after
+    /// MoonYueya/VIctory-Kira 9223b21, from kelvaroq 0063-uma.patch).
+    ///
+    /// A refresh of such a copy copies nothing already (`Shadow::update`
+    /// returns 0 with a `place`): the step, the thread time and the
+    /// write-watch asking it costs are what goes. A copy shaders write stays
+    /// on the old path.
+    pub(crate) fn direct_read(&self) -> bool {
+        self.place.is_some() && !self.written() && crate::inplace::direct_on()
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -3488,6 +3501,12 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // With `VICTORY_UMA_DIRECT=1` still marked, not for a copy-back
+            // (there is none) but so that `direct_read` turns it down: a copy
+            // shaders write is not one whose reads skip their refresh.
+            if crate::inplace::direct_on() {
+                self.written.store(true, Ordering::Relaxed);
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4970,6 +4989,21 @@ impl Shadow {
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
+        let shadow = Arc::new(shadow);
+        std::mem::forget(shadow.clone());
+        shadow
+    }
+
+    /// A copy that is the title's own memory at `start` of `len` bytes, with
+    /// no buffer behind it: what `Shadow::placed` makes (`crate::inplace`),
+    /// for the tests that ask whether a range of it is refreshed.
+    pub(crate) fn placed_unbacked(start: u64, len: u64) -> Arc<Shadow> {
+        // SAFETY: two interface pointers nothing calls, as in `unbacked`.
+        let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let heap = || unsafe { std::mem::transmute::<usize, windows::Win32::Graphics::Direct3D12::ID3D12Heap>(8) };
+        let mut shadow = Shadow::new(none(), start as *mut u8, 0, start, len);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((heap(), 0));
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
         shadow
