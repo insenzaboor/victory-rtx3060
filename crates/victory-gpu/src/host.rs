@@ -3771,6 +3771,94 @@ fn land() {
     }
 }
 
+/// [`land`] at the end of a submission, on a thread of its own with
+/// `VICTORY_LAND_ASIDE=1` (off by default: here, as before; flips with the
+/// in-run A/B in diagnostics builds): resetting the lists of landed flights
+/// (`HostList::reset`, the host's and the driver's work on their allocators)
+/// is nothing the submission that follows waits for: it takes a list from
+/// the idle ones, or makes one. [`land`] is already called from the thread
+/// that settles flights as well, so it may run beside the submitting thread.
+/// `VICTORY_REAP` only moves the drops of what [`land`] lets go; the resets
+/// stayed on the submitting thread.
+///
+/// Lists not reset are lists not given back, and the next submissions make
+/// new ones: with more than [`land_aside_most`] flights landed and not given
+/// back beyond [`bury_lag`], this thread lands them too (said once).
+///
+/// From Peppacodes/playablegames-peppa cb412956 (fxceless/victory-fork pull
+/// request 1146, beamdotdev); the cap is ours.
+fn land_after_submission() {
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<()>>> = OnceLock::new();
+    let wanted = *WANTED.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let wanted = crate::ab::pick("VICTORY_LAND_ASIDE").unwrap_or(wanted);
+    if wanted {
+        let aside = ASIDE.get_or_init(|| {
+            let (send, asked) = std::sync::mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("victory-land-aside".to_owned())
+                .spawn(move || {
+                    while asked.recv().is_ok() {
+                        // One landing for all the asks so far.
+                        while asked.try_recv().is_ok() {}
+                        let _landing = crate::timeline::span("landed lists reset and given back");
+                        land();
+                    }
+                })
+                .ok()
+                .map(|_| send)
+        });
+        if let Some(send) = aside
+            && send.send(()).is_ok()
+        {
+            let landed = line().landed.len();
+            if !land_here_too(landed, bury_lag(), land_aside_most()) {
+                return;
+            }
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    landed,
+                    most = land_aside_most(),
+                    "VICTORY_LAND_ASIDE: more landed flights wait for their lists' reset than the most: the submitting thread lands them too (said once)"
+                );
+            }
+        }
+    }
+    let _landing = crate::timeline::span("landed lists reset and given back");
+    land();
+}
+
+/// The landed flights beyond [`bury_lag`] that may wait for the thread of
+/// [`land_after_submission`] (`VICTORY_LAND_ASIDE_MOST=<flights>`; 64 by
+/// default, some three frames of submissions).
+fn land_aside_most() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_LAND_ASIDE_MOST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64))
+}
+
+/// Whether the submitting thread lands too ([`land_after_submission`]):
+/// `landed` flights wait, [`land`] keeps `lag` of them, `most` more may wait.
+fn land_here_too(landed: usize, lag: u64, most: usize) -> bool {
+    landed > (lag as usize).saturating_add(most)
+}
+
+#[cfg(test)]
+mod land_aside_tests {
+    use super::land_here_too;
+
+    /// Up to the lag and the most more: left to the thread; past them: here too.
+    #[test]
+    fn past_the_lag_and_the_most_the_submitting_thread_lands() {
+        assert!(!land_here_too(0, 64, 64));
+        assert!(!land_here_too(128, 64, 64));
+        assert!(land_here_too(129, 64, 64));
+        assert!(land_here_too(1, 0, 0));
+        assert!(!land_here_too(usize::MAX, u64::MAX, usize::MAX));
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -5826,8 +5914,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
