@@ -1100,11 +1100,16 @@ fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own:
         ("our heap", own.iter().take(4).sum()),
     ];
     let (text, ours) = biggest(&kinds, 8);
+    // Of the PC's memory the card shares, what the kinds above do not hold:
+    // the driver's command memory of host lists, and upload buffers of ours
+    // outside the pools (texture uploads, descriptor data).
+    let pooled = shared[0].max(copies[1]) + upload[0] + (pool[1] << 20) + kinds[5].1 + kinds[6].1;
     let mb = |v: u64| v >> 20;
     tracing::info!(
         "memory, ours by kind, the biggest (MB, every {OURS_EVERY_S} s): {text}; in all {} of {} private, the rest {} is the \
          title's own heaps, the driver's and the runtime's; of the copies {} MB have a card side too (buffers {}, windows {}); \
-         host lists {} alive, {} idle; the card {} MB in use of {}, {} MB of the PC's memory shared with it \
+         host lists {} alive, {} idle; the card {} MB in use of {}, {} MB of the PC's memory shared with it, {} MB of that \
+         not in the kinds above (the driver's command memory, uploads outside the pools) \
          (VICTORY_POOL_PACK={}, VICTORY_LIST_LEAN={})",
         mb(ours),
         mb(private),
@@ -1117,6 +1122,7 @@ fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own:
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
+        mb(card[3].saturating_sub(pooled)),
         u8::from(crate::switch::on("VICTORY_POOL_PACK")),
         u8::from(crate::switch::on("VICTORY_LIST_LEAN")),
     );
