@@ -1263,6 +1263,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
+    crate::layout_probe::tick();
     if level() > 0 {
         say();
     }

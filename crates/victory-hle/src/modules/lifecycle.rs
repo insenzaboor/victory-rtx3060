@@ -423,6 +423,9 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // The layout probe's summary (`VICTORY_PROBE_LAYOUT`).
+    #[cfg(windows)]
+    victory_gpu::layout_probe::summary();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

@@ -676,6 +676,7 @@ unsafe fn piece_at(
     count(stat::MISSING, missing);
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
+    crate::layout_probe::landed(title, dwords * 4);
     dwords * 4
 }
 

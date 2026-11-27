@@ -3910,6 +3910,7 @@ pub(crate) fn install() {
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
+            crate::layout_probe::write_fault(at, true);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Another thread may have opened the block since this one faulted
@@ -3930,6 +3931,7 @@ pub(crate) fn install() {
             #[cfg(feature = "diagnostics")]
             let waited = _waited;
             if opened != 0 {
+                crate::layout_probe::write_fault(at, false);
                 // Renderer port #2's fallback says who wrote a block of the heap.
                 crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
                 #[cfg(feature = "diagnostics")]

@@ -91,14 +91,37 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
-    virtual_alloc(
+    let at = virtual_alloc(
         base,
         size,
         kind,
         flags,
         protect,
         victory_gpu::title_memory_allocated,
-    )
+    );
+    probe_virtual_alloc(base, size, kind, protect, at);
+    at
+}
+
+/// `VICTORY_PROBE_LAYOUT`: what kind of `XMemVirtualAlloc` gave `at`.
+fn probe_virtual_alloc(base: *mut c_void, size: usize, kind: u32, protect: u32, at: *mut c_void) {
+    use victory_gpu::layout_probe::{Origin, on, title_allocated};
+    if at.is_null() || !on() {
+        return;
+    }
+    let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
+    if placeholder && kind & MEM_REPLACE_PLACEHOLDER != 0 {
+        // Part of a placeholder the title split: nothing new.
+        return;
+    }
+    let origin = match (placeholder, base.is_null(), kind & MEM_COMMIT != 0) {
+        (true, _, _) => Origin::Placeholder,
+        (false, true, true) => Origin::VirtualCommit,
+        (false, false, true) => Origin::CommitInReservation,
+        (false, _, false) => Origin::VirtualReserve,
+    };
+    let start = if base.is_null() { at } else { base };
+    title_allocated(origin, start as usize, size, protect);
 }
 
 fn virtual_alloc(
@@ -326,7 +349,12 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
+            let at = alloc(size, attributes);
+            if !at.is_null() {
+                use victory_gpu::layout_probe::{Origin, title_allocated_coded};
+                title_allocated_coded(Origin::XMemAllocHooked, at as usize, size, attributes);
+            }
+            at
         }
     }
 }
@@ -345,14 +373,21 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    use victory_gpu::layout_probe::{Origin, title_allocated_coded};
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        // As `XMemVirtualAlloc`, counted as what it is.
+        let at = virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            victory_gpu::title_memory_allocated,
         );
+        if !at.is_null() {
+            title_allocated_coded(Origin::XMemAlloc32, at as usize, size, attributes);
+        }
+        return at;
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -374,6 +409,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        title_allocated_coded(Origin::XMemAllocHeap, user as usize, size, attributes);
         user.cast()
     }
 }
@@ -713,6 +749,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::layout_probe::title_allocated_coded(
+        victory_gpu::layout_probe::Origin::PhysicalPages,
+        0,
+        size,
+        flags,
+    );
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -1225,6 +1267,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    let probe = victory_gpu::layout_probe::remap_scope(victory_gpu::layout_probe::Remap::MapPhysicalPages);
+    probe.note(victory_gpu::layout_probe::Remap::MapPhysicalPages, base, n * PAGE, pages.is_none());
     if port_on()
         && let Some(pages) = &pages
     {
@@ -1284,6 +1328,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    let probe = victory_gpu::layout_probe::remap_scope(victory_gpu::layout_probe::Remap::Scatter);
+    if probe.counting() {
+        for i in 0..n {
+            // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+            let (address, page) = unsafe { (*addresses.add(i) as usize, if pages.is_null() { 0 } else { *pages.add(i) }) };
+            probe.note(victory_gpu::layout_probe::Remap::Scatter, address, PAGE, page == 0);
+        }
+    }
     lift_thread();
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
@@ -1321,6 +1373,8 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    let probe = victory_gpu::layout_probe::remap_scope(victory_gpu::layout_probe::Remap::CopyPageMappings);
+    probe.note(victory_gpu::layout_probe::Remap::CopyPageMappings, to, len, from == 0);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
@@ -1369,6 +1423,12 @@ pub(crate) static ALIASES_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    let probe = victory_gpu::layout_probe::remap_scope(victory_gpu::layout_probe::Remap::CopyPageMappings);
+    if probe.counting() {
+        for &(to, from, len) in ranges {
+            probe.note(victory_gpu::layout_probe::Remap::CopyPageMappings, to as usize, len as usize, from == 0);
+        }
+    }
     let _costed = Costed::begin(None);
     lift_thread();
     if side_by_side() <= 1 {
@@ -2053,6 +2113,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+        victory_gpu::layout_probe::title_freed(address as usize, size);
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
