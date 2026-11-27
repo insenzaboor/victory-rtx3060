@@ -390,7 +390,16 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
-fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+///
+/// `source`: the card only reads `[from, to)` there. Then title memory in
+/// place (`VICTORY_INPLACE`, renderer port 1) counts too with
+/// `VICTORY_INPLACE_CONSTANTS=1` ([`crate::inplace::constants_on`]): the
+/// card reads the title's own bytes, behind the flights that write them, as
+/// the console does. Without it such a read is refused and the submission
+/// waits for its flights (after Maykzera/victory-rtx3060 e67ab0708: ~2
+/// settles and 30-40 ms a frame on an RTX 3060, the fills of constants).
+/// What is written there by a copy is still refused.
+fn holder(writers: &[Writer], from: usize, to: usize, source: bool) -> Result<Arc<Shadow>, &'static str> {
     let mut found: Option<&Arc<Shadow>> = None;
     for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
         match (&w.shadow, found) {
@@ -404,7 +413,8 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
-    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+    let read_in_place = source && crate::inplace::constants_on();
+    if (shadow.in_place() && !read_in_place) || (from as u64) < start || to as u64 > start + len {
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
@@ -722,7 +732,7 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = holder(&writers, src, src + len, true)?;
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -745,7 +755,7 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = holder(&writers, dst, dst + len, false)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -1162,7 +1172,8 @@ mod tests {
     #[test]
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
-        assert!(holder(&writers, 104, 120).is_err());
+        assert!(holder(&writers, 104, 120, false).is_err());
+        assert!(holder(&writers, 104, 120, true).is_err());
     }
 
     /// Reads are all before writes, between two buffers and within one, and
