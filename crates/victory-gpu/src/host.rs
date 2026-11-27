@@ -5004,6 +5004,9 @@ impl Host {
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        // `VICTORY_LAND_NOT` (unset): the pieces the title sent
+                        // up land for a while.
+                        crate::landnot::title_sent(shadow.span(), ranges);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         // (Once for each buffer, however many copies lie in
@@ -5326,6 +5329,10 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if left && lo < hi {
                             crate::wcback::skipped((hi - lo) as u64);
+                            continue;
+                        }
+                        // `VICTORY_LAND_NOT` (unset): copies only shaders use.
+                        if lo < hi && crate::landnot::left_on_card(r.shadow.span(), lo, hi - lo) {
                             continue;
                         }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
@@ -5714,6 +5721,10 @@ impl Host {
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if left && lo < hi {
                     crate::wcback::skipped((hi - lo) as u64);
+                    continue;
+                }
+                // `VICTORY_LAND_NOT` (unset), as in the landing above.
+                if lo < hi && crate::landnot::left_on_card(r.shadow.span(), lo, hi - lo) {
                     continue;
                 }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
