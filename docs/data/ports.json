@@ -1208,6 +1208,17 @@
       "switch": "VICTORY_SUBMIT_STAGES=1",
       "commit": "82fdc2351",
       "effect": "Prints every 30 s on its own; q17 \"other\" was start-up time and \"Execute\" was a catch-all"
+    },
+    {
+      "id": "port-driver",
+      "title": "Stage 2b: the 32-bit heap's pages in a driver heap at their address, plus a shader-load self-test",
+      "category": "performance",
+      "status": "ready",
+      "source": "ours (stage 2b design) on XCL's driver heap",
+      "switch": "VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DRIVER=1",
+      "commit": "8026027b1",
+      "effect": "Self-test times dependent shader loads from card memory, driver heap, address import and file-mapping import: decides whether in-place reads can beat copies on this card",
+      "issue": 91
     }
   ]
 }

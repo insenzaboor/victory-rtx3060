@@ -47,14 +47,14 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 
 | | Category | Done | In flight | Planned |
 |---|---|---|---|---|
-| <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 29 | 15 | 2 |
+| <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 29 | 16 | 2 |
 | <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 2 | 10 | 3 |
 | <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 16 | 4 |
 | <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 9 | 0 |
 | <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 10 | 0 |
 | <img src="docs/assets/progress/tooling.svg" width="300"> | **Measurement and automation** | 6 | 4 | 0 |
 
-**44 of 117** items done or decided, **64** merged and waiting for a game run, **9** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
+**44 of 118** items done or decided, **65** merged and waiting for a game run, **9** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
 
 <!-- PROGRESS:END -->
 

@@ -8,7 +8,7 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 |---|---|---|
 | 🟢 shipped | On by default, verified in game runs | 24 |
 | 🔵 on, untested | On by default, merged, not yet verified in a game run | 18 |
-| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 46 |
+| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 47 |
 | 🟡 in progress | Being ported or built | 0 |
 | ⬜ planned | Designed or queued, not started | 9 |
 | ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 18 |
@@ -47,6 +47,7 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Heap-records round starts at the lock / at the title submit | 🔵 ready to test | foxhound 66f7e545e / d2e24b3bc | `VICTORY_HEAP_SYNC_FIRST=1 VICTORY_HEAP_SYNC_AT_SUBMIT=1` | Submit thread waited 2.7-5.8 ms for heap records | [`f07f15600`](https://github.com/insenzaboor/victory-rtx3060/commit/f07f15600) | [#87](https://github.com/insenzaboor/victory-rtx3060/issues/87) |
 | Port 5 without raw twins: constant buffers read through their own slot | 🔵 ready to test | adanaport 9d9803d97 | `VICTORY_PORT_CBV=1 VICTORY_PORT_CBV_SLOT=1` | adanaport: about -3 ms, 20.8 -> 22.3 fps | [`6eef27d50`](https://github.com/insenzaboor/victory-rtx3060/commit/6eef27d50) | [#88](https://github.com/insenzaboor/victory-rtx3060/issues/88) |
 | Driver-owned heap at the title address instead of imported heaps (XCL) | 🔵 ready to test | xcl-dev/xcl f2248f068 / f78e05bcc (GPL-3.0-or-later) | `VICTORY_UMA_DRIVER=1 VICTORY_INPLACE=1` | Ported from XCL (GPL-3.0-or-later, credited in docs/THIRD_PARTY.md); self-test passes on WARP; not yet run on the 3060 | [`1216e6373`](https://github.com/insenzaboor/victory-rtx3060/commit/1216e6373) | [#89](https://github.com/insenzaboor/victory-rtx3060/issues/89) |
+| Stage 2b: the 32-bit heap's pages in a driver heap at their address, plus a shader-load self-test | 🔵 ready to test | ours (stage 2b design) on XCL's driver heap | `VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DRIVER=1` | Self-test times dependent shader loads from card memory, driver heap, address import and file-mapping import: decides whether in-place reads can beat copies on this card | [`8026027b1`](https://github.com/insenzaboor/victory-rtx3060/commit/8026027b1) | [#91](https://github.com/insenzaboor/victory-rtx3060/issues/91) |
 | Joined submissions 16 parts / 96 lists | ⬜ planned | Maykzera (RTX 3060) | `VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96` | 1% low +18%, P99 -15% on an RTX 3060 |  | [#5](https://github.com/insenzaboor/victory-rtx3060/issues/5) |
 | In-place memory stages 1-3 (one heap per allocation, owned allocator, self-indexing descriptors) | ⬜ planned | ours (docs/design/in-place-memory.md) |  | q15 probe: 30% of copy traffic is ownable up front, 58% in physical-page views (33% of that is texture reads), 11.5% stays copied. Stage 2b design added. | [`ceae18c0`](https://github.com/insenzaboor/victory-rtx3060/commit/ceae18c0) | [#50](https://github.com/insenzaboor/victory-rtx3060/issues/50) |
 | Page mapping threads: 8 (default) vs 1 | ⚪ no gain (off) | ours |  | A/B run 48 with the first minute of streaming excluded: 31.0 vs 32.2 ms per 1k draws (noise); 8 kept. An earlier reading of 30.9 vs 37.7 included streaming phases. |  |  |
