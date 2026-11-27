@@ -29,14 +29,36 @@
 //! after the lane saw the wait met) begins after those writes: it sees all
 //! of them, as the round begun at the preparing did. What our own steps
 //! write into a heap's title memory while preparing moves the floor up for
-//! every submission prepared after it. Not covered (as not before, where the
-//! round raced the steps): shader writes landing in a heap's memory.
+//! every submission prepared after it. Shader writes landing in a heap's
+//! memory: a submission that waits for flights to land (sent ahead, before
+//! its preparing) is given a round that begins after the wait
+//! (`crate::host`, `descriptor::round_after_wait`), as without the switch;
+//! landings meanwhile are not covered (as not before, where the round raced
+//! them).
+//!
+//! `VICTORY_HEAP_SYNC_AT_SUBMIT=1` (off by default; a `VICTORY_AB` switch in
+//! diagnostics builds) turns on the heaps' records part alone, without the
+//! journal's: what trustno1-coder/VIctory-NVIDIA and readmet3xt-lab/foxhound
+//! took of it (d2e24b3bc, from Belobug 673be0e and a609a2f), where the
+//! submitting thread waited 2.7-5.8 ms a frame for the heaps' records.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Whether the switch is on (`crate::watch::port_journal`).
+/// Whether the heaps' records' part is on: the port's switch
+/// (`crate::watch::port_journal`), or [`at_submit`].
 pub(crate) fn on() -> bool {
-    crate::watch::port_journal()
+    crate::watch::port_journal() || at_submit()
+}
+
+/// `VICTORY_HEAP_SYNC_AT_SUBMIT=1`: the heaps' records asked for at the
+/// title's submit, without the journal's part of the port.
+fn at_submit() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_AT_SUBMIT") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_AT_SUBMIT").is_some_and(|v| v == "1"))
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +150,7 @@ pub(crate) fn heaps_waited(ns: u64, on: bool) {
 /// Whether the switch is on, or changes in this run (`VICTORY_AB`).
 fn named() -> bool {
     #[cfg(feature = "diagnostics")]
-    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
+    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() || crate::ab::bit("VICTORY_HEAP_SYNC_AT_SUBMIT").is_some() {
         return true;
     }
     on()
@@ -146,7 +168,7 @@ pub(crate) fn line(frames: f64) {
     // covers both).
     let (on_ms, off_ms) = (s[HEAPS_NS_ON] / 1e6 / f, s[HEAPS_NS_OFF] / 1e6 / f);
     tracing::info!(
-        "renderer port 7 (VICTORY_PORT_JOURNAL=1) per frame: heaps' records: the lane waited {on_ms:.2} ms ({:.1} preparings) with \
+        "renderer port 7 (VICTORY_PORT_JOURNAL=1, or VICTORY_HEAP_SYNC_AT_SUBMIT=1 for the heaps alone) per frame: heaps' records: the lane waited {on_ms:.2} ms ({:.1} preparings) with \
          the switch, {off_ms:.2} ms ({:.1}) without; {:.1} rounds asked for at the title's submit, {:.1} preparings found theirs \
          asked earlier, {:.1} asked it at the preparing, {:.1} had no mark; {:.1} preparings wrote a heap's memory; journal: {}",
         s[HEAPS_ON] / f,

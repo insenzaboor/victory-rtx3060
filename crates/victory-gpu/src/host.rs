@@ -3258,6 +3258,52 @@ fn heaps_early() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAPS_EARLY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a submission sent ahead ([`late`]) begins the round of the heaps'
+/// records (`crate::descriptor::begin_sync_heaps`) as soon as it holds the
+/// submission lock, before the steps done on the card are planned and
+/// flights are looked at (`VICTORY_HEAP_SYNC_FIRST=1`, or a `VICTORY_AB`
+/// switch; off by default: after them, as before).
+///
+/// From trustno1-coder/VIctory-NVIDIA and readmet3xt-lab/foxhound 66f7e545e:
+/// the submitting thread waited for those rounds at the end of its
+/// preparing, 2.7-5.8 ms a frame there (release run 233354), while the
+/// planning ahead of the round's start took 2-4 ms a frame.
+///
+/// How it differs from [`heaps_early`] (chabrune 144bd30, which it leaves
+/// alone and gives way to): only submissions sent ahead, and one that waits
+/// for flights to land (a settle, or the relay's wait for what it reads)
+/// is given a round that begins after the wait, as without the switch: the
+/// one begun first if its turn has not come yet, else another
+/// (`crate::descriptor::begin_sync_heaps_again`). With renderer port #7's
+/// heaps' part (`VICTORY_PORT_JOURNAL=1` or `VICTORY_HEAP_SYNC_AT_SUBMIT=1`)
+/// the round asked for at the title's submit comes earlier still: this
+/// switch serves only submissions that have none (as in foxhound).
+///
+/// Overlap with the other heap-sync switches: `VICTORY_SYNC_IN_PLACE`,
+/// `VICTORY_SPANS_QUICK` (both on by default) and `VICTORY_SYNC_FINE` make a
+/// round cheaper; this one only moves its start. They add up.
+///
+/// Not neutral in timing: the round reads the heaps' pages earlier, by the
+/// planning's time. A record the title writes for this submission after
+/// submitting it (which the console's card could miss as well) is left to
+/// the next round.
+fn heap_sync_first() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_FIRST") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`heap_sync_first`]: submissions
+/// whose round begun first was the one waited for; those that waited for
+/// flights and were given another; those that waited and whose first round
+/// had not begun yet (kept). Then, with renderer port #7's heaps' part
+/// (`VICTORY_PORT_JOURNAL` or `VICTORY_HEAP_SYNC_AT_SUBMIT`): submissions
+/// that waited for flights after their round had begun, given a later one.
+static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     let (written, copies) = {
         let line = line();
@@ -5004,6 +5050,9 @@ impl Host {
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        // `VICTORY_LAND_NOT` (unset): the pieces the title sent
+                        // up land for a while.
+                        crate::landnot::title_sent(shadow.span(), ranges);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         // (Once for each buffer, however many copies lie in
@@ -5326,6 +5375,10 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if left && lo < hi {
                             crate::wcback::skipped((hi - lo) as u64);
+                            continue;
+                        }
+                        // `VICTORY_LAND_NOT` (unset): copies only shaders use.
+                        if lo < hi && crate::landnot::left_on_card(r.shadow.span(), lo, hi - lo) {
                             continue;
                         }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
@@ -5714,6 +5767,10 @@ impl Host {
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if left && lo < hi {
                     crate::wcback::skipped((hi - lo) as u64);
+                    continue;
+                }
+                // `VICTORY_LAND_NOT` (unset), as in the landing above.
+                if lo < hi && crate::landnot::left_on_card(r.shadow.span(), lo, hi - lo) {
                     continue;
                 }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
@@ -6188,6 +6245,15 @@ impl Host {
         // default because a flight landed while waiting could still write
         // title memory that holds records.
         let heaps_early = heaps_early().then(crate::descriptor::begin_sync_heaps);
+        // Renderer port #7: the round asked for when the title submitted it,
+        // if that is known (0 if not, or the port is off). (Known here as well
+        // as below: what moves it up is written by the preparing's steps.)
+        let heaps_mark = crate::port_journal::needed();
+        // With [`heap_sync_first`] (off), for a submission sent ahead with no
+        // round asked at its submit: as `heaps_early`, again after a wait for
+        // flights below.
+        let first_heaps =
+            (heaps_early.is_none() && heaps_mark == 0 && late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -6197,11 +6263,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        let mut waited_for_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_for_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -6221,10 +6289,29 @@ impl Host {
         // or the one begun early (`VICTORY_HEAPS_EARLY`).
         crate::submit_stages::mark(crate::submit_stages::Stage::Descriptors);
         let heaps_on = crate::port_journal::on();
-        let heaps_synced = match (heaps_early, crate::port_journal::needed()) {
-            (Some(early), _) => early,
-            (None, 0) => crate::descriptor::begin_sync_heaps(),
-            (None, mark) => crate::descriptor::begin_sync_heaps_after(mark),
+        let heaps_synced = match (heaps_early, first_heaps, heaps_mark) {
+            (Some(early), _, _) => early,
+            // `VICTORY_HEAP_SYNC_FIRST`: begun as the lock was taken.
+            (None, Some(first), _) if !waited_for_flights => {
+                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                first
+            }
+            // What the flights landed may be records: a round that begins
+            // after the wait (the first, if it has not begun yet).
+            (None, Some(first), _) => {
+                let (round, again) = crate::descriptor::begin_sync_heaps_again(first);
+                HEAP_SYNC_FIRST[if again { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+                round
+            }
+            (None, None, 0) => crate::descriptor::begin_sync_heaps(),
+            // Renderer port #7, after a wait for flights: likewise (as
+            // foxhound's VICTORY_HEAP_SYNC_AT_SUBMIT, d2e24b3bc).
+            (None, None, mark) if waited_for_flights => {
+                let after = crate::descriptor::round_after_wait(mark);
+                HEAP_SYNC_FIRST[3].fetch_add(u64::from(after != mark), Ordering::Relaxed);
+                crate::descriptor::begin_sync_heaps_after(after)
+            }
+            (None, None, mark) => crate::descriptor::begin_sync_heaps_after(mark),
         };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -8484,6 +8571,18 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    let first = HEAP_SYNC_FIRST.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    if first.iter().sum::<f64>() > 0.0 {
+        tracing::info!(
+            "the heaps' records begun as a submission took the lock, per frame (VICTORY_HEAP_SYNC_FIRST=1): {:.1} waited for as \
+             begun, {:.1} begun again after a wait for flights, {:.1} kept over such a wait (not begun yet); asked at the title's \
+             submit (port 7) and begun before a wait for flights, so a later one: {:.1}",
+            first[0],
+            first[1],
+            first[2],
+            first[3]
+        );
+    }
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
@@ -8981,9 +9080,23 @@ fn wide_fills() -> bool {
 /// buffer then holds (`texture.rs`, `dirty`) may come ahead of the refresh
 /// an earlier list of the submission asked for, not behind it. The texture
 /// is then uploaded by a later list too, once more than needed.
+///
+/// This is what fxceless/victory-fork ceb9e1f7a calls
+/// `VICTORY_PARALLEL_REFRESH=1` (a submission's texture checks gathered
+/// between writes of ours and run on the helper pool: -8.7 / -9.4 ms of the
+/// preparing thread at equal draws on an RTX 4070 + i7-14700KF); ours came
+/// earlier (151816ce) and is on by default where [`wide_refresh`] is. With
+/// the in-run A/B (`VICTORY_AB=<s>,VICTORY_WIDE_TEXTURES`, diagnostics builds)
+/// it flips while the title runs, to measure it on one machine; a flip in the
+/// middle of a submission only moves where its textures are checked (one
+/// noted due is checked at the next flush either way). It stays off without
+/// [`wide_refresh`].
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh());
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_WIDE_TEXTURES").map_or(on, |picked| picked && wide_refresh());
+    on
 }
 
 impl Batch {

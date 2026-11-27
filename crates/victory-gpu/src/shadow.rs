@@ -1745,10 +1745,13 @@ fn wide_priority() -> bool {
     on
 }
 
-/// A thread that helps the submitting thread ([`wide`]; the pools of
-/// `crate::land` for the title's bytes under flights' writes and the heaps'
-/// records): its priority as [`wide_priority`] says, set when that changes.
-/// `above` is what it was set to.
+/// A thread that helps the submitting thread ([`wide`]; every pool of
+/// `crate::land`: landing, the title's bytes under flights' writes, the
+/// heaps' records, the views; the heap-sync thread, "victory-heap-sync"; the
+/// heap pass beside the lists, "victory-aside", as trustno1-coder/VIctory-NVIDIA
+/// 80c70b719 raises them, 8.6 -> 9.6 fps on an RTX 3060 + i5-12400F): its
+/// priority as [`wide_priority`] says, set when that changes. `above` is
+/// what it was set to.
 pub(crate) fn helper_priority(above: &mut bool) {
     let wanted = wide_priority();
     if wanted == *above {

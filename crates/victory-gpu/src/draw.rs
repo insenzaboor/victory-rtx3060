@@ -4173,9 +4173,21 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        // Renderer port 5: title memory in place is the
-                        // card's to read where it is; nothing is copied.
-                        if crate::port_cbv::in_place_on() {
+                        // Renderer port 5 without raw twins: the slot a raw
+                        // view of the bytes on whatever host copy holds
+                        // them, brought up to date as a buffer view's are
+                        // (`readable`); nothing is copied or done at
+                        // submission, and no step on the card waits for it.
+                        if crate::port_cbv::slot_on() {
+                            match crate::shadow::find(address, u64::from(size)) {
+                                Some(shadow) if host.constant_in_slot(index, &shadow.buffer, shadow.gpu(address), size) => {
+                                    shadow.refresh(list, address, u64::from(size));
+                                    crate::port_cbv::in_slot(size);
+                                    continue;
+                                }
+                                found => crate::port_cbv::copied(found.is_none()),
+                            }
+                        } else if crate::port_cbv::in_place_on() {
                             match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
                                 Some(shadow) => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
@@ -4203,7 +4215,11 @@ impl State {
                             continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            if crate::port_cbv::slot_on() {
+                                host.make_null_buffer(index);
+                            } else {
+                                host.make_null(index);
+                            }
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
@@ -4247,7 +4263,13 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        // (Without raw twins a constant buffer's slot is read
+                        // as a raw buffer.)
+                        if crate::port_cbv::slot_on() && used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            host.make_null_buffer(index);
+                        } else {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }

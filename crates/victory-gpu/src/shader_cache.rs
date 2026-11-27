@@ -207,6 +207,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::bvh_no_hit() {
             bytes.extend_from_slice(b"VICTORY_BVH_NO_HIT=1");
         }
+        // Renderer port 5's form on a host without raw twins: through the
+        // slots themselves (`VICTORY_PORT_CBV_SLOT=1`, only when on).
+        if victory_shader::emit::constants_in_slot() {
+            bytes.extend_from_slice(b"VICTORY_PORT_CBV_SLOT=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
