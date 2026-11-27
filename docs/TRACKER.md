@@ -1,17 +1,17 @@
 # Port tracker
 
-_Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/build.py` · updated 2026-11-26_ · **[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Project board](https://github.com/users/insenzaboor/projects/2)**
+_Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/build.py` · updated 2026-11-27_ · **[Live dashboard](https://insenzaboor.github.io/victory-rtx3060/)** · **[Project board](https://github.com/users/insenzaboor/projects/2)**
 
 ![overall](assets/progress/overall.svg)
 
 | Status | Meaning | Count |
 |---|---|---|
-| 🟢 shipped | On by default, verified in game runs | 23 |
-| 🔵 on, untested | On by default, merged, not yet verified in a game run | 13 |
-| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 42 |
+| 🟢 shipped | On by default, verified in game runs | 22 |
+| 🔵 on, untested | On by default, merged, not yet verified in a game run | 14 |
+| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 40 |
 | 🟡 in progress | Being ported or built | 0 |
 | ⬜ planned | Designed or queued, not started | 9 |
-| ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 14 |
+| ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 16 |
 | ⚫ n/a | Does not apply to NVIDIA / this title (documented why) | 2 |
 
 ## Frame time / CPU
@@ -25,7 +25,6 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Card buffers placed in heaps (reused pieces resent whole) | 🟢 shipped | ours | `VICTORY_CARD_HEAPS=64` | Part of run 36: 153 -> 138 ms at 3k draws | [`0d7ac684`](https://github.com/insenzaboor/victory-rtx3060/commit/0d7ac684) |  |
 | card_dirty looks only at copies noted as changed | 🟢 shipped | ours | `VICTORY_CARD_DIRTY_LIST=1` | Removes an atomic upgrade + swap per copy per submission (was 12% of the submit thread) | [`5caad0cb`](https://github.com/insenzaboor/victory-rtx3060/commit/5caad0cb) |  |
 | Structured views stay on their buffer's copy | 🟢 shipped | deynesdev 175ebc49 | `VICTORY_STRUCT_IN_PLACE=1` | Avoids ~19k extra copy buffers; renders correctly (run 37) | [`32d87b9a`](https://github.com/insenzaboor/victory-rtx3060/commit/32d87b9a) |  |
-| Renderer port 1: constants heap read in place | 🟢 shipped | avatarmanz | `VICTORY_PORT_CONSTANTS=1` | No uploads or fills of the 174 MB constants heap |  |  |
 | Renderer port 2: descriptor stores report their slots | 🟢 shipped | avatarmanz | `VICTORY_PORT_DESCRIPTORS=1` | Replaces a ~600,000-slot scan a frame |  |  |
 | Renderer port 6: shared guard lock, per-block claims | 🟢 shipped | avatarmanz | `VICTORY_PORT_GUARD=1` | Title threads' waits 29 -> ~2 ms a frame (upstream) |  |  |
 | Non-blocking logger | 🟢 shipped | ours |  | Logger lock stalls removed from frame chains | [`e72f733d`](https://github.com/insenzaboor/victory-rtx3060/commit/e72f733d) |  |
@@ -33,16 +32,15 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | BCPack decoder 1.56x | 🟢 shipped | ours |  | 27 -> 43 MB/s per thread, bit-exact | [`15eea45d`](https://github.com/insenzaboor/victory-rtx3060/commit/15eea45d) |  |
 | Lock-free fast path for refreshes that copy nothing | 🟢 shipped | XaviFortes fdfb306d |  | ~15k of ~16k refreshes a frame copy nothing; part of run 48/49 gains | [`4884d2a7`](https://github.com/insenzaboor/victory-rtx3060/commit/4884d2a7) |  |
 | Descriptor heap GPU start cached | 🔵 on, untested | aleksesipenko 41d8a1e |  | Small per-draw saving | [`31e16a63`](https://github.com/insenzaboor/victory-rtx3060/commit/31e16a63) | [#1](https://github.com/insenzaboor/victory-rtx3060/issues/1) |
+| Renderer port 1: constants heap read in place | 🔵 ready to test | avatarmanz | `VICTORY_PORT_CONSTANTS=1` | q21 (port 1 + inplace off): walk 22.9 ms per 1k draws vs 27.0 (q16), but killed at 1.0 GB free (rust-analyzer restarted mid-run). Re-test. |  |  |
 | Per-thread lookup cache for host copies | 🔵 ready to test | fxceless 32be36d + bc6ee68 | `VICTORY_LOOKUP_CACHE=1` | Claimed -8 to -15 ms/frame on RTX 4070 | [`e1ac4e47`](https://github.com/insenzaboor/victory-rtx3060/commit/e1ac4e47) | [#3](https://github.com/insenzaboor/victory-rtx3060/issues/3) |
 | Audio decoded on a worker thread | 🔵 ready to test | ours | `VICTORY_APU_ASYNC=1` | Opus decode was ~5% of title thread time (run 52 profile) | [`c6ed52d8`](https://github.com/insenzaboor/victory-rtx3060/commit/c6ed52d8) | [#4](https://github.com/insenzaboor/victory-rtx3060/issues/4) |
 | Residency wait for textures only | 🔵 ready to test | Belobug#346 | `VICTORY_WAIT_RESIDENT=textures` | Buffers skip the residency wait | [`4bd60465`](https://github.com/insenzaboor/victory-rtx3060/commit/4bd60465) | [#29](https://github.com/insenzaboor/victory-rtx3060/issues/29) |
 | Placed read-only title memory skips the refresh step | 🔵 ready to test | MoonYueya/VIctory-Kira 9223b21 / df6ef57 | `VICTORY_UMA_DIRECT=1` | Needs VICTORY_INPLACE 1 or 2 | [`6c4c341e`](https://github.com/insenzaboor/victory-rtx3060/commit/6c4c341e) | [#56](https://github.com/insenzaboor/victory-rtx3060/issues/56) |
-| One write-watch query per memory reservation | 🔵 ready to test | MoonYueya/VIctory-Kira ab8fae2 | `VICTORY_WATCH_RESERVATION=1` | kelvaroq: heavy frame 129 -> 110 ms | [`39ad907b`](https://github.com/insenzaboor/victory-rtx3060/commit/39ad907b) | [#57](https://github.com/insenzaboor/victory-rtx3060/issues/57) |
+| One write-watch query per memory reservation | 🔵 ready to test | MoonYueya/VIctory-Kira ab8fae2 | `VICTORY_WATCH_RESERVATION=1` | q17 inconclusive: preparing per 1k draws 24 -> 14.7 ms, but GPU wait doubled and the run had 2.1 GB free with a 133 MB/s page-in spike (47.8 ms per 1k draws walk). Re-test. | [`39ad907b`](https://github.com/insenzaboor/victory-rtx3060/commit/39ad907b) | [#57](https://github.com/insenzaboor/victory-rtx3060/issues/57) |
 | Wide-comparison thread count settable | 🔵 ready to test | MoonYueya/VIctory-Kira eb6dd4f | `VICTORY_WIDE_THREADS=<n>` | Unset keeps the old count | [`13c91ee7`](https://github.com/insenzaboor/victory-rtx3060/commit/13c91ee7) | [#60](https://github.com/insenzaboor/victory-rtx3060/issues/60) |
 | mimalloc as the Rust allocator (returns memory after 250 ms) | 🔵 ready to test | Peppacodes cd950293 (trustno1-coder PR 11 by Dastano) | `cargo feature mimalloc; VICTORY_ALLOC=system to undo` | Peppa: about -2 ms median on a 5080 | [`6c7cf94f`](https://github.com/insenzaboor/victory-rtx3060/commit/6c7cf94f) | [#62](https://github.com/insenzaboor/victory-rtx3060/issues/62) |
 | Shader writes to write-combining title memory stay on the card | 🔵 ready to test | Peppacodes 6035addd / 3cc0a8d6 / ca2432bd | `VICTORY_SKIP_WC_BACK=1 VICTORY_SKIP_WC_KEEP=1048576` | Peppa: -3.9 ms; without KEEP the picture breaks | [`6865100c`](https://github.com/insenzaboor/victory-rtx3060/commit/6865100c) | [#63](https://github.com/insenzaboor/victory-rtx3060/issues/63) |
-| Retired objects dropped on their own thread | 🔵 ready to test | Peppacodes 92b7cf93 (Steenax6) / e38bfb0d | `VICTORY_BURY_ASIDE=1 (cap VICTORY_BURY_ASIDE_MOST=131072)` | Peppa: -23 ms mean | [`a5a6dc5a`](https://github.com/insenzaboor/victory-rtx3060/commit/a5a6dc5a) | [#64](https://github.com/insenzaboor/victory-rtx3060/issues/64) |
-| Landed lists reset on their own thread | 🔵 ready to test | Peppacodes cb412956 (fxceless PR 1146, beamdotdev) | `VICTORY_LAND_ASIDE=1 (cap VICTORY_LAND_ASIDE_MOST=64)` | Peppa: -2 to -4 ms | [`00ef9237`](https://github.com/insenzaboor/victory-rtx3060/commit/00ef9237) | [#65](https://github.com/insenzaboor/victory-rtx3060/issues/65) |
 | Submit-thread helpers run above normal priority | 🔵 ready to test | Peppacodes a370bde6 | `VICTORY_WIDE_PRIORITY=1` | Peppa: -0.7 ms median; may starve title threads on 12 cores | [`8f43114d`](https://github.com/insenzaboor/victory-rtx3060/commit/8f43114d) | [#66](https://github.com/insenzaboor/victory-rtx3060/issues/66) |
 | Joined submissions 16 parts / 96 lists | ⬜ planned | Maykzera (RTX 3060) | `VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96` | 1% low +18%, P99 -15% on an RTX 3060 |  | [#5](https://github.com/insenzaboor/victory-rtx3060/issues/5) |
 | In-place memory stages 1-3 (one heap per allocation, owned allocator, self-indexing descriptors) | ⬜ planned | ours (docs/design/in-place-memory.md) |  | Estimate 3-6 ms/frame (stage 1), 10-20 ms with stage 2, 1-4 GB RAM; waits on probe numbers | [`ceae18c0`](https://github.com/insenzaboor/victory-rtx3060/commit/ceae18c0) | [#50](https://github.com/insenzaboor/victory-rtx3060/issues/50) |
@@ -58,6 +56,8 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Join parts (Spook) | ⚪ no gain (off) | SPOOKEXE | `VICTORY_JOIN_PARTS` | A/B run 33: noisy, no clear gain |  |  |
 | Skip ray-tracing passes | ⚪ no gain (off) | LoverCatys / deynesdev | `VICTORY_SKIP_RT` | Run 31: ~206 ms (worse) |  |  |
 | Refreshes skip 2 MiB chunks with no writes | ⚪ no gain (off) | Peppacodes 44d8d30 | `VICTORY_COLD_SKIP` | Not ported: Peppa lists it as tried without gain |  |  |
+| Retired objects dropped on their own thread | ⚪ no gain (off) | Peppacodes 92b7cf93 (Steenax6) / e38bfb0d | `VICTORY_BURY_ASIDE=1 (cap VICTORY_BURY_ASIDE_MOST=131072)` | q20 in-run A/B on the 3060: 31.5 vs 31.6 ms per 1k draws (noise); both on p50 118.7 vs 126.7 ms. Off. | [`a5a6dc5a`](https://github.com/insenzaboor/victory-rtx3060/commit/a5a6dc5a) | [#64](https://github.com/insenzaboor/victory-rtx3060/issues/64) |
+| Landed lists reset on their own thread | ⚪ no gain (off) | Peppacodes cb412956 (fxceless PR 1146, beamdotdev) | `VICTORY_LAND_ASIDE=1 (cap VICTORY_LAND_ASIDE_MOST=64)` | q20 in-run A/B on the 3060: within noise (31.5 vs 31.6 ms per 1k draws). Off. | [`00ef9237`](https://github.com/insenzaboor/victory-rtx3060/commit/00ef9237) | [#65](https://github.com/insenzaboor/victory-rtx3060/issues/65) |
 | Renderer port 5: constant buffers read in place | ⚫ n/a | avatarmanz | `VICTORY_PORT_CBV` | Needs a 4.2M-view heap; NVIDIA caps heaps at 1M |  |  |
 
 ## RAM and VRAM
@@ -133,6 +133,7 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Item | Status | Source | Switch | Effect | Commit | Issue |
 |---|---|---|---|---|---|---|
 | VICTORY_BVH_NO_HIT keyed into the shader cache | 🔵 on, untested | ours (found porting Op-lite 50bd954) | `VICTORY_BVH_NO_HIT` | With a warm cache the switch did nothing; now it applies (one cold retranslation) | [`50e3cffa`](https://github.com/insenzaboor/victory-rtx3060/commit/50e3cffa) | [#39](https://github.com/insenzaboor/victory-rtx3060/issues/39) |
+| Paired wave64 form: exact translation of the 27 refused shaders | 🔵 on, untested | MoonYueya/VIctory-Kira 243533d (from proneonn/Vertex 26600c6) | `VICTORY_WAVE_PAIRS=1` | Run q16 (3060): pipelines refused 6 -> 0, p99 787 -> 461 ms, fps 7.57 -> 8.03, 27.6 -> 27.0 ms per 1k draws; GPU wait 6.9 -> 12.6 ms. Now in the default set. | [`a297fad5`](https://github.com/insenzaboor/victory-rtx3060/commit/a297fad5) | [#55](https://github.com/insenzaboor/victory-rtx3060/issues/55) |
 | Loose-LDS forms of wave64 programs on 32-lane GPUs | 🔵 ready to test | deynesdev fab7fda | `VICTORY_WAVE_LDS_LOOSE=1` | Offline probe: all 27 wave64-only shaders translate (particles, decal trails, water volumetrics, hair shadows) | [`d157b329`](https://github.com/insenzaboor/victory-rtx3060/commit/d157b329) | [#18](https://github.com/insenzaboor/victory-rtx3060/issues/18) |
 | ds_bpermute within halves, 32 KiB LDS kept to | 🔵 ready to test | deynesdev fab7fda | `VICTORY_WAVE32_FIXES=1` | Exact pieces of the same commit | [`d157b329`](https://github.com/insenzaboor/victory-rtx3060/commit/d157b329) | [#19](https://github.com/insenzaboor/victory-rtx3060/issues/19) |
 | Split 64-lane masks treated as the mask | 🔵 ready to test | Th3C0D3R #1112 | `VICTORY_MASK_COPIES=1` | Translator correctness | [`2cf371ee`](https://github.com/insenzaboor/victory-rtx3060/commit/2cf371ee) | [#20](https://github.com/insenzaboor/victory-rtx3060/issues/20) |
@@ -141,7 +142,6 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | 16-bit halves through table views keep their bits | 🔵 ready to test | pr0vId3nce aa67414 / fxceless #927 | `VICTORY_HALVES=1` | Face animation buffers read as 0: mouths do not move, face specks (queue q13) | [`e95b92e1`](https://github.com/insenzaboor/victory-rtx3060/commit/e95b92e1) | [#41](https://github.com/insenzaboor/victory-rtx3060/issues/41) |
 | SDWA 16-bit sign extension; f16 interpolation modifiers | 🔵 ready to test | pr0vId3nce aa67414 | `VICTORY_SDWA_SEXT=1, VICTORY_INTERP_F16_FIXES=1` | A 16-bit -1 came out as 0x0000FFFF | [`0ff6698d`](https://github.com/insenzaboor/victory-rtx3060/commit/0ff6698d) | [#42](https://github.com/insenzaboor/victory-rtx3060/issues/42) |
 | f32 to f16 conversions round to nearest even everywhere | 🔵 ready to test | ours (XCL study lead) | `VICTORY_F16_NEAREST=1` | NVIDIA truncates (0x3c01) where the console rounds (0x3c02); verified on the RTX 3060 | [`7aed3d5a`](https://github.com/insenzaboor/victory-rtx3060/commit/7aed3d5a) | [#47](https://github.com/insenzaboor/victory-rtx3060/issues/47) |
-| Paired wave64 form: exact translation of the 27 refused shaders | 🔵 ready to test | MoonYueya/VIctory-Kira 243533d (from proneonn/Vertex 26600c6) | `VICTORY_WAVE_PAIRS=1` | Offline: 27/27 wave64-only shaders translate exactly and the driver builds all 27 pipelines; 106 approximate forms replaced too. Not yet seen in game | [`a297fad5`](https://github.com/insenzaboor/victory-rtx3060/commit/a297fad5) | [#55](https://github.com/insenzaboor/victory-rtx3060/issues/55) |
 | GS_VoxelizeGeneric (195 geometry shaders) | ⚫ n/a | design: MiamiGame/XTP |  | Never bound in 62 runs; design doc in docs/geometry-shaders.md | [`645819a2`](https://github.com/insenzaboor/victory-rtx3060/commit/645819a2) |  |
 
 ## Measurement and automation

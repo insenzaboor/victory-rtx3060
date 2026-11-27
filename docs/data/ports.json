@@ -1,5 +1,5 @@
 {
-  "updated": "2026-11-26",
+  "updated": "2026-11-27",
   "statuses": {
     "shipped": "On by default, verified in game runs",
     "default-untested": "On by default, merged, not yet verified in a game run",
@@ -71,10 +71,10 @@
       "id": "port1",
       "title": "Renderer port 1: constants heap read in place",
       "category": "performance",
-      "status": "shipped",
+      "status": "ready",
       "source": "avatarmanz",
       "switch": "VICTORY_PORT_CONSTANTS=1",
-      "effect": "No uploads or fills of the 174 MB constants heap"
+      "effect": "q21 (port 1 + inplace off): walk 22.9 ms per 1k draws vs 27.0 (q16), but killed at 1.0 GB free (rust-analyzer restarted mid-run). Re-test."
     },
     {
       "id": "port2",
@@ -929,11 +929,11 @@
       "id": "wave-pairs",
       "title": "Paired wave64 form: exact translation of the 27 refused shaders",
       "category": "shaders",
-      "status": "ready",
+      "status": "default-untested",
       "source": "MoonYueya/VIctory-Kira 243533d (from proneonn/Vertex 26600c6)",
       "switch": "VICTORY_WAVE_PAIRS=1",
       "commit": "a297fad5",
-      "effect": "Offline: 27/27 wave64-only shaders translate exactly and the driver builds all 27 pipelines; 106 approximate forms replaced too. Not yet seen in game",
+      "effect": "Run q16 (3060): pipelines refused 6 -> 0, p99 787 -> 461 ms, fps 7.57 -> 8.03, 27.6 -> 27.0 ms per 1k draws; GPU wait 6.9 -> 12.6 ms. Now in the default set.",
       "issue": 55
     },
     {
@@ -955,7 +955,7 @@
       "source": "MoonYueya/VIctory-Kira ab8fae2",
       "switch": "VICTORY_WATCH_RESERVATION=1",
       "commit": "39ad907b",
-      "effect": "kelvaroq: heavy frame 129 -> 110 ms",
+      "effect": "q17 inconclusive: preparing per 1k draws 24 -> 14.7 ms, but GPU wait doubled and the run had 2.1 GB free with a 133 MB/s page-in spike (47.8 ms per 1k draws walk). Re-test.",
       "issue": 57
     },
     {
@@ -1036,10 +1036,10 @@
       "id": "bury-aside",
       "title": "Retired objects dropped on their own thread",
       "category": "performance",
-      "status": "ready",
+      "status": "no-gain",
       "source": "Peppacodes 92b7cf93 (Steenax6) / e38bfb0d",
       "switch": "VICTORY_BURY_ASIDE=1 (cap VICTORY_BURY_ASIDE_MOST=131072)",
-      "effect": "Peppa: -23 ms mean",
+      "effect": "q20 in-run A/B on the 3060: 31.5 vs 31.6 ms per 1k draws (noise); both on p50 118.7 vs 126.7 ms. Off.",
       "issue": 64,
       "commit": "a5a6dc5a"
     },
@@ -1047,10 +1047,10 @@
       "id": "land-aside",
       "title": "Landed lists reset on their own thread",
       "category": "performance",
-      "status": "ready",
+      "status": "no-gain",
       "source": "Peppacodes cb412956 (fxceless PR 1146, beamdotdev)",
       "switch": "VICTORY_LAND_ASIDE=1 (cap VICTORY_LAND_ASIDE_MOST=64)",
-      "effect": "Peppa: -2 to -4 ms",
+      "effect": "q20 in-run A/B on the 3060: within noise (31.5 vs 31.6 ms per 1k draws). Off.",
       "issue": 65,
       "commit": "00ef9237"
     },
