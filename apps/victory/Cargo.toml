@@ -33,6 +33,10 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Rust allocations through mimalloc instead of the process heap the title and
+# the drivers share (victory-gpu's `heap`). Off by default: build with
+# `--features mimalloc`; VICTORY_ALLOC=system goes back for a run.
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true
