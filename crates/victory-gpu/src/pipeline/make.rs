@@ -109,7 +109,47 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`, unset by default: none;
+/// `VICTORY_SKIP_PIPELINES` drops draws in diagnostics builds only). Their
+/// draws and dispatches go without them, as those of the ray-tracing passes
+/// left out below. From readmet3xt-lab/foxhound 672442b7 (the decal heap's
+/// defrag, 02384a60fda6f2d0, 11.85 ms of the card a frame there) and
+/// trustno1-coder 35c156087 (the water's tiled light, 5dc3b25986622949 and
+/// 6f225b641c5b0708, in the wave-wide form on 32-lane hosts).
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let hashes = parse_leave_out(&std::env::var("VICTORY_LEAVE_OUT").unwrap_or_default());
+        if !hashes.is_empty() {
+            tracing::info!(?hashes, "pipelines with these shaders are left out (VICTORY_LEAVE_OUT)");
+        }
+        hashes
+    })
+}
+
+/// The 16-hex-digit shader hashes of a `VICTORY_LEAVE_OUT` value, lower case;
+/// anything else is passed over with a warning.
+fn parse_leave_out(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .filter(|h| {
+            let ok = h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit());
+            if !ok {
+                tracing::warn!(hash = %h, "VICTORY_LEAVE_OUT expects 16-digit shader hashes");
+            }
+            ok
+        })
+        .collect()
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let named_out = leave_out();
+    if !named_out.is_empty() && shaders.iter().any(|s| named_out.contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -962,6 +1002,17 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_LEAVE_OUT` takes 16-digit hashes in any case, with spaces
+    /// around them; anything else is passed over.
+    #[test]
+    fn leave_out_takes_sixteen_digit_hashes() {
+        assert!(parse_leave_out("").is_empty());
+        assert_eq!(
+            parse_leave_out(" 5DC3B25986622949 ,6f225b641c5b0708,,nothex0000000000,123"),
+            ["5dc3b25986622949", "6f225b641c5b0708"]
+        );
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
