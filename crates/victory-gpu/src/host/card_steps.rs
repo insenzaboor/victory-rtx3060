@@ -256,6 +256,25 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
 fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+    plan_with(does, stage, by_order, behind, fill_plan())
+}
+
+/// `VICTORY_FILL_PLAN=1` (off by default): [`plan`] takes fills that only
+/// read, and that no copy writes into, without looking for what is in their
+/// way (after adybag14-cyber/VIctory-RTX4090 83c7697). The plan is the same.
+fn fill_plan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_PLAN").is_some_and(|v| v == "1"))
+}
+
+/// [`plan`]; `fills_only`: [`fill_plan`].
+fn plan_with(
+    does: &[Does],
+    stage: u32,
+    by_order: bool,
+    behind: &mut Option<(usize, usize)>,
+    fills_only: bool,
+) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
@@ -264,13 +283,46 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     let mut taken = vec![false; does.len()];
     let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
+    // For `VICTORY_FILL_PLAN`: whether a copy is asked for, the bytes the
+    // asked fills read, and those every copy (asked or not) writes, each as
+    // one envelope.
+    let mut copy_asked = false;
+    let mut fill_reads = (usize::MAX, 0usize);
+    let mut destinations = (usize::MAX, 0usize);
+    let widen = |e: &mut (usize, usize), from: usize, len: usize| *e = (e.0.min(from), e.1.max(from.saturating_add(len)));
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
-            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
+            Does::Fill { src, len, asked: true, .. } => {
+                more.push(i);
+                widen(&mut fill_reads, src, len);
+            }
+            Does::Copy { dst, len, asked, .. } => {
+                if asked {
+                    more.push(i);
+                    copy_asked = true;
+                }
+                widen(&mut destinations, dst, len);
+            }
+            Does::Placed { dst, len, .. } => widen(&mut destinations, dst, len),
             _ => {}
         }
+    }
+    // Fills write no title memory: when only fills are asked for and no copy
+    // writes what they read, nothing is in their way and nothing is behind
+    // them, so they are all of level zero, as the expansion below would find
+    // (after adybag14-cyber/VIctory-RTX4090 83c7697; card-step planning was
+    // 5-9 ms a frame on Maykzera's RTX 3060). Envelopes that meet take the
+    // full path.
+    if fills_only && !copy_asked && !meet(fill_reads, destinations) {
+        for &i in &more {
+            takes(&does[i])?;
+        }
+        if more.len() > MOST {
+            return Err("too many steps depend on it");
+        }
+        return Ok(more.into_iter().map(|i| (i, 0)).collect());
     }
     while !more.is_empty() {
         // (Joined once for the round: one by one the 2,800 fills of a frame
@@ -977,6 +1029,37 @@ mod tests {
     /// What is done on the card, as (place, level), in stage 2.
     fn planned(does: &[Does]) -> Vec<(usize, u32)> {
         plan(does, 2, true, &mut None).unwrap()
+    }
+
+    /// `VICTORY_FILL_PLAN`: the shortcut plans what the full path plans, and
+    /// refuses what it refuses (after adybag14 83c7697's test).
+    #[test]
+    fn read_only_fills_plan_as_the_full_path_does() {
+        let steps = [
+            fill(100, 12, true),
+            copy(400, 100, 8, false),
+            Does::Placed { dst: 600, src: 104, len: 32 },
+            fill(112, 20, false),
+            fill(104, 8, true),
+        ];
+        let both = |does: &[Does], stage: u32, by_order: bool| {
+            let quick = plan_with(does, stage, by_order, &mut None, true);
+            assert_eq!(quick, plan_with(does, stage, by_order, &mut None, false), "{does:?}");
+            quick
+        };
+        for stage in [1, 2] {
+            for by_order in [false, true] {
+                assert_eq!(both(&steps, stage, by_order).unwrap(), [(0, 0), (4, 0)]);
+            }
+        }
+        // A copy writing into the asked fill's source still goes first.
+        assert_eq!(both(&[copy(108, 400, 8, false), steps[0]], 2, true).unwrap(), [(0, 0), (1, 1)]);
+        let mut many = vec![steps[0]; MOST];
+        assert_eq!(both(&many, 2, true).unwrap().len(), MOST);
+        many.push(steps[0]);
+        assert_eq!(both(&many, 2, true), Err("too many steps depend on it"));
+        many.push(Does::Fill { src: 100, len: 8, asked: true, to: false });
+        assert_eq!(both(&many, 2, true), Err("a fill of memory the card cannot be given the bytes of"));
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
