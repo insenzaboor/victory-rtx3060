@@ -1093,13 +1093,18 @@ fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own:
     LAST.store(now, Relaxed);
     let [shared, upload] = [&crate::pool::SHARED, &crate::pool::UPLOAD].map(crate::pool::Placed::held);
     let [buffers_on_card, windows_on_card] = crate::shadow::on_card_bytes();
+    // Copies in the card's memory without a CPU side
+    // (`VICTORY_CARD_NO_CPU_SIDE`): their title bytes are not held on the
+    // CPU, and leave the copies' kinds.
+    let side = crate::shadow::no_side_stats();
+    let (windows_cpu, all_cpu) = (copies[3].saturating_sub(side[4]), copies[1].saturating_sub(side[1] + side[4]));
     // Disjoint: the copies' CPU sides lie in the shared heaps (or are
     // allocations of their own), "unused" is the rest of the heaps; the
     // staging blocks hold the staging alive; our heap holds the snapshots,
     // shader containers and translations.
     let kinds = [
-        ("copies of windows (CPU side)", copies[3]),
-        ("copies of title buffers (CPU side)", copies[1].saturating_sub(copies[3])),
+        ("copies of windows (CPU side)", windows_cpu),
+        ("copies of title buffers (CPU side)", all_cpu.saturating_sub(windows_cpu)),
         ("shared heaps unused", shared[0].saturating_sub(shared[1])),
         ("upload heaps unused", upload[0].saturating_sub(upload[1])),
         ("texture staging blocks", pool[1] << 20),
@@ -1137,6 +1142,27 @@ fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own:
         u8::from(crate::switch::on("VICTORY_LIST_LEAN")),
         u8::from(crate::switch::on("VICTORY_PRELUDE_POOL")),
     );
+    if crate::shadow::card_no_cpu_side() {
+        tracing::info!("{}", no_side_line(side));
+    }
+}
+
+/// The memory line of `VICTORY_CARD_NO_CPU_SIDE`, of
+/// `crate::shadow::no_side_stats`.
+fn no_side_line(side: [u64; 8]) -> String {
+    let mb = |v: u64| v >> 20;
+    format!(
+        "memory, card copies without a CPU side (VICTORY_CARD_NO_CPU_SIDE=1): {} MB of CPU sides not held, {} copies (title \
+         buffers {} in {} MB, windows {} in {} MB); {} copies given their CPU side later for shader writes ({} MB)",
+        mb(side[2] + side[5]),
+        side[0] + side[3],
+        side[0],
+        mb(side[2]),
+        side[3],
+        mb(side[5]),
+        side[6],
+        mb(side[7]),
+    )
 }
 
 /// The `n` biggest of `kinds` (name, bytes) that are not zero, biggest
@@ -1151,6 +1177,14 @@ fn biggest(kinds: &[(&str, u64)], n: usize) -> (String, u64) {
 #[cfg(test)]
 mod ours_tests {
     use super::biggest;
+
+    #[test]
+    fn the_line_without_cpu_sides_counts_both_kinds() {
+        const MB: u64 = 1 << 20;
+        let line = super::no_side_line([3, 5 * MB, 6 * MB, 2, 4 * MB, 4 * MB, 1, 2 * MB]);
+        assert!(line.contains(": 10 MB of CPU sides not held, 5 copies (title buffers 3 in 6 MB, windows 2 in 4 MB); 1 copies"), "{line}");
+        assert!(line.ends_with("for shader writes (2 MB)"), "{line}");
+    }
 
     #[test]
     fn the_biggest_kinds_come_first_and_all_are_summed() {

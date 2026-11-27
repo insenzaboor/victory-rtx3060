@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::submit_stages::{self as stages, Stage};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -364,7 +366,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+            stages::during(Stage::FenceWait, || WaitForSingleObject(a.event, INFINITE));
         }
     }
     let us = started.elapsed().as_micros() as u64;
@@ -3834,6 +3836,7 @@ fn land() {
 /// From Peppacodes/playablegames-peppa cb412956 (fxceless/victory-fork pull
 /// request 1146, beamdotdev); the cap is ours.
 fn land_after_submission() {
+    let _stage = stages::enter(Stage::Recycle);
     static WANTED: OnceLock<bool> = OnceLock::new();
     static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<()>>> = OnceLock::new();
     let wanted = *WANTED.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"));
@@ -4002,6 +4005,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     if done(&line) {
         return;
     }
+    let _stage = stages::enter(Stage::RelayWait);
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
@@ -4362,6 +4366,12 @@ pub(crate) mod rec;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
+
+/// Whether the sends of copies in the card's memory are taken into memory of
+/// the submission's own (`VICTORY_SEND_OWN`).
+pub(crate) fn send_own() -> bool {
+    send::own()
+}
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -4960,6 +4970,26 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        // `VICTORY_CARD_NO_CPU_SIDE`: a copy without a CPU side that this
+        // submission's shaders may write (or that the structure builder may
+        // store in) is given one now, and goes up whole from it ahead of the
+        // lists, before its hashes are made below.
+        if crate::shadow::card_no_cpu_side() {
+            let wanting: Vec<Arc<crate::shadow::Shadow>> = declared
+                .iter()
+                .map(|d| d.0.clone())
+                .chain(looked.iter().map(|l| l.0.clone()))
+                .chain(crate::shadow::side_wanted())
+                .collect();
+            for shadow in wanting {
+                if let Some(whole) = shadow.card_side_now(sent_as) {
+                    match dirty.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &shadow)) {
+                        Some((_, ranges)) => *ranges = whole,
+                        None => dirty.push((shadow, whole)),
+                    }
+                }
+            }
+        }
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -5029,7 +5059,7 @@ impl Host {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some((Some(staging), _, _)) = side {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
@@ -5042,7 +5072,13 @@ impl Host {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() && up.is_none() {
+                        // (A copy without a CPU side has its sends taken into
+                        // the submission's own memory, `send::take`: the
+                        // switch is turned down without that.)
+                        if own.is_none()
+                            && up.is_none()
+                            && let Some(staging) = staging
+                        {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
@@ -5110,8 +5146,9 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
-                    list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    stages::during(Stage::Closing, || list.Close())?;
+                    let sending = [Some(list.cast()?)];
+                    stages::during(Stage::Execute, || self.queue.ExecuteCommandLists(&sending));
                     Ok(())
                 })()
             };
@@ -5217,7 +5254,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
-                    list.Close()?;
+                    stages::during(Stage::Closing, || list.Close())?;
                     list.cast()
                 })()
             };
@@ -5476,23 +5513,23 @@ impl Host {
                 for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
-                list.Close()?;
+                stages::during(Stage::Closing, || list.Close())?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
-                    queue.ExecuteCommandLists(&lists);
+                    stages::during(Stage::Execute, || queue.ExecuteCommandLists(&lists));
                     queue.Signal(&fence, sent)?;
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    stages::during(Stage::FenceWait, || WaitForSingleObject(event, INFINITE));
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                stages::during(Stage::Execute, || self.queue.ExecuteCommandLists(&lists));
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -5501,7 +5538,7 @@ impl Host {
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                stages::during(Stage::FenceWait, || WaitForSingleObject(event, INFINITE));
                 Ok(after)
             })()
         };
@@ -5800,14 +5837,15 @@ impl Host {
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
-                    list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    stages::during(Stage::Closing, || list.Close())?;
+                    let sending = [Some(list.cast()?)];
+                    stages::during(Stage::Execute, || self.queue.ExecuteCommandLists(&sending));
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    stages::during(Stage::FenceWait, || WaitForSingleObject(self.event, INFINITE));
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5929,6 +5967,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        let _noting = stages::enter(Stage::Noting);
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -5984,6 +6023,7 @@ impl Host {
         let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
             return 0;
         };
+        let _noting = stages::enter(Stage::Noting);
         let number = sent.number;
         {
             let mut line = line();
@@ -6042,6 +6082,7 @@ impl Host {
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
             return;
         }
+        let _landing = stages::enter(Stage::Landing);
         let was_working = working(true);
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
@@ -6075,7 +6116,7 @@ impl Host {
                             working(false);
                             #[cfg(feature = "diagnostics")]
                             let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
+                            stages::during(Stage::FenceWait, || WaitForSingleObject(self.event, INFINITE));
                             stood(waiting);
                             working(true);
                         }
@@ -6223,6 +6264,9 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // The stages below are this submission's; the caller's (the line, a
+        // present) runs again when it returns.
+        let _stages = stages::enter(Stage::Lock);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6231,6 +6275,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        stages::mark(Stage::Descriptors);
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6255,6 +6300,7 @@ impl Host {
         let first_heaps =
             (heaps_early.is_none() && heaps_mark == 0 && late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         stage.next("submit: steps given to the card");
+        stages::mark(Stage::CardSteps);
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -6263,6 +6309,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        // (What is read against what flights write; the waits are stages of
+        // their own.)
+        stages::mark(Stage::Watch);
         let mut waited_for_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
@@ -6287,7 +6336,7 @@ impl Host {
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`);
         // or the one begun early (`VICTORY_HEAPS_EARLY`).
-        crate::submit_stages::mark(crate::submit_stages::Stage::Descriptors);
+        stages::mark(Stage::Descriptors);
         let heaps_on = crate::port_journal::on();
         let heaps_synced = match (heaps_early, first_heaps, heaps_mark) {
             (Some(early), _, _) => early,
@@ -6324,6 +6373,7 @@ impl Host {
         };
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
         stage.next("submit: the sweep");
+        stages::mark(Stage::Sweep);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6348,6 +6398,7 @@ impl Host {
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
+        stages::mark(Stage::Watch);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -6392,7 +6443,6 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            crate::submit_stages::mark(crate::submit_stages::Stage::Watch);
             crate::watch::ask_once(&ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
@@ -6423,18 +6473,19 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        stages::mark(Stage::Refreshes);
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        crate::submit_stages::mark(crate::submit_stages::Stage::Deferred);
+        stages::mark(Stage::Deferred);
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for (_run, list) in runs.iter().enumerate() {
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some(prelude) = stages::during(Stage::Preludes, || list.prelude(&uploads)) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -6451,12 +6502,13 @@ impl Host {
         }
         batch.fill();
         stage.next("submit: the last refreshes");
+        stages::mark(Stage::Refreshes);
         batch.flush();
         crate::watch::ask_once_end();
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
-        crate::submit_stages::mark(crate::submit_stages::Stage::Snapshots);
+        stages::mark(Stage::Snapshots);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6470,7 +6522,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(3);
         stage.next("submit: copies in the card's memory");
-        crate::submit_stages::mark(crate::submit_stages::Stage::CardSetup);
+        stages::mark(Stage::CardSetup);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6501,9 +6553,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        stages::mark(Stage::HeapsWait);
         let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
         crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        stages::mark(Stage::Descriptors);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6511,7 +6565,7 @@ impl Host {
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
-        crate::submit_stages::mark(crate::submit_stages::Stage::Execute);
+        stages::mark(Stage::Execute);
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
@@ -6540,11 +6594,12 @@ impl Host {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
-                    crate::submit_stages::executing(to - from);
+                    stages::executing(to - from);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            stages::mark(Stage::Noting);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -6594,19 +6649,20 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        crate::submit_stages::mark(crate::submit_stages::Stage::Execute);
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
+            stages::mark(Stage::Execute);
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                crate::submit_stages::executing(group.len());
+                stages::executing(group.len());
                 self.card_sent();
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                stages::mark(Stage::Noting);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
@@ -6614,7 +6670,7 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
+                        stages::during(Stage::FenceWait, || WaitForSingleObject(self.event, INFINITE));
                         stood(started);
                         working(true);
                     }
@@ -6689,7 +6745,7 @@ impl Host {
         }
         submitting(3, runs.len());
         stage.next("submit: copying back");
-        crate::submit_stages::mark(crate::submit_stages::Stage::CopyBack);
+        stages::mark(Stage::CopyBack);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -7148,7 +7204,7 @@ impl HostList {
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        if let Err(e) = stages::during(Stage::Closing, || unsafe { self.list.Close() }) {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -7691,7 +7747,7 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
-                list.Close()
+                stages::during(Stage::Closing, || list.Close())
             })
         };
         if let Err(e) = recorded {
@@ -10263,6 +10319,22 @@ impl Meter {
                         per_frame(5),
                         per_frame(6) / 1e3
                     );
+                    if crate::shadow::card_no_cpu_side() {
+                        let side = crate::shadow::no_side_stats();
+                        let [read, runs] = [0, 1].map(|i| send::TITLE_READS[i].load(Ordering::Relaxed));
+                        tracing::info!(
+                            "host copies in the card's memory without a CPU side (VICTORY_CARD_NO_CPU_SIDE=1): {} of them, {} MB \
+                             of CPU sides not held; {} given their CPU side later for shader writes ({} MB); since the start {} MB \
+                             sent up from title memory in {} runs; upload ring kept {} MB",
+                            side[0] + side[3],
+                            (side[2] + side[5]) >> 20,
+                            side[6],
+                            side[7] >> 20,
+                            read >> 20,
+                            runs,
+                            crate::shadow::card_upload_ring_mb(),
+                        );
+                    }
                 }
                 crate::sampler::line();
                 let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
@@ -10631,7 +10703,7 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
-            copy.close();
+            stages::during(Stage::Closing, || copy.close());
             let flown = match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -10656,7 +10728,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = stages::during(Stage::SwapPresent, || p.swap_chain.Present(0, DXGI_PRESENT(0)));
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());

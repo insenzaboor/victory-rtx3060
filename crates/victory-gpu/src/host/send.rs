@@ -20,7 +20,7 @@
 //! stored by one dispatch per copy; the others as a copy each.
 
 use super::*;
-use crate::shadow::Shadow;
+use crate::shadow::{CardSource, Shadow};
 
 pub(super) fn own() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -122,9 +122,21 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 /// [`on_card`]. `VICTORY_SEND_SPARE_MB` sets it instead (`0`: none kept, all
 /// is freed when its submission has run). After DoubleGhosty/cool_fox
 /// 39318a8.
+///
+/// With `VICTORY_CARD_NO_CPU_SIDE` (`crate::shadow::card_no_cpu_side`) this
+/// memory is the ring the sends of copies without a CPU side go up through,
+/// straight from title memory: unless `VICTORY_SEND_SPARE_MB` says another,
+/// `VICTORY_CARD_UPLOAD_RING_MB` of it is kept (128 MiB unless set). A
+/// submission that sends more (the burst when the world loads, a copy that
+/// goes up whole) takes more for as long as it runs, as before.
 fn kept() -> u64 {
     static ASKED: OnceLock<Option<u64>> = OnceLock::new();
-    let asked = *ASKED.get_or_init(|| std::env::var("VICTORY_SEND_SPARE_MB").ok().and_then(|v| v.trim().parse().ok()));
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_SEND_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| crate::shadow::card_no_cpu_side().then(crate::shadow::card_upload_ring_mb))
+    });
     kept_for(asked, on_card())
 }
 
@@ -187,6 +199,10 @@ pub(super) fn give_back(memory: Memory) {
 /// microseconds of taking them out of the CPU sides.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the start: of the runs copied, the bytes read from title memory for
+/// copies without a CPU side, and the runs (`VICTORY_CARD_NO_CPU_SIDE`).
+pub(crate) static TITLE_READS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
 struct Copy {
@@ -229,31 +245,51 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    // Of copies without a CPU side (`crate::shadow::card_no_cpu_side`): read
+    // from title memory (its start and length, the offset, bytes, where to).
+    let mut reads: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    let mut work: Vec<(CardSource, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
-        let from = shadow.card_data() as usize;
-        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        let source = shadow.card_source();
+        match source {
+            CardSource::Side(from) => moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n))),
+            CardSource::Title(start, len) => {
+                reads.extend(copy.runs.iter().map(|&(a, to, n)| (start, len, a, n, memory.data + to as usize)));
+            }
+        }
         // (80,000 runs of some words a frame: in pieces of work.)
         let mut to = memory.data + copy.pairs.0 as usize;
         for ranges in ranges.chunks(RUNS_AT_A_TIME) {
             let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
             if words > 0 {
-                work.push((from, ranges, to));
+                work.push((source, ranges, to));
                 to += words * 8;
             }
         }
     }
     let one = |i: usize| {
-        let (from, ranges, to) = work[i];
+        let (source, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
+        // A run of title memory as read, for a copy without a CPU side.
+        let mut title = [0u8; SHORT];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
+            // Where the run's first word is.
+            let from = match source {
+                CardSource::Side(from) => from + a,
+                CardSource::Title(start, len) => {
+                    // SAFETY: `title` has room for a short run.
+                    unsafe { crate::shadow::title_run(start, len, a, b - a, title.as_mut_ptr()) };
+                    title.as_ptr() as usize
+                }
+            };
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
+                // ranges), or inside the run as read; and inside the memory,
+                // which has room for every pair, a piece of work's behind
+                // the last one's.
                 unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
+                    let word = ((from + offset - a) as *const u32).read_unaligned();
                     to.write([offset as u32, word]);
                     to = to.add(1);
                 }
@@ -261,9 +297,15 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         }
     };
     crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    let read: u64 = reads.iter().map(|r| r.3 as u64).sum();
+    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum::<u64>() + read, Ordering::Relaxed);
+    STATS[1].fetch_add((moves.len() + reads.len()) as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    if !reads.is_empty() {
+        TITLE_READS[0].fetch_add(read, Ordering::Relaxed);
+        TITLE_READS[1].fetch_add(reads.len() as u64, Ordering::Relaxed);
+        crate::shadow::title_runs(reads);
+    }
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })

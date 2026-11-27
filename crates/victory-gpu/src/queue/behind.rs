@@ -334,10 +334,12 @@ impl<W: Work> Lane<W> {
                 let mut state = self.lock();
                 while state.asked == state.served {
                     if state.items.is_empty() {
+                        crate::submit_stages::mark(crate::submit_stages::Stage::Idle);
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
+                        crate::submit_stages::mark(crate::submit_stages::Stage::Stalled);
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
@@ -348,6 +350,8 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
+            crate::submit_stages::mark(crate::submit_stages::Stage::Line);
+            crate::submit_stages::tick();
             self.look(limit);
             let mut state = self.lock();
             state.served = state.served.max(asked);
@@ -656,7 +660,7 @@ impl<W: Work> Lane<W> {
                 Some(ask) if !held && Instant::now() < until => {
                     held = true;
                     let waited = Instant::now();
-                    let free = W::hold(&ask, until);
+                    let free = crate::submit_stages::during(crate::submit_stages::Stage::Translation, || W::hold(&ask, until));
                     MERGE_STATS[MERGE_HELD_US].fetch_add(waited.elapsed().as_micros() as u64, Relaxed);
                     MERGE_STATS[if free { MERGE_HELD_MET } else { MERGE_HELD_OUT }].fetch_add(1, Relaxed);
                     if !free {
@@ -931,6 +935,7 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
+                let presenting = crate::submit_stages::enter(crate::submit_stages::Stage::Present);
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
@@ -941,6 +946,8 @@ impl Work for Job {
                     });
                     super::show_planes(&texture.texture, state, over, shown);
                 }
+                drop(presenting);
+                crate::submit_stages::presented();
                 QUEUED.fetch_sub(1, Relaxed);
             }
         }
