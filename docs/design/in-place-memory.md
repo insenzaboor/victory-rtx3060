@@ -384,7 +384,8 @@ no GPU access bits, budget, RAM, the driver).
 
 ## Stage 2b: physical pages in place
 
-Status: design, nothing built. Written from run q15 (RTX 3060, the default
+Status: steps 1 and 2 built (`VICTORY_PORT_DRIVER=1`, off by default),
+not yet run on a card. Written from run q15 (RTX 3060, the default
 switches with `VICTORY_PROBE_LAYOUT=1 VICTORY_INPLACE_PROBE=1`, port 1 off,
 6,976 frames; log `run-q15-layout-probe-20261127-122309.log.err`) and runs
 q16 and q21.
@@ -663,6 +664,16 @@ made before the world loads, so an A/B inside one run is not possible.
    Files: `uma_driver.rs` (+90), `inplace.rs` (`Rig::load_ms`, +60),
    `port.rs` and `xmem.rs` (the switch, +10). Done when one run logs the
    four load times.
+
+   *Built.* Every self-test line now begins `UMA self-test:`. The card's
+   steps are doubled from 16 until a run takes 5 ms; the other memories
+   double up to the card's steps and stop at 5 ms too (a run is at most
+   about twice the one before, so a very slow import never nears a device
+   timeout), and are scaled to the card's steps (marked `~`). The lines say
+   each time, the ratios against card memory and the driver heap, and
+   whether the file-mapping import reaches half the driver heap's speed
+   (option (a)'s decider). A refused opening is said as such; a device
+   removed meanwhile fails the test. On WARP all four read alike.
 2. **Level 1: the pages at home.** In `XMemMapPhysicalPages`, after
    `arrange`, the first map into a `LOW_RESERVATIONS` reservation whose
    section is as big as the reservation and wholly fresh calls a new
@@ -693,6 +704,24 @@ made before the world loads, so an A/B inside one run is not possible.
    Files: `xmem.rs` (+180), `uma_driver.rs` (+110). Done when the log says
    the 32-bit heap is a driver heap at its address, with no aliases, the
    probe's view faults drop, and the walk is no worse than level 0.
+
+   *Built.* `uma_driver::remake_reservation` shares the remake's steps
+   (`rebuild`); its release lets each placeholder go and puts back those
+   already let go if one refuses. With the switch the self-test also remakes
+   48 MB of its own placeholders, split in three (a failure there leaves
+   level 0, `VICTORY_UMA_DRIVER` as its own test said). The homes are a table
+   of their own, not `REGIONS`: `uma_driver::place_for` does not place in
+   them, and `port::place_for` and `inplace::place_for` leave them copied
+   (level 1 is copies only, whatever `VICTORY_INPLACE` says). Freshness is
+   the section's commit bits, which at home mean "touched" (maps, window
+   writes, and with the switch `View::map` writes), so `arrange` keeps
+   working for the four later maps. Pages written through the section's
+   window while the remake ran are copied home. A map into a home of a page
+   whose home is elsewhere is counted and left as the heap shows it (no
+   view can be made in a heap). A release of a home keeps the heap
+   (shortcut: the 32-bit heap is never released). Port 1's frame-rate line
+   is followed by a `VICTORY_PORT_DRIVER=1` line: homes, buffers there
+   copied, reservations refused (with the last reason), aliases, releases.
 3. **Level 2: port 1 in it.** `port::place_in` asks
    `uma_driver::place_for(start, len)` before `open_region`, so the title's
    buffers and windows there are buffers in the driver heap with no

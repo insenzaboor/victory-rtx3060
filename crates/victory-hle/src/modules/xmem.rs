@@ -489,11 +489,25 @@ struct Section {
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
-    /// A bit per page: committed, as far as [`Section::window`] asked.
+    /// A bit per page: committed, as far as [`Section::window`] asked. With a
+    /// [`Section::home`]: touched (mapped or written), which is what
+    /// [`arrange`] needs to know.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// `VICTORY_PORT_DRIVER`: the address of a driver heap where the
+    /// section's pages live, page `i` at home + `i` × 64 KiB ([`home_with`]);
+    /// its bytes, not the section's, are the pages from then on.
+    home: std::sync::OnceLock<usize>,
 }
 
 impl Section {
+    /// Pages `[index, index + n)` noted touched.
+    fn touch(&self, index: usize, n: usize) {
+        use std::sync::atomic::Ordering;
+        for p in index..(index + n).min(self.pages) {
+            self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+        }
+    }
+
     /// Where bytes of `n` pages from page `index` on can be written,
     /// whether or not the pages are mapped anywhere, committed.
     ///
@@ -509,6 +523,14 @@ impl Section {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
+        // At home (`VICTORY_PORT_DRIVER`): the pages are there.
+        if let Some(&home) = self.home.get() {
+            if index + n > self.pages {
+                return None;
+            }
+            self.touch(index, n);
+            return Some(home + index * PAGE);
+        }
         if !*ON || index + n > self.pages {
             return None;
         }
@@ -549,6 +571,12 @@ impl Section {
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
         use std::sync::atomic::Ordering;
+        // A view of a section whose pages live at home (an alias): its bits
+        // say touched, not committed, so it is committed here.
+        if self.home.get().is_some() {
+            self.touch(index, len / PAGE);
+            return counted(Call::Commit, || commit(base, len));
+        }
         let pages = index..(index + len / PAGE).min(self.pages);
         let bit = |p: usize| (&self.committed[p / 64], 1 << (p % 64));
         let done = || {
@@ -610,6 +638,9 @@ struct Physical {
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
     holes: HashMap<usize, usize>,
+    /// Pages mapped at their home ([`Section::home`]), by address: no view,
+    /// only this note (`VICTORY_PORT_DRIVER`).
+    homed: BTreeMap<usize, (usize, Slice)>,
 }
 
 impl Physical {
@@ -623,14 +654,16 @@ impl Physical {
 
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
-        self.views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
+        [&self.views, &self.homed].into_iter().find_map(|views| {
+            views
+                .range(..=at)
+                .next_back()
+                .filter(|(base, (size, _))| at < *base + size)
+                .map(|(base, (_, s))| Slice {
+                    index: s.index + (at - base) / PAGE,
+                    section: s.section.clone(),
+                })
+        })
     }
 }
 
@@ -798,6 +831,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        home: std::sync::OnceLock::new(),
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -871,6 +905,10 @@ impl View {
         if !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
+        }
+        // Written, so no longer fresh for a home ([`home_with`]).
+        if port_driver_asked() {
+            slice.section.touch(slice.index, n);
         }
         Some(view)
     }
@@ -1295,6 +1333,168 @@ fn arrange(base: usize, pages: &[usize]) {
     }
 }
 
+/// `VICTORY_PORT_DRIVER=1|2` with renderer port 1 (the GPU side's half is
+/// `victory_gpu::uma_driver`, which also needs its self-test passed): read
+/// here for xmem's part, [`home_with`]. Unset or anything else: as before.
+fn port_driver_asked() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        port_on() && std::env::var("VICTORY_PORT_DRIVER").is_ok_and(|v| matches!(v.trim(), "1" | "2"))
+    });
+    *ON
+}
+
+/// Reservations whose section's pages live at home in a driver heap
+/// ([`home_with`]): base and bytes.
+static HOMES: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+/// Whether [`HOMES`] has any (a quick look on every mapping).
+static ANY_HOME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Reservations [`home_with`] looked at already: once each.
+static HOME_TRIED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether `[at, at + len)` touches a home.
+fn in_home(at: usize, len: usize) -> bool {
+    ANY_HOME.load(Ordering::Acquire)
+        && HOMES.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(base, n)| at < base + n && base < at + len.max(1))
+}
+
+/// Why the pages of `section` cannot live at home in a reservation of
+/// `bytes`: `None` if they can (the section as big as it, every page
+/// fresh: never mapped, never written).
+fn not_homeable(section: &Section, bytes: usize, all_of_it: bool) -> Option<String> {
+    if on_wine() {
+        return Some("under Wine".to_owned());
+    }
+    if !all_of_it {
+        return Some("the pages are not all of one section".to_owned());
+    }
+    if section.pages * PAGE != bytes {
+        return Some(format!("the section has {} pages, the reservation {}", section.pages, bytes / PAGE));
+    }
+    if section.home.get().is_some() {
+        return Some("the section lives elsewhere already".to_owned());
+    }
+    if section.committed.iter().any(|w| w.load(Ordering::Acquire) != 0) {
+        return Some("pages of the section were mapped or written already".to_owned());
+    }
+    None
+}
+
+/// Before `pages` are mapped at `base` (after [`arrange`]): with
+/// `VICTORY_PORT_DRIVER`, the first map into a 32-bit graphics reservation
+/// ([`LOW_RESERVATIONS`]) whose pages are one section as big as it, wholly
+/// fresh, makes the reservation a driver heap at its address (`remake`,
+/// `victory_gpu::uma_driver::title_reservation`); the section's pages then
+/// live there, page `i` at the reservation's base + `i` × 64 KiB
+/// ([`Section::home`]), which is where [`arrange`] puts them. Maps at home
+/// make no view ([`map`]); a page of it mapped anywhere else is an alias.
+/// Once per reservation; the caller holds none of our locks.
+fn home_with(base: usize, pages: &[usize], remake: impl FnOnce(usize, usize) -> bool) {
+    let Some((first, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
+    else {
+        return;
+    };
+    {
+        let mut tried = HOME_TRIED.lock().unwrap_or_else(|e| e.into_inner());
+        if tried.contains(&first) {
+            return;
+        }
+        tried.push(first);
+    }
+    let (section, all_of_it) = {
+        let table = page_table();
+        let Some(section) = pages.first().and_then(|p| table.pages.get(p)).map(|s| s.section.clone()) else {
+            return;
+        };
+        let all = pages.iter().all(|p| table.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)));
+        (section, all)
+    };
+    if let Some(why) = not_homeable(&section, bytes, all_of_it) {
+        tracing::warn!(
+            at = format_args!("{first:#x}"),
+            mb = bytes >> 20,
+            why,
+            "renderer port 1, VICTORY_PORT_DRIVER: the 32-bit heap's pages stay views of their section"
+        );
+        return;
+    }
+    if !remake(first, bytes) {
+        return;
+    }
+    let _ = section.home.set(first);
+    HOMES.write().unwrap_or_else(|e| e.into_inner()).push((first, bytes));
+    ANY_HOME.store(true, Ordering::Release);
+    // Pages written into the section while the remake ran (through its
+    // window, before the home was set): into the heap.
+    let mut copied = 0;
+    if let Some(&window) = section.window.get()
+        && window != 0
+    {
+        for p in 0..section.pages {
+            if section.committed[p / 64].load(Ordering::Acquire) >> (p % 64) & 1 != 0 {
+                // SAFETY: a committed page of the section's view, and the
+                // same page of the heap's mapping.
+                unsafe { std::ptr::copy_nonoverlapping((window + p * PAGE) as *const u8, (first + p * PAGE) as *mut u8, PAGE) };
+                copied += 1;
+            }
+        }
+    }
+    tracing::info!(
+        at = format_args!("{first:#x}"),
+        mb = bytes >> 20,
+        copied,
+        "renderer port 1, VICTORY_PORT_DRIVER=1: the 32-bit heap's physical pages live at home in a driver heap, each at its offset; maps there make no views"
+    );
+}
+
+/// What `[base, base + len)`, in a home, shows from now on: `slice` and
+/// those after it, if that is where they live; then no view is made, only
+/// noted (bytes stay where they live). A page that lives elsewhere is an
+/// alias: said and left as the heap shows it.
+fn map_home(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    let at_home = slice.section.home.get().is_some_and(|&home| home + slice.index * PAGE == base);
+    if !at_home {
+        victory_gpu::uma_driver::home_alias(base, len, true);
+        return true;
+    }
+    slice.section.touch(slice.index, len / PAGE);
+    shown_mut().note(base, len, &slice);
+    // Write-watched memory, no view: copies of it go by the write watch.
+    victory_gpu::title_memory_remapped(base, len);
+    physical.homed.insert(base, (len, slice));
+    true
+}
+
+/// Forgets what is noted at home in `[base, base + len)`: the bytes stay,
+/// as a console page keeps them; what stays outside is noted again.
+fn unmap_home(physical: &mut Physical, base: usize, len: usize) {
+    let end = base + len;
+    let first = physical.homed.range(..=base).next_back().filter(|(at, (size, _))| *at + size > base).map(|(at, _)| *at);
+    let hit: Vec<usize> = first.into_iter().chain(physical.homed.range(base + 1..end).map(|(at, _)| *at)).collect();
+    for at in hit {
+        let Some((size, slice)) = physical.homed.remove(&at) else {
+            continue;
+        };
+        let (from, to) = (at.max(base), (at + size).min(end));
+        victory_gpu::title_memory_unmapping(from, to - from);
+        let mut shown = shown_mut();
+        shown.forget(at, size, &slice);
+        if at < base {
+            shown.note(at, base - at, &slice);
+            physical.homed.insert(at, (base - at, slice.clone()));
+        }
+        if at + size > end {
+            let rest = Slice { index: slice.index + (end - at) / PAGE, section: slice.section.clone() };
+            shown.note(end, at + size - end, &rest);
+            physical.homed.insert(end, (at + size - end, rest));
+        }
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1313,6 +1513,11 @@ pub extern "system" fn XMemMapPhysicalPages(
         && let Some(pages) = &pages
     {
         arrange(base, pages);
+        // `VICTORY_PORT_DRIVER`: the reservation a driver heap, its pages
+        // at home, at the first map into it.
+        if port_driver_asked() {
+            home_with(base, pages, victory_gpu::uma_driver::title_reservation);
+        }
     }
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
@@ -1699,6 +1904,18 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    // Pages of a home (`VICTORY_PORT_DRIVER`): noted, no system calls.
+    let mut home_ok = true;
+    if ANY_HOME.load(Ordering::Acquire) {
+        let (home, rest): (Vec<Op>, Vec<Op>) = ops.into_iter().partition(|op| in_home(op.at, PAGE));
+        for op in home {
+            unmap(physical, op.at, PAGE);
+            if let Some(slice) = op.slice {
+                home_ok &= map(physical, op.at, PAGE, slice);
+            }
+        }
+        ops = rest;
+    }
     for op in &mut ops {
         let there = physical
             .views
@@ -1734,7 +1951,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
         }
     }
     let done = pool::all(ops);
-    let mut ok = true;
+    let mut ok = home_ok;
     for (op, done) in done {
         match op.slice {
             Some(slice) if done => {
@@ -1876,6 +2093,10 @@ mod pool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    // In a home (`VICTORY_PORT_DRIVER`): no placeholder there, no view.
+    if in_home(base, len) {
+        return map_home(physical, base, len, slice);
+    }
     let own = physical.holes.remove(&base) == Some(len) && lean();
     if !show(base, len, &slice, own) {
         return false;
@@ -1908,6 +2129,11 @@ fn split(base: usize, len: usize) {
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
 /// long already.
 fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+    // A page that lives at home (`VICTORY_PORT_DRIVER`) shown elsewhere: a
+    // plain view of the section, whose bytes are not the home's.
+    if slice.section.home.get().is_some() {
+        victory_gpu::uma_driver::home_alias(base, len, false);
+    }
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {
@@ -2014,6 +2240,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
         return;
+    }
+    if !physical.homed.is_empty() {
+        unmap_home(physical, base, len);
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -2394,6 +2623,93 @@ mod tests {
         unsafe { at(3).cast::<u32>().write(7) };
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_PORT_DRIVER`'s bookkeeping, with the driver heap's remake
+    /// played by write-watched private memory at the reservation's address:
+    /// the 32-bit heap's pages live at home, maps there make no views, a
+    /// write by page number lands at home, an unmap keeps the bytes, and a
+    /// page mapped elsewhere is a counted alias showing the section's bytes.
+    #[test]
+    fn a_32_bit_heap_at_home_maps_without_views() {
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS) as usize;
+        assert!(base != 0 && base < 1 << 32);
+        // Split in two, as the title splits its heap.
+        // SAFETY: our own placeholder.
+        assert_ne!(unsafe { VirtualFree(base as *mut c_void, 2 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) }, 0);
+        let pages = allocate(4);
+        let at = |page: usize| (base + page * PAGE) as *mut c_void;
+        let remake = |first: usize, bytes: usize| {
+            assert_eq!((first, bytes), (base, 4 * PAGE));
+            // SAFETY: the reservation's two placeholders, then memory of ours there.
+            unsafe {
+                VirtualFree(first as *mut c_void, 0, MEM_RELEASE) != 0
+                    && VirtualFree((first + 2 * PAGE) as *mut c_void, 0, MEM_RELEASE) != 0
+                    && VirtualAlloc(first as *const c_void, bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize == first
+            }
+        };
+        // The second piece first, from the array's start, as the title does.
+        arrange(base + 2 * PAGE, &pages[..2]);
+        home_with(base + 2 * PAGE, &pages[..2], remake);
+        assert!(in_home(base, 4 * PAGE), "the reservation is a home");
+        // Once only.
+        home_with(base, &pages[2..], |_, _| panic!("asked again"));
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        arrange(base, &pages[2..]);
+        assert_eq!(XMemMapPhysicalPages(at(0), 2, pages[2..].as_ptr()), at(0));
+        {
+            let p = physical();
+            assert!(p.views.range(base..base + 4 * PAGE).next().is_none(), "no views at home");
+            assert_eq!(p.homed.len(), 2);
+        }
+        assert_eq!(query(at(0)).host.Type, windows_sys::Win32::System::Memory::MEM_PRIVATE);
+        // DirectStorage's write by page number lands at home.
+        assert!(write_physical(&pages[..1], 3, &[0x42]));
+        // SAFETY: the home's memory.
+        assert_eq!(unsafe { at(2).cast::<u8>().add(3).read() }, 0x42);
+        assert_eq!(shown_at(&pages[..1], 0, PAGE), vec![(base + 2 * PAGE, PAGE)]);
+        // An unmap keeps the bytes; the rest stays noted.
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, std::ptr::null()), at(2));
+        // SAFETY: as above.
+        assert_eq!(unsafe { at(2).cast::<u8>().add(3).read() }, 0x42);
+        assert!(physical().homed.contains_key(&(base + 3 * PAGE)));
+        assert!(shown_at(&pages[..1], 0, PAGE).is_empty());
+        // Mapped again at home: shown there again.
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, pages.as_ptr()), at(2));
+        assert_eq!(shown_at(&pages[..1], 0, PAGE), vec![(base + 2 * PAGE, PAGE)]);
+        // A page of it elsewhere: an alias, a plain view of the section.
+        let other = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!other.is_null());
+        let aliases = victory_gpu::uma_driver::home_aliases();
+        assert_eq!(XMemMapPhysicalPages(other, 1, pages.as_ptr()), other);
+        assert!(victory_gpu::uma_driver::home_aliases() > aliases, "counted");
+        // SAFETY: mapped read-write; the section's page, never written.
+        assert_eq!(unsafe { other.cast::<u8>().add(3).read() }, 0);
+        assert_eq!(XMemMapPhysicalPages(other, 1, std::ptr::null()), other);
+        assert_eq!(XMemMapPhysicalPages(at(0), 4, std::ptr::null()), at(0));
+        assert!(physical().homed.range(base..base + 4 * PAGE).next().is_none());
+        HOMES.write().unwrap().retain(|h| h.0 != base);
+        // SAFETY: our own memory.
+        unsafe {
+            VirtualFree(other, 0, MEM_RELEASE);
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Only a section as big as the reservation, never touched, goes home.
+    #[test]
+    fn only_a_fresh_section_as_big_as_its_reservation_goes_home() {
+        let pages = allocate(2);
+        let section = page_table().pages.get(&pages[0]).unwrap().section.clone();
+        if !on_wine() {
+            assert_eq!(not_homeable(&section, 2 * PAGE, true), None);
+            assert!(not_homeable(&section, 3 * PAGE, true).is_some());
+            assert!(not_homeable(&section, 2 * PAGE, false).is_some());
+            section.touch(1, 1);
+            assert!(not_homeable(&section, 2 * PAGE, true).unwrap().contains("mapped or written"));
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     #[test]

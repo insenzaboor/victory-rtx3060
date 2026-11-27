@@ -115,6 +115,13 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if !wanted(start, len) {
         return None;
     }
+    // `VICTORY_PORT_DRIVER=1`: the 32-bit heap's pages live in a driver heap
+    // at their own addresses (no views to open), and copies of them stay,
+    // found by the write watch (level 2 would place them there).
+    if crate::uma_driver::homed(start as usize, len as usize) {
+        crate::uma_driver::home_copied();
+        return None;
+    }
     let host = crate::host::host()?;
     match place_in(&host.device, start, len) {
         Ok(placed) => {
@@ -345,6 +352,9 @@ pub(crate) fn log(frames: f64) {
         s[6],
         s[7],
     );
+    if let Some(line) = crate::uma_driver::home_line() {
+        tracing::info!("{line}");
+    }
     if cbv_direct() {
         let n = DIRECT_CBV[0].swap(0, Ordering::Relaxed) as f64 / frames;
         let kb = DIRECT_CBV[1].swap(0, Ordering::Relaxed) as f64 / (1024.0 * frames);
