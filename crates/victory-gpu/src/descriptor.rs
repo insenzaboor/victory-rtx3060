@@ -230,6 +230,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             }
             // Between the rounds asked for, while submissions come.
             let mut last = std::time::Instant::now();
+            // (The submitting thread waits for its rounds: `VICTORY_WIDE_PRIORITY`.)
+            let mut above = false;
             loop {
                 let mut r = rounds();
                 let mut asked = r.0 != r.1;
@@ -247,6 +249,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                crate::shadow::helper_priority(&mut above);
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -295,6 +298,46 @@ pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
         crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     SyncedHeaps(Some(mark))
+}
+
+/// `VICTORY_HEAP_SYNC_FIRST` (`crate::host`): `first` was begun before the
+/// submission waited for flights to land, whose landings may have written
+/// records. A round that begins after now is the one waited for: `first`
+/// itself if it has not begun yet, else another one asked for (`first` then
+/// not waited for: rounds run one at a time, in order, so the later one's
+/// end is after its end). The flag: whether another was asked for.
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_again(first: SyncedHeaps) -> (SyncedHeaps, bool) {
+    let Some(mine) = first.0 else {
+        // Done inline already: again, inline.
+        return (begin_sync_heaps(), true);
+    };
+    if !begun(SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1, mine) {
+        return (first, false);
+    }
+    std::mem::forget(first);
+    (begin_sync_heaps(), true)
+}
+
+/// Renderer port #7 and `VICTORY_HEAP_SYNC_AT_SUBMIT` (`crate::host`): the
+/// submission that needs round `mark` waited for flights to land, whose
+/// landings may have written records. A round that begins after now: `mark`
+/// if it has not begun yet, else the next not asked for
+/// ([`begin_sync_heaps_after`] asks for it).
+#[cfg(windows)]
+pub(crate) fn round_after_wait(mark: u64) -> u64 {
+    if mark == 0 || !sync_aside() {
+        return mark;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if begun(rounds.1, mark) { mark.max(rounds.0 + 1) } else { mark }
+}
+
+/// Whether round `mine` may have begun with `done` rounds done: it begins
+/// only once the one before it is done (as `crate::port_journal::round_after`).
+#[cfg(windows)]
+fn begun(done: u64, mine: u64) -> bool {
+    done + 1 >= mine
 }
 
 /// Renderer port #7: the number of a round of the heaps' records that
@@ -1824,6 +1867,19 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// `VICTORY_HEAP_SYNC_FIRST`: a round asked for whose turn has not come
+    /// (the one before it not done) begins after now, and is kept.
+    #[cfg(windows)]
+    #[test]
+    fn a_round_not_begun_yet_serves_after_a_wait() {
+        // Round 5 asked; 3 done: round 4 runs or waits, 5 has not begun.
+        assert!(!begun(3, 5));
+        // 4 done: round 5 may be running already.
+        assert!(begun(4, 5));
+        assert!(begun(5, 5));
+        assert!(begun(0, 1));
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

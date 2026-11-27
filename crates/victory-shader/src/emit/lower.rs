@@ -7968,7 +7968,32 @@ impl<'a> Lower<'a> {
             return Ok(None);
         }
         if super::shader::raw_views() == 0 {
-            return Ok(None);
+            // No twins (`constants_in_slot`): through the slot itself, only
+            // where the host is sure to make it a raw view: one load at an
+            // offset fixed in the code, from a table whose used-resource
+            // entry there is a constant buffer (such a table is made afresh
+            // for the draw). A read of a constant buffer view as raw bytes
+            // would not survive.
+            if !super::shader::constants_in_slot() {
+                return Ok(None);
+            }
+            let Source::Loaded { load, first } = src else {
+                return Ok(None);
+            };
+            // The slot read, in descriptors of 32 bytes.
+            let slot = self.scalar.get(load).and_then(|a| {
+                (a.dynamic.is_none()
+                    && self.x.native.layout.get(a.param).is_some_and(|p| p.root == RootType::Table))
+                .then(|| (a.offset / 4 + u32::from(*first)) / 8)
+            });
+            let named = slot.is_some_and(|slot| {
+                self.used_kind(src)
+                    .is_some_and(|u| u.kind == ResourceType::Cbv && u.table_offset_dwords / 8 == slot)
+            });
+            if !named || self.x.res.waterfall.loads.contains(load) {
+                return Ok(None);
+            }
+            return Ok(Some(self.handle(site, src, false, (11, 0))?));
         }
         let x = self.x;
         let scalar = &self.scalar;

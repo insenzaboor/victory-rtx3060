@@ -67,7 +67,13 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
             .name("victory-aside".into())
             .spawn(move || {
                 crate::cores::keep_on_fast_cores("victory-aside");
-                jobs.into_iter().for_each(|job| job())
+                // (Lists wait for its pass at their close, and the submission
+                // behind them: `VICTORY_WIDE_PRIORITY`.)
+                let mut above = false;
+                jobs.into_iter().for_each(|job| {
+                    crate::shadow::helper_priority(&mut above);
+                    job()
+                })
             })
             .ok()
             .map(|_| Mutex::new(send))
