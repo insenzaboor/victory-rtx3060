@@ -8,8 +8,8 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 |---|---|---|
 | 🟢 shipped | On by default, verified in game runs | 23 |
 | 🔵 on, untested | On by default, merged, not yet verified in a game run | 13 |
-| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 39 |
-| 🟡 in progress | Being ported or built | 2 |
+| 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 42 |
+| 🟡 in progress | Being ported or built | 0 |
 | ⬜ planned | Designed or queued, not started | 9 |
 | ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 14 |
 | ⚫ n/a | Does not apply to NVIDIA / this title (documented why) | 2 |
@@ -41,8 +41,9 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Wide-comparison thread count settable | 🔵 ready to test | MoonYueya/VIctory-Kira eb6dd4f | `VICTORY_WIDE_THREADS=<n>` | Unset keeps the old count | [`13c91ee7`](https://github.com/insenzaboor/victory-rtx3060/commit/13c91ee7) | [#60](https://github.com/insenzaboor/victory-rtx3060/issues/60) |
 | mimalloc as the Rust allocator (returns memory after 250 ms) | 🔵 ready to test | Peppacodes cd950293 (trustno1-coder PR 11 by Dastano) | `cargo feature mimalloc; VICTORY_ALLOC=system to undo` | Peppa: about -2 ms median on a 5080 | [`6c7cf94f`](https://github.com/insenzaboor/victory-rtx3060/commit/6c7cf94f) | [#62](https://github.com/insenzaboor/victory-rtx3060/issues/62) |
 | Shader writes to write-combining title memory stay on the card | 🔵 ready to test | Peppacodes 6035addd / 3cc0a8d6 / ca2432bd | `VICTORY_SKIP_WC_BACK=1 VICTORY_SKIP_WC_KEEP=1048576` | Peppa: -3.9 ms; without KEEP the picture breaks | [`6865100c`](https://github.com/insenzaboor/victory-rtx3060/commit/6865100c) | [#63](https://github.com/insenzaboor/victory-rtx3060/issues/63) |
-| Retired objects dropped on their own thread | 🟡 in progress | Peppacodes 92b7cf93 (Steenax6) / e38bfb0d | `VICTORY_BURY_ASIDE=1` | Peppa: -23 ms mean |  | [#64](https://github.com/insenzaboor/victory-rtx3060/issues/64) |
-| Landed lists reset on their own thread | 🟡 in progress | Peppacodes cb412956 (fxceless PR 1146, beamdotdev) | `VICTORY_LAND_ASIDE=1` | Peppa: -2 to -4 ms |  | [#65](https://github.com/insenzaboor/victory-rtx3060/issues/65) |
+| Retired objects dropped on their own thread | 🔵 ready to test | Peppacodes 92b7cf93 (Steenax6) / e38bfb0d | `VICTORY_BURY_ASIDE=1 (cap VICTORY_BURY_ASIDE_MOST=131072)` | Peppa: -23 ms mean | [`a5a6dc5a`](https://github.com/insenzaboor/victory-rtx3060/commit/a5a6dc5a) | [#64](https://github.com/insenzaboor/victory-rtx3060/issues/64) |
+| Landed lists reset on their own thread | 🔵 ready to test | Peppacodes cb412956 (fxceless PR 1146, beamdotdev) | `VICTORY_LAND_ASIDE=1 (cap VICTORY_LAND_ASIDE_MOST=64)` | Peppa: -2 to -4 ms | [`00ef9237`](https://github.com/insenzaboor/victory-rtx3060/commit/00ef9237) | [#65](https://github.com/insenzaboor/victory-rtx3060/issues/65) |
+| Submit-thread helpers run above normal priority | 🔵 ready to test | Peppacodes a370bde6 | `VICTORY_WIDE_PRIORITY=1` | Peppa: -0.7 ms median; may starve title threads on 12 cores | [`8f43114d`](https://github.com/insenzaboor/victory-rtx3060/commit/8f43114d) | [#66](https://github.com/insenzaboor/victory-rtx3060/issues/66) |
 | Joined submissions 16 parts / 96 lists | ⬜ planned | Maykzera (RTX 3060) | `VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96` | 1% low +18%, P99 -15% on an RTX 3060 |  | [#5](https://github.com/insenzaboor/victory-rtx3060/issues/5) |
 | In-place memory stages 1-3 (one heap per allocation, owned allocator, self-indexing descriptors) | ⬜ planned | ours (docs/design/in-place-memory.md) |  | Estimate 3-6 ms/frame (stage 1), 10-20 ms with stage 2, 1-4 GB RAM; waits on probe numbers | [`ceae18c0`](https://github.com/insenzaboor/victory-rtx3060/commit/ceae18c0) | [#50](https://github.com/insenzaboor/victory-rtx3060/issues/50) |
 | Page mapping threads: 8 (default) vs 1 | ⚪ no gain (off) | ours |  | A/B run 48 with the first minute of streaming excluded: 31.0 vs 32.2 ms per 1k draws (noise); 8 kept. An earlier reading of 30.9 vs 37.7 included streaming phases. |  |  |

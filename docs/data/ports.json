@@ -1036,21 +1036,34 @@
       "id": "bury-aside",
       "title": "Retired objects dropped on their own thread",
       "category": "performance",
-      "status": "in-progress",
+      "status": "ready",
       "source": "Peppacodes 92b7cf93 (Steenax6) / e38bfb0d",
-      "switch": "VICTORY_BURY_ASIDE=1",
+      "switch": "VICTORY_BURY_ASIDE=1 (cap VICTORY_BURY_ASIDE_MOST=131072)",
       "effect": "Peppa: -23 ms mean",
-      "issue": 64
+      "issue": 64,
+      "commit": "a5a6dc5a"
     },
     {
       "id": "land-aside",
       "title": "Landed lists reset on their own thread",
       "category": "performance",
-      "status": "in-progress",
+      "status": "ready",
       "source": "Peppacodes cb412956 (fxceless PR 1146, beamdotdev)",
-      "switch": "VICTORY_LAND_ASIDE=1",
+      "switch": "VICTORY_LAND_ASIDE=1 (cap VICTORY_LAND_ASIDE_MOST=64)",
       "effect": "Peppa: -2 to -4 ms",
-      "issue": 65
+      "issue": 65,
+      "commit": "00ef9237"
+    },
+    {
+      "id": "wide-priority",
+      "title": "Submit-thread helpers run above normal priority",
+      "category": "performance",
+      "status": "ready",
+      "source": "Peppacodes a370bde6",
+      "switch": "VICTORY_WIDE_PRIORITY=1",
+      "commit": "8f43114d",
+      "effect": "Peppa: -0.7 ms median; may starve title threads on 12 cores",
+      "issue": 66
     }
   ]
 }
