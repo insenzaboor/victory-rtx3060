@@ -230,6 +230,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             }
             // Between the rounds asked for, while submissions come.
             let mut last = std::time::Instant::now();
+            // (The submitting thread waits for its rounds: `VICTORY_WIDE_PRIORITY`.)
+            let mut above = false;
             loop {
                 let mut r = rounds();
                 let mut asked = r.0 != r.1;
@@ -247,6 +249,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                crate::shadow::helper_priority(&mut above);
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
