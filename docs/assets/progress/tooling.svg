@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="Measurement and automation: 62% done">
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="70" role="img" aria-label="Measurement and automation: 56% done">
 <style>text{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;fill:#768390;font-size:12px} .t{fill:#768390;font-size:14px;font-weight:600}</style>
-<text class="t" x="10" y="20">Measurement and automation</text><text x="550" y="20" text-anchor="end">62% done · 8 of 8 landed</text>
+<text class="t" x="10" y="20">Measurement and automation</text><text x="550" y="20" text-anchor="end">56% done · 9 of 9 landed</text>
 <rect x="10" y="30" width="540" height="16" rx="8" fill="#8c959f" fill-opacity="0.25"/>
-<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="337.5" height="16" fill="#2ea043"/><rect x="347.5" y="30" width="202.5" height="16" fill="#3b82f6"/></g>
-<text x="10" y="64">■ 5 done</text><text x="120" y="64" style="fill:#3b82f6">■ 3 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 0 planned</text>
+<clipPath id="c"><rect x="10" y="30" width="540" height="16" rx="8"/></clipPath><g clip-path="url(#c)"><rect x="10.0" y="30" width="300.0" height="16" fill="#2ea043"/><rect x="310.0" y="30" width="240.0" height="16" fill="#3b82f6"/></g>
+<text x="10" y="64">■ 5 done</text><text x="120" y="64" style="fill:#3b82f6">■ 4 merged / in flight</text><text x="300" y="64" style="fill:#6e7681">■ 0 planned</text>
 </svg>

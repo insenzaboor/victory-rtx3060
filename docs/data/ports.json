@@ -1061,9 +1061,120 @@
       "status": "ready",
       "source": "Peppacodes a370bde6",
       "switch": "VICTORY_WIDE_PRIORITY=1",
-      "commit": "8f43114d",
-      "effect": "Peppa: -0.7 ms median; may starve title threads on 12 cores",
+      "commit": "3a6047168",
+      "effect": "Extended to heap-sync, aside and landing pools (trustno1 80c70b719: 3060 8.6 -> 9.6 fps)",
       "issue": 66
+    },
+    {
+      "id": "maykzera-set",
+      "title": "Maykzera RTX 3060 switch set (half render scale, JOIN_PARTS 16, SUBMIT_FRAMES 2)",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "Maykzera/victory-rtx3060",
+      "switch": "RENDER_SCALE=0.5 CARD_BUFFERS_MB=1536 JOIN_PARTS=16 JOIN_LISTS=96 MAP_THREADS=1 SUBMIT_FRAMES=2 THIN_THREADS=4",
+      "effect": "q22: p50 109 -> 86 ms, GPU wait 12.6 -> 1 ms, but 30.3 vs 27.0 ms per 1k draws"
+    },
+    {
+      "id": "compare-first-slice",
+      "title": "Big compares check their first slice (bug fix)",
+      "category": "stability",
+      "status": "default-untested",
+      "source": "fxceless 81d54b06f (#1407)",
+      "commit": "63e6b8e8",
+      "effect": "Release builds skipped the first slice of 32 MiB+ compares: missed GPU writes"
+    },
+    {
+      "id": "fence-recheck",
+      "title": "Fence waiter re-checks the value after it is queued (lost wakeups)",
+      "category": "stability",
+      "status": "default-untested",
+      "source": "MoonYueya/VIctory-Kira 63504046c",
+      "commit": "674d5b7d"
+    },
+    {
+      "id": "clzero-guard",
+      "title": "clzero on a guarded line faults into the guard",
+      "category": "stability",
+      "status": "default-untested",
+      "source": "fxceless b3b65aa25 (#1380)",
+      "commit": "3e041377"
+    },
+    {
+      "id": "raw-view-clamp",
+      "title": "Raw buffer views clamped inside their buffer",
+      "category": "stability",
+      "status": "default-untested",
+      "source": "trustno1 aec85efb1",
+      "switch": "VICTORY_RAW_VIEW_CLAMP (on)",
+      "commit": "a414bff7"
+    },
+    {
+      "id": "texture-stage-frame",
+      "title": "One texture-stage budget per frame",
+      "category": "performance",
+      "status": "ready",
+      "source": "MoonYueya/VIctory-Kira 15ceab4e7",
+      "switch": "VICTORY_TEXTURE_STAGE_PER_FRAME=1",
+      "commit": "43ce11f7",
+      "effect": "Bounds streaming hitches"
+    },
+    {
+      "id": "leave-out",
+      "title": "Leave out pipelines of named shaders",
+      "category": "tooling",
+      "status": "ready",
+      "source": "foxhound 672442b7 / trustno1 35c156087",
+      "switch": "VICTORY_LEAVE_OUT=<hash,hash>",
+      "commit": "7df8b755"
+    },
+    {
+      "id": "land-not",
+      "title": "Shader-only host copies stay on the card",
+      "category": "performance",
+      "status": "ready",
+      "source": "adanaport 692cebe6e / 26d310d9f / 50a0b550c",
+      "switch": "VICTORY_LAND_NOT=<lengths>",
+      "commit": "c31b6f965",
+      "effect": "adanaport: 22.7 -> 26.1 fps (4070 SUPER, 6-core)"
+    },
+    {
+      "id": "heap-sync-first",
+      "title": "Heap-records round starts at the lock / at the title submit",
+      "category": "performance",
+      "status": "ready",
+      "source": "foxhound 66f7e545e / d2e24b3bc",
+      "switch": "VICTORY_HEAP_SYNC_FIRST=1 VICTORY_HEAP_SYNC_AT_SUBMIT=1",
+      "commit": "f07f15600",
+      "effect": "Submit thread waited 2.7-5.8 ms for heap records"
+    },
+    {
+      "id": "merge-submissions",
+      "title": "Consecutive submissions merged into one host submission",
+      "category": "performance",
+      "status": "ready",
+      "source": "Peppacodes 9cbc10100",
+      "switch": "VICTORY_MERGE_SUBMISSIONS=1",
+      "commit": "f13e3d5ce",
+      "effect": "Peppa: -1.9 ms, 41 -> 8 submissions a frame"
+    },
+    {
+      "id": "port-cbv-slot",
+      "title": "Port 5 without raw twins: constant buffers read through their own slot",
+      "category": "performance",
+      "status": "ready",
+      "source": "adanaport 9d9803d97",
+      "switch": "VICTORY_PORT_CBV=1 VICTORY_PORT_CBV_SLOT=1",
+      "commit": "6eef27d50",
+      "effect": "adanaport: about -3 ms, 20.8 -> 22.3 fps"
+    },
+    {
+      "id": "uma-driver",
+      "title": "Driver-owned heap at the title address instead of imported heaps (XCL)",
+      "category": "performance",
+      "status": "in-progress",
+      "source": "xcl-dev/xcl f2248f068 / f78e05bcc (GPL-3.0-or-later)",
+      "switch": "VICTORY_UMA_DRIVER=1",
+      "effect": "XCL: frame replay 1,427 -> 172 ms GPU on NVIDIA"
     }
   ]
 }
