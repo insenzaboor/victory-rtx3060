@@ -253,6 +253,12 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
+/// For the memory lines: host lists kept idle now.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn idle_lists() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,

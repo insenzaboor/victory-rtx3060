@@ -291,6 +291,16 @@ pub(crate) fn vram_breakdown() -> [u64; 2] {
     [buffers, arenas]
 }
 
+/// For the memory lines: the bytes of title buffers' copies and of
+/// windows' copies that have a side on the card too (their CPU's side is
+/// counted with the copies, [`memory`]): the same bytes three times, in
+/// title memory, the CPU's side and the card's.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn on_card_bytes() -> [u64; 2] {
+    let arenas = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
+    [CARD_BYTES[0].load(Ordering::Relaxed), WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_sub(arenas)]
+}
+
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
 /// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).

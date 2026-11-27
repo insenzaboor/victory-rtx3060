@@ -674,6 +674,16 @@ impl Placed {
         if this.switch == CARD.switch { pool } else { pool.lean(1) }
     }
 
+    /// For the memory lines: the bytes of the heaps alive and of the
+    /// buffers' pieces in them (zeros with the switch off).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn held(&self) -> [u64; 2] {
+        if self.bytes() == 0 {
+            return [0, 0];
+        }
+        [self.lock().blocks() as u64 * self.bytes(), self.stats[3].load(Ordering::Relaxed)]
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Pool<ID3D12Heap>> {
         self.pool.lock().unwrap_or_else(|e| e.into_inner())
     }
