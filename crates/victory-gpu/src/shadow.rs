@@ -1682,9 +1682,41 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the processor's,
+/// 2 to 6, as before.
+///
+/// `VICTORY_WIDE_THREADS=<n>` sets it (1 to 64), after MoonYueya/VIctory-Kira
+/// eb6dd4f (from stellarr-studio/kelvaroq patch 0013): the wide comparisons
+/// take the refreshes of a submission's copies too, so on a processor with
+/// many threads the quarter may leave them short. More threads take cores
+/// from the title's recording threads, so raised, the frame rate is what
+/// says whether it helps.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 64)
+    })
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::wide_threads;
+
+    /// The wide comparisons' threads: a quarter of the processor's, 2 to 6
+    /// unless `VICTORY_WIDE_THREADS` says otherwise, and 1 to 64 whatever
+    /// it says.
+    #[test]
+    fn wide_threads_follow_the_switch_and_are_clamped() {
+        let quarter = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        match std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(asked) => assert_eq!(wide_threads(), asked.clamp(1, 64)),
+            None => assert_eq!(wide_threads(), quarter),
+        }
+    }
 }
 
 fn workers() -> &'static Workers {
