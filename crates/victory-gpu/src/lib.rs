@@ -116,6 +116,8 @@ pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;
 #[cfg(windows)]
+pub mod uma_driver;
+#[cfg(windows)]
 mod upload;
 #[cfg(windows)]
 mod watch;

@@ -1,14 +1,17 @@
 # Title graphics memory in place
 
-Status: plan. Stage 0 (the probes) is built; stages 1 to 3 are not.
+Status: plan. Stage 0 (the probes) is built; stages 1 to 3 are not. Driver
+heaps for in-place memory (`VICTORY_UMA_DRIVER`) are built, off by default.
 Target PC for the numbers below: RTX 3060 12 GB, 32 GB RAM, Resizable BAR off,
 GTA VI at about 10 fps, bound by the CPU on the thread that prepares
 submissions, and by RAM at 22 to 25 GB.
 
 The ideas come from a study of another compatibility layer
-(`research/xcl-study.md`, items H2 and H3). That layer is GPL-2.0-only. This
-plan is written from the study's own-words summary and from our code. It
-reuses nothing of that project's code, and its files were not read for it.
+(`research/xcl-study.md`, items H2 and H3). That layer was GPL-2.0-only when
+this plan was written, from the study's own-words summary and from our code,
+and nothing of it was reused here. It is GPL-3.0-or-later since its commit
+`06f90c198`; one piece of it is ported since then, the driver heaps below
+([Driver heaps](#driver-heaps-victory_uma_driver), `docs/THIRD_PARTY.md`).
 
 ## Why
 
@@ -298,6 +301,80 @@ read through the index path.
 only (a different shader-cache key), and the runtime mirrors as today. Every
 indexed access also carries the positional fallback, so a bad slot degrades
 to today's behaviour, not to garbage.
+
+## Driver heaps (`VICTORY_UMA_DRIVER`)
+
+Built, off by default; ported from XCL (`f2248f068`, `f78e05bcc`;
+`crates/victory-gpu/src/uma_driver.rs`).
+
+**Why.** A heap opened on memory the process has (any of the three openings
+above) is an import, and on NVIDIA the card reads imported pages slowly: XCL
+measured GPU loads 8-24x and atomics 13-22x slower than from a driver
+`CUSTOM` heap of write-back pages in the PC's memory (pool L0), and a whole
+frame's replay at 1,427 ms of GPU time imported against 172 ms. Our run q21
+fits: port 1 and in-place reads off gave 22.9 ms per 1,000 draws, on 27.0.
+
+**What.** A title allocation that `XMemVirtualAlloc` reserves and commits at
+once, read-write, at an address of ours, with the console's GPU access bits,
+is made a driver heap at that same address before the call returns: its
+written pages are copied out (none yet), it is released, every other free
+stretch it would fit in is reserved for a moment (all but a margin of half
+its size, 256 MiB at most, at each stretch's start), the heap is made
+(`CUSTOM`, write-back, L0, `ALLOW_ONLY_BUFFERS | ALLOW_WRITE_WATCH`) and one
+buffer over it mapped, and the grooming let go. If the mapping is not at the
+address, or `GetWriteWatch` cannot read it, the memory is made again there;
+if even that fails (another thread took the hole), the allocation is made
+anew elsewhere: no title thread has the address yet. XCL does the same once,
+before the title runs, for its coherent window; here it is per allocation,
+because the title's memory is its own allocations. While a remake grooms,
+our own mappings of title memory and the title's allocations wait on a lock
+(`uma_driver::gate`). The software adapter keeps the address space of a heap
+let go and maps the next heap of that size there, where the grooming cannot
+reach: the remake then keeps the memory as it was. Whether NVIDIA's driver
+does the same after the title frees a driver heap, the in-place line's
+"mapped elsewhere" count will say.
+
+**Who reads them.** `inplace::place_for` (`VICTORY_INPLACE=1` windows, `=2`
+title buffers too) places a buffer in the driver heap, without
+`ALLOW_CROSS_ADAPTER`, before it would import; nothing else changes for that
+memory (`crate::watch` keeps its write watch, which the heap allows).
+Renderer port 1 does not: its 32-bit heap is views of a section (physical
+pages the title maps), which a driver heap cannot be, so it stays imported.
+Making it a driver heap would mean xmem backing those physical pages with
+the heap instead of the section (the reservation is mapped once, in order:
+`xmem::arrange`), with every view and write path of those pages following.
+Descriptor memory (stage 3) becomes GPU-readable in place only if the title
+allocates it that way; nothing reads it yet.
+
+**The title's calls on it.** A release of the whole lets the heap go (the
+GPU's placed buffers keep it alive until they go). A decommit zeroes the
+pages, and a commit there again is a no-op. A partial release fails, as
+Windows' would.
+
+**Limits.** `VICTORY_UMA_DRIVER_MIN_MB` (64): smaller allocations are left
+alone, which keeps the grooming's margin at 32 MiB or more for mappings made
+in that moment by threads that do not take the lock (the drivers'). The most
+in driver heaps at once, `VICTORY_UMA_DRIVER_MB` (1024), and the RAM and
+commit to leave free, `VICTORY_UMA_DRIVER_KEEP_MB` (2048): a driver heap is
+resident at once, all of it, where the title's committed memory costs RAM
+only as it is touched. On the 3060 with Resizable BAR off the heap is still
+the PC's memory read over PCIe, about 25 GB/s at best: what is gained is the
+import's penalty, not the link; big, often-read buffers still belong on the
+card (`cards()`).
+
+**Self-test.** At start-up (`uma_driver::before_title`, before the title's
+TLS callbacks and `DllMain`s, which makes the host device then), on 64 MiB
+of its own remade by the same steps: steps 1 to 4 below, the write watch
+seeing a CPU write, a `VirtualProtect` read-only and back (the guards of
+`crate::watch`), then the card's copy rate out of the driver heap and out of
+the same memory imported, logged only. Any failure is logged at error level
+and leaves the switch off for the run. With `VICTORY_INPLACE=0` it is off
+too (nothing would read the heaps).
+
+**A run.** `VICTORY_UMA_DRIVER=1 VICTORY_INPLACE=1` (or `=2`). The in-place
+line every ten seconds says how many allocations became driver heaps, how
+many buffers were placed in them, and why the others were left alone (size,
+no GPU access bits, budget, RAM, the driver).
 
 ## The start-up self-test
 

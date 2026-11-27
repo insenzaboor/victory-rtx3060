@@ -178,23 +178,54 @@ fn virtual_alloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base,
-            size,
-            kind,
-            protect,
-            if constrained {
-                &mut parameter
-            } else {
-                std::ptr::null_mut()
-            },
-            constrained.into(),
-        )
+    let mut allocate = || {
+        // Not while a driver heap's remake holds the address space
+        // (`VICTORY_UMA_DRIVER`; nothing is held with it off).
+        let _gate = victory_gpu::uma_driver::gate();
+        // SAFETY: the title's own arguments, cleaned of console bits; the
+        // parameter points at `requirements`, which outlives the call.
+        unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base,
+                size,
+                kind,
+                protect,
+                if constrained {
+                    &mut parameter
+                } else {
+                    std::ptr::null_mut()
+                },
+                constrained.into(),
+            )
+        }
     };
+    let mut at = allocate();
+    // A commit inside a driver heap (`VICTORY_UMA_DRIVER`): its pages are
+    // there already (a decommit there zeroed them, `title_virtual_free`).
+    if at.is_null()
+        && !base.is_null()
+        && kind & MEM_COMMIT != 0
+        && kind & MEM_RESERVE == 0
+        && victory_gpu::uma_driver::holds(base as usize, size)
+    {
+        at = base;
+    }
+    // `VICTORY_UMA_DRIVER=1`: memory reserved and committed at once, at an
+    // address of ours, with the console's GPU access bits (0x800 and up), is
+    // made a driver heap at the same address before the title has it. If
+    // the address was lost on the way, the allocation is made anew.
+    if !at.is_null()
+        && constrained
+        && !placeholder
+        && kind & MEM_COMMIT != 0
+        && protect == PAGE_READWRITE
+        && victory_gpu::uma_driver::on()
+        && victory_gpu::uma_driver::title_allocation(at as usize, size, asked & !0x7ff != 0)
+            == victory_gpu::uma_driver::Allocation::Gone
+    {
+        at = allocate();
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -428,7 +459,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -482,6 +513,8 @@ impl Section {
             return None;
         }
         let base = *self.window.get_or_init(|| {
+            // Not while a driver heap's remake holds the address space.
+            let _gate = victory_gpu::uma_driver::gate();
             // SAFETY: the whole of a section we own.
             unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
         });
@@ -818,6 +851,8 @@ impl View {
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        // Not while a driver heap's remake holds the address space.
+        let _gate = victory_gpu::uma_driver::gate();
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
@@ -2123,6 +2158,15 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         if kind & MEM_RELEASE != 0 {
             victory_gpu::title_memory_released(address as usize);
         }
+    }
+    free(address, size, kind)
+}
+
+/// `VirtualFree` of title memory, which may be a driver heap
+/// (`VICTORY_UMA_DRIVER`): that is let go, or its pages zeroed, there.
+fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    if let Some(done) = victory_gpu::uma_driver::title_free(address as usize, size, kind) {
+        return done.into();
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
