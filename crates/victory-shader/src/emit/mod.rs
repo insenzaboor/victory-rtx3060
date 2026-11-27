@@ -126,7 +126,7 @@ pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
 pub use loose_lds::{wave32_fixes, wave_lds_loose};
 pub use sampler::{StaticSampler, aniso_point_on as sampler_aniso_point, anisotropic as sampler_anisotropic, is_aniso_point as sampler_is_aniso_point};
-pub use lower::{div_fixup_order, host_settings, nan_scrub, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{div_fixup_order, host_settings, nan_scrub, set_host_max_wave, set_host_rdna, set_thread_max_wave, thread_ticket};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
