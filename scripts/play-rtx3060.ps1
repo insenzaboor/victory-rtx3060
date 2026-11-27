@@ -31,15 +31,15 @@ $set = [ordered]@{
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_CARD_AWAKE = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'
     VICTORY_BVH_NO_HIT = '1'; VICTORY_PIPELINE_BOOK = '1'; VICTORY_D3D12_ADAPTER = 'NVIDIA'
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
-    # renderer ports 1, 2, 6 (port 5 needs a heap NVIDIA cannot create)
-    VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_DESCRIPTORS = '1'; VICTORY_PORT_GUARD = '1'
+    # renderer ports 2 and 6 (port 1 off: its imported heap makes GPU reads slow on NVIDIA, runs q15/q21; port 5 needs a heap NVIDIA cannot create)
+    VICTORY_PORT_CONSTANTS = '0'; VICTORY_PORT_DESCRIPTORS = '1'; VICTORY_PORT_GUARD = '1'
     # title memory read from VRAM, not over PCIe (Resizable BAR off)
     VICTORY_CARD_WINDOWS_MB = '2304'; VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_CARD_BUFFERS_MB = '1024'
     # buffers placed in heaps made resident once; change tracking by list
     VICTORY_SHARED_HEAPS = '16'; VICTORY_CARD_HEAPS = '64'; VICTORY_CARD_DIRTY_LIST = '1'; VICTORY_STRUCT_IN_PLACE = '1'
     # threads and memory
     VICTORY_THIN_THREADS = '8'; VICTORY_PIPELINE_WORKERS = '4'; VICTORY_WINDOW_KB = '256'; VICTORY_WINDOW_TAILS = '1'
-    VICTORY_ALLOC_TRIM = '1024'; VICTORY_RESIDENCY = '1'; VICTORY_INPLACE = '1'; VICTORY_MEMORY_MAP = '0'
+    VICTORY_ALLOC_TRIM = '1024'; VICTORY_RESIDENCY = '1'; VICTORY_INPLACE = '0'; VICTORY_MEMORY_MAP = '0'
     VICTORY_BCPACK_CACHE_MB = '0'; VICTORY_ALIAS_SAME = '1'; VICTORY_EXACT_LATELY = '8192'
     # picture: the title's own upscaler (FSR4's fallback dots hair and shadow edges)
     VICTORY_UPSCALER = '6'
