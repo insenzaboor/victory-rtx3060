@@ -1692,9 +1692,41 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the processor's,
+/// 2 to 6, as before.
+///
+/// `VICTORY_WIDE_THREADS=<n>` sets it (1 to 64), after MoonYueya/VIctory-Kira
+/// eb6dd4f (from stellarr-studio/kelvaroq patch 0013): the wide comparisons
+/// take the refreshes of a submission's copies too, so on a processor with
+/// many threads the quarter may leave them short. More threads take cores
+/// from the title's recording threads, so raised, the frame rate is what
+/// says whether it helps.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 64)
+    })
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::wide_threads;
+
+    /// The wide comparisons' threads: a quarter of the processor's, 2 to 6
+    /// unless `VICTORY_WIDE_THREADS` says otherwise, and 1 to 64 whatever
+    /// it says.
+    #[test]
+    fn wide_threads_follow_the_switch_and_are_clamped() {
+        let quarter = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        match std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(asked) => assert_eq!(wide_threads(), asked.clamp(1, 64)),
+            None => assert_eq!(wide_threads(), quarter),
+        }
+    }
 }
 
 fn workers() -> &'static Workers {
@@ -3373,6 +3405,19 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Whether what shaders read of it is the title's own memory, with
+    /// nothing to refresh: in place (`crate::inplace`), never declared
+    /// written by shaders, and `VICTORY_UMA_DIRECT=1` (after
+    /// MoonYueya/VIctory-Kira 9223b21, from kelvaroq 0063-uma.patch).
+    ///
+    /// A refresh of such a copy copies nothing already (`Shadow::update`
+    /// returns 0 with a `place`): the step, the thread time and the
+    /// write-watch asking it costs are what goes. A copy shaders write stays
+    /// on the old path.
+    pub(crate) fn direct_read(&self) -> bool {
+        self.place.is_some() && !self.written() && crate::inplace::direct_on()
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -3470,6 +3515,12 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // With `VICTORY_UMA_DIRECT=1` still marked, not for a copy-back
+            // (there is none) but so that `direct_read` turns it down: a copy
+            // shaders write is not one whose reads skip their refresh.
+            if crate::inplace::direct_on() {
+                self.written.store(true, Ordering::Relaxed);
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4954,6 +5005,21 @@ impl Shadow {
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
+        let shadow = Arc::new(shadow);
+        std::mem::forget(shadow.clone());
+        shadow
+    }
+
+    /// A copy that is the title's own memory at `start` of `len` bytes, with
+    /// no buffer behind it: what `Shadow::placed` makes (`crate::inplace`),
+    /// for the tests that ask whether a range of it is refreshed.
+    pub(crate) fn placed_unbacked(start: u64, len: u64) -> Arc<Shadow> {
+        // SAFETY: two interface pointers nothing calls, as in `unbacked`.
+        let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let heap = || unsafe { std::mem::transmute::<usize, windows::Win32::Graphics::Direct3D12::ID3D12Heap>(8) };
+        let mut shadow = Shadow::new(none(), start as *mut u8, 0, start, len);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((heap(), 0));
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
         shadow

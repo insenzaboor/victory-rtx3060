@@ -89,6 +89,38 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_UMA_DIRECT`: 0 (unset) off, 1 on. A copy that is the title's
+/// own memory and that no shader writes ([`crate::shadow::Shadow::direct_read`])
+/// is not refreshed: the refresh would copy nothing (`Shadow::update`), and
+/// the step, the thread time and the write-watch asking it costs are what is
+/// skipped. After MoonYueya/VIctory-Kira 9223b21 (kelvaroq
+/// native/patches/0063-uma.patch, `Deferred.direct`). Off by default: it
+/// changes which ranges a submission's flights wait on (`host.rs`
+/// `blocked_by`), which no run on a card has measured yet.
+///
+/// Worth anything only with [`level`] at 1 (windows) or 2 (title buffers
+/// too): at 0 nothing is placed, so nothing is ever direct. It covers the
+/// read side of placed copies for `VICTORY_LATE_WAIT`: a flight whose
+/// shaders may write a range read directly is waited for on its account.
+/// The write side is not changed (`Shadow::gpu_writes` declares nothing to
+/// the flights for a placed copy), so `VICTORY_INPLACE=2` with
+/// `VICTORY_LATE_WAIT` stays as it was.
+pub(crate) fn direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UMA_DIRECT").is_some_and(|v| v == "1"))
+}
+
+/// What `VICTORY_UMA_DIRECT` skipped: refresh requests and their bytes, from
+/// the start (`HostList::defer_refresh`).
+static SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `requests` refreshes of `bytes` were not needed: the copies they name are
+/// the title's own memory ([`crate::shadow::Shadow::direct_read`]).
+pub(crate) fn skipped(requests: u64, bytes: u64) {
+    SKIPPED[0].fetch_add(requests, Ordering::Relaxed);
+    SKIPPED[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// The most title memory in place at once, in bytes
 /// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
 /// memory, also those the title never touched.
@@ -219,6 +251,14 @@ fn say() {
         s[6],
         s[7]
     );
+    if direct_on() {
+        let k: Vec<u64> = SKIPPED.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "title memory read directly (VICTORY_UMA_DIRECT=1): {} refreshes skipped, {} MB; nothing was copied into them",
+            k[0],
+            k[1] >> 20
+        );
+    }
 }
 
 /// What a heap is opened on.
@@ -1264,7 +1304,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// and 150 seconds later.
 pub(crate) fn tick() {
     crate::layout_probe::tick();
-    if level() > 0 {
+    if level() > 0 || direct_on() {
         say();
     }
     if probe_level() == 0 {
