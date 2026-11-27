@@ -873,6 +873,57 @@
       "commit": "ceae18c0",
       "effect": "Estimate 3-6 ms/frame (stage 1), 10-20 ms with stage 2, 1-4 GB RAM; waits on probe numbers",
       "issue": 50
+    },
+    {
+      "id": "pool-pack",
+      "title": "Pool pieces packed into the fullest heap so empty heaps are freed",
+      "category": "memory",
+      "status": "ready",
+      "source": "ours (memory accounting, run b1)",
+      "switch": "VICTORY_POOL_PACK=1",
+      "commit": "566084a4",
+      "effect": "Expected -0.4 to -1.2 GB (0.3-1.45 GB of heap space sat unused)",
+      "issue": 51
+    },
+    {
+      "id": "list-lean",
+      "title": "Idle host-list floor only while 8 GiB is free",
+      "category": "memory",
+      "status": "ready",
+      "source": "ours (memory accounting, run b1)",
+      "switch": "VICTORY_LIST_LEAN=1",
+      "commit": "19f8ba47",
+      "effect": "Expected -160 to -250 MB; risk of hitches when lists are remade",
+      "issue": 52
+    },
+    {
+      "id": "prelude-pool",
+      "title": "Host lists borrow preludes from a shared pool",
+      "category": "memory",
+      "status": "ready",
+      "source": "ours (memory accounting, run b1)",
+      "switch": "VICTORY_PRELUDE_POOL=1",
+      "commit": "8a9cfc11",
+      "effect": "Live preludes ~1,400 -> in-flight + 64: expected -0.4 to -0.8 GB",
+      "issue": 53
+    },
+    {
+      "id": "memory-breakdown",
+      "title": "30 s memory breakdown line (our buckets vs private total)",
+      "category": "tooling",
+      "status": "shipped",
+      "source": "ours",
+      "commit": "395d3fdc",
+      "effect": "Diagnostics builds: eight biggest buckets, unexplained card-shared memory, list/prelude counts"
+    },
+    {
+      "id": "card-cpu-side",
+      "title": "Drop the CPU side of card copies (transient upload ring)",
+      "category": "memory",
+      "status": "planned",
+      "source": "ours (memory accounting, run b1)",
+      "effect": "Biggest duplicate we own: about 1.5-2.5 GB; large shadow.rs change",
+      "issue": 54
     }
   ]
 }
