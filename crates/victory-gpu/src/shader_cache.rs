@@ -159,6 +159,13 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::wave32_fixes() {
             bytes.extend_from_slice(b"VICTORY_WAVE32_FIXES=1");
         }
+        // Likewise, only when on: the paired form of wave64 compute programs on 32-lane
+        // hosts, each console wave one host wave whose threads carry two lanes each
+        // (`VICTORY_WAVE_PAIRS=1`, proneonn/Vertex 26600c6 by way of MoonYueya/VIctory-Kira
+        // 243533d), with the other changes of that commit.
+        if victory_shader::emit::wave_pairs() {
+            bytes.extend_from_slice(b"VICTORY_WAVE_PAIRS=1");
+        }
         // Likewise, only when on: `v_div_fixup_f32` in the hardware's order
         // (`VICTORY_DIV_FIXUP=1`, after dng-nguyn 472518cb).
         if victory_shader::emit::div_fixup_order() {
