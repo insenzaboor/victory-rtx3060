@@ -193,6 +193,23 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
+    // The value may have moved between the look above and the push: a
+    // bottom-of-pipe write (`crate::queue::Written::write`) stores into it
+    // without the waiters' lock and without `set`, so an event pushed just
+    // after it would wait for the sweep (or for good with
+    // `VICTORY_FENCE_SWEEP=0`). Looked at once more after the push; a load,
+    // and nothing changes when the value has not moved. (From Kira 63504046c,
+    // its always-on part.)
+    let now = fence.value.load(Ordering::Acquire);
+    if now >= value {
+        waiters.retain(|&(wanted, event)| {
+            let reached = wanted <= now;
+            if reached {
+                set_event(event);
+            }
+            !reached
+        });
+    }
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
