@@ -608,6 +608,8 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        // (`VICTORY_LIST_IDLE_MAX`: the thin recordings' idle lists of ours.)
+        crate::list::trim_idle();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -1458,7 +1460,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<Budget>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
@@ -1494,6 +1496,120 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Whether host lists' indirect-work budgets are 256-byte slots of shared
+/// 64 KiB buffers (`VICTORY_BUDGET_PACK=1`; off by default: a buffer of each
+/// list's own). After skornuta/victory-memory-stack patch 0023 (`8172480`):
+/// a placed or committed buffer takes 64 KiB however small, and 602 lists'
+/// budgets held 37 MB in the first area. Shaders write a budget through its
+/// address (a root view: no barrier names its buffer); the list's end copies
+/// the card's notes into it ([`HostList::card_budget_out`]) at its offset.
+/// A slot goes back behind the submissions running when its list goes.
+fn budget_pack() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_some_and(|v| v == "1"))
+}
+
+/// A budget's bytes, and the buffers [`budget_pack`] cuts them from.
+const BUDGET_SLOT: u64 = 256;
+const BUDGET_SLAB: u64 = 64 << 10;
+
+/// The budgets' shared buffers (buffer, mapping), and the free slots (buffer,
+/// offset).
+struct BudgetSlabs(Vec<(ID3D12Resource, usize)>, Vec<(usize, u64)>);
+
+// SAFETY: D3D12 objects are free-threaded; the mappings are only addresses.
+unsafe impl Send for BudgetSlabs {}
+
+static BUDGET_SLABS: Mutex<BudgetSlabs> = Mutex::new(BudgetSlabs(Vec::new(), Vec::new()));
+
+/// A host list's indirect-work budget: a buffer and the offset of its 256
+/// bytes in it, mapped at `data`; with [`budget_pack`] the slot, given back
+/// when it goes.
+struct Budget {
+    buffer: ID3D12Resource,
+    offset: u64,
+    data: usize,
+    _slot: Option<BudgetSlot>,
+}
+
+/// A slot of [`BUDGET_SLABS`]: back when dropped, behind the submissions
+/// running then ([`retire`]).
+struct BudgetSlot(usize, u64);
+
+/// Gives a slot back when dropped.
+struct BudgetFree(usize, u64);
+
+impl Drop for BudgetFree {
+    fn drop(&mut self) {
+        BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner()).1.push((self.0, self.1));
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        retire(BudgetFree(self.0, self.1));
+    }
+}
+
+impl Budget {
+    fn new() -> Option<Budget> {
+        if !budget_pack() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
+            return Some(Budget {
+                buffer,
+                offset: 0,
+                data: data as usize,
+                _slot: None,
+            });
+        }
+        let mut slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+        if slabs.1.is_empty() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLAB)?;
+            name(&buffer, || "indirect budgets".into());
+            let at = slabs.0.len();
+            slabs.0.push((buffer, data as usize));
+            // Taken from the front: the slab's first slot first.
+            slabs.1.extend((0..BUDGET_SLAB / BUDGET_SLOT).rev().map(|k| (at, k * BUDGET_SLOT)));
+        }
+        let (slab, offset) = slabs.1.pop()?;
+        let (buffer, data) = slabs.0[slab].clone();
+        drop(slabs);
+        let data = data + offset as usize;
+        // A slot given back holds its last list's words: zeroed, as a new
+        // buffer is.
+        // SAFETY: the slot's 256 mapped bytes, ours alone now (its last
+        // list's submissions ran).
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
+        Some(Budget {
+            buffer,
+            offset,
+            data,
+            _slot: Some(BudgetSlot(slab, offset)),
+        })
+    }
+
+    fn gpu(&self) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetGPUVirtualAddress() + self.offset }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A packed budget's slot comes back when what holds it goes, and a
+    /// slab holds 256 of them.
+    #[test]
+    fn a_budget_slot_comes_back() {
+        assert_eq!(BUDGET_SLAB / BUDGET_SLOT, 256);
+        drop(BudgetFree(usize::MAX, 3 * BUDGET_SLOT));
+        let mut slabs = BUDGET_SLABS.lock().unwrap();
+        let at = slabs.1.iter().position(|&s| s == (usize::MAX, 3 * BUDGET_SLOT)).expect("given back");
+        slabs.1.remove(at);
+    }
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -8049,18 +8165,12 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = budget.data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -8085,8 +8195,11 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        Some(match card {
+            // SAFETY: a live buffer.
+            Some(card) => unsafe { card.GetGPUVirtualAddress() },
+            None => budget.gpu(),
+        })
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -8141,7 +8254,7 @@ impl HostList {
         if !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
+        let (Some(Some(card)), Some(Some(Budget { buffer: mapped, offset, .. }))) =
             (self.card_budget.get(), self.budget.get())
         else {
             return;
@@ -8154,7 +8267,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, offset + 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8748,7 +8861,10 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
-    /// `ahead` holds everything the submission refreshes
+    /// Under [`refresh_pages`], in place of `ahead` for what
+    /// [`Batch::refresh_front`] brought up to date: the ranges, per copy.
+    ahead_runs: ByCopy<Vec<(usize, usize)>>,
+    /// `ahead` (or `ahead_runs`) holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
 }
@@ -8831,6 +8947,89 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
     spans
 }
 
+/// Whether [`Batch::refresh_front`] brings up to date only the ranges the
+/// steps ask for, per copy ([`front_runs`]), instead of the one span from the
+/// lowest to the highest ([`front_spans`]), gaps and all
+/// (`VICTORY_REFRESH_PAGES=1`, off by default; `VICTORY_AB` may flip it).
+///
+/// Ported from DissolveDZ (77d3f507, "refresh requested buffer ranges
+/// without copying gaps"). [`crate::shadow::Shadow::update`] copies only the
+/// pages written since, but over the whole span: the write watch is asked
+/// about every page of the gaps, a copy that is not write-watched copies them
+/// whole, and pages the title wrote there that no step reads are copied too.
+fn refresh_pages() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_PAGES"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_REFRESH_PAGES").unwrap_or(on);
+    on
+}
+
+/// [`front_spans`], each copy's refreshes kept apart ([`refresh_pages`]): per
+/// copy in the order of its first touch, the ranges that count (the same as
+/// those [`front_spans`] covers), sorted, those that meet or end and start in
+/// one write-watch page joined ([`merge_runs`]).
+fn front_runs(steps: impl Iterator<Item = Touch>) -> Vec<(usize, Vec<(usize, usize)>)> {
+    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut runs: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    let mut given: Vec<u32> = Vec::new();
+    let (mut part, mut last) = (1, usize::MAX);
+    for step in steps {
+        let (copy, range) = match step {
+            Touch::Refresh(copy, from, to) => (copy, Some((from, to))),
+            Touch::Write(copy) => (copy, None),
+            Touch::Part => {
+                part += 1;
+                continue;
+            }
+            Touch::Title | Touch::Nothing => continue,
+        };
+        // (Most come several times on end.)
+        let i = if runs.get(last).is_some_and(|r| r.0 == copy) {
+            last
+        } else {
+            *at.entry(copy).or_insert_with(|| {
+                runs.push((copy, Vec::new()));
+                given.push(0);
+                runs.len() - 1
+            })
+        };
+        last = i;
+        match range {
+            Some((from, to)) if from < to && given[i] != part => {
+                if runs[i].1.last() != Some(&(from, to)) {
+                    runs[i].1.push((from, to));
+                }
+            }
+            Some(_) => {}
+            None => given[i] = part,
+        }
+    }
+    runs.retain_mut(|(_, r)| {
+        merge_runs(r);
+        !r.is_empty()
+    });
+    runs
+}
+
+/// Sorts `runs` and joins those that overlap, meet, or where one starts in
+/// the write-watch page the one before ends in (`crate::watch::PAGE`): that
+/// page is asked about and copied once.
+fn merge_runs(runs: &mut Vec<(usize, usize)>) {
+    runs.sort_unstable();
+    let mut kept = 0;
+    for i in 0..runs.len() {
+        let (from, to) = runs[i];
+        if kept > 0 && from <= runs[kept - 1].1.next_multiple_of(crate::watch::PAGE) {
+            runs[kept - 1].1 = runs[kept - 1].1.max(to);
+        } else {
+            runs[kept] = (from, to);
+            kept += 1;
+        }
+    }
+    runs.truncate(kept);
+}
+
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
 /// each list's part beside the submitting thread (renderer port #6).
 const WIDE_PLAN_STEPS: usize = 4096;
@@ -8843,6 +9042,9 @@ struct ListFront {
     /// shaders (`usize::MAX, 0`: none) and whether it writes it: what
     /// [`join_fronts`] takes.
     copies: Vec<(usize, usize, usize, bool)>,
+    /// Under [`refresh_pages`], in place of `copies`: each copy's ranges
+    /// themselves ([`fold_runs`]), what [`join_runs`] takes.
+    runs: Vec<(usize, Vec<(usize, usize)>, bool)>,
     /// A copy the list refreshes, by address.
     shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)>,
     /// The textures to bring up to date, in order.
@@ -8851,7 +9053,7 @@ struct ListFront {
 
 /// A list's steps as [`front_spans`] takes them, folded per copy
 /// ([`ListFront`]).
-fn list_front(steps: &[Step], textures: bool) -> ListFront {
+fn list_front(steps: &[Step], textures: bool, pages: bool) -> ListFront {
     let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
     let mut staged: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
     let mut refreshed: ByCopy<()> = ByCopy::default();
@@ -8870,8 +9072,81 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
         }
         _ => None,
     });
+    if pages {
+        let runs = fold_runs(touches);
+        return ListFront { copies: Vec::new(), runs, shadows, textures: staged };
+    }
     let copies = fold_touches(touches);
-    ListFront { copies, shadows, textures: staged }
+    ListFront { copies, runs: Vec::new(), shadows, textures: staged }
+}
+
+/// [`fold_touches`] keeping each copy's ranges apart ([`refresh_pages`]):
+/// per copy in the order of its first touch, the ranges it refreshes before
+/// the list's first write of it by shaders, and whether it is written.
+fn fold_runs(touches: impl Iterator<Item = Touch>) -> Vec<(usize, Vec<(usize, usize)>, bool)> {
+    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut copies: Vec<(usize, Vec<(usize, usize)>, bool)> = Vec::new();
+    let mut last = usize::MAX;
+    for touch in touches {
+        let (key, range) = match touch {
+            Touch::Refresh(key, from, to) => (key, Some((from, to))),
+            Touch::Write(key) => (key, None),
+            _ => continue,
+        };
+        let i = if copies.get(last).is_some_and(|c| c.0 == key) {
+            last
+        } else {
+            *at.entry(key).or_insert_with(|| {
+                copies.push((key, Vec::new(), false));
+                copies.len() - 1
+            })
+        };
+        last = i;
+        let c = &mut copies[i];
+        match range {
+            Some((from, to)) if !c.2 && from < to => {
+                if c.1.last() != Some(&(from, to)) {
+                    c.1.push((from, to));
+                }
+            }
+            Some(_) => {}
+            None => c.2 = true,
+        }
+    }
+    copies
+}
+
+/// [`front_runs`] of the lists whose parts are `lists` ([`fold_runs`]), a new
+/// part of the submission beginning at each of `parts`: the same runs, in the
+/// same order (`front_tests`), as [`join_keys`] is to [`front_spans`].
+fn join_runs<'a>(lists: impl Iterator<Item = &'a [(usize, Vec<(usize, usize)>, bool)]>, parts: &[usize]) -> Vec<(usize, Vec<(usize, usize)>)> {
+    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut runs: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    let mut given: Vec<u32> = Vec::new();
+    let mut part = 1;
+    for (n, copies) in lists.enumerate() {
+        if parts.contains(&n) {
+            part += 1;
+        }
+        for (key, ranges, written) in copies {
+            let i = *at.entry(*key).or_insert_with(|| {
+                runs.push((*key, Vec::new()));
+                given.push(0);
+                runs.len() - 1
+            });
+            if given[i] != part {
+                runs[i].1.extend_from_slice(ranges);
+            }
+            if *written {
+                given[i] = part;
+            }
+        }
+    }
+    runs.retain_mut(|(_, r)| {
+        merge_runs(r);
+        !r.is_empty()
+    });
+    runs
 }
 
 /// Touches of one list, per copy in the order of their first touch: the span
@@ -8954,7 +9229,82 @@ fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<cra
 
 #[cfg(test)]
 mod front_tests {
-    use super::{Touch, fold_touches, front_spans, join_keys};
+    use super::{Touch, fold_runs, fold_touches, front_runs, front_spans, join_keys, join_runs};
+
+    /// `VICTORY_REFRESH_PAGES` (DissolveDZ 77d3f507): ranges apart from one
+    /// another stay apart, those in one write-watch page are joined, and what
+    /// a part refreshes of a copy it gave its shaders is left out.
+    #[test]
+    fn front_runs_keep_the_gaps_out_and_the_write_boundaries() {
+        use Touch::{Part, Refresh, Write};
+        let runs = front_runs(
+            [
+                Refresh(1, 0x1000, 0x1100),
+                Refresh(1, 0x1200, 0x1300),
+                Refresh(2, 0x8000, 0x8000),
+                Write(1),
+                Refresh(1, 0x3000, 0x3100),
+                Part,
+                Refresh(1, 0x25000, 0x25100),
+                Refresh(1, 0x25000, 0x25100),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(runs, [(1, vec![(0x1000, 0x1300), (0x25000, 0x25100)])]);
+    }
+
+    /// Each copy's runs lie inside the span [`front_spans`] gives it, and
+    /// lists folded apart and joined give what the whole submission gives.
+    #[test]
+    fn front_runs_lie_in_the_spans_and_join_like_them() {
+        let mut seed = 0x51ed_270b_u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let page = crate::watch::PAGE;
+        for _ in 0..3000 {
+            let lists = 1 + next(8);
+            let copies = 1 + next(6);
+            let mut parts = Vec::new();
+            let mut whole: Vec<Touch> = Vec::new();
+            let mut again: Vec<Touch> = Vec::new();
+            let mut folds = Vec::new();
+            for n in 0..lists {
+                if n > 0 && next(4) == 0 {
+                    parts.push(n);
+                    whole.push(Touch::Part);
+                    again.push(Touch::Part);
+                }
+                let mut mine: Vec<Touch> = Vec::new();
+                for _ in 0..next(12) {
+                    let key = 0x1000 * (1 + next(copies));
+                    if next(5) == 0 {
+                        mine.push(Touch::Write(key));
+                        whole.push(Touch::Write(key));
+                        again.push(Touch::Write(key));
+                    } else {
+                        let from = next(8) * page + next(page);
+                        let to = from + 1 + next(page / 2);
+                        mine.push(Touch::Refresh(key, from, to));
+                        whole.push(Touch::Refresh(key, from, to));
+                        again.push(Touch::Refresh(key, from, to));
+                    }
+                }
+                folds.push(fold_runs(mine.into_iter()));
+            }
+            let runs = front_runs(whole.into_iter());
+            let spans = front_spans(again.into_iter());
+            assert_eq!(runs.len(), spans.len());
+            for ((key, runs), &(k, from, to)) in runs.iter().zip(&spans) {
+                assert_eq!(*key, k);
+                assert_eq!((runs[0].0, runs[runs.len() - 1].1), (from, to));
+                assert!(runs.windows(2).all(|w| w[0].1.next_multiple_of(page) < w[1].0));
+            }
+            let joined = join_runs(folds.iter().map(|f| f.as_slice()), &parts);
+            assert_eq!(joined, runs, "parts {parts:?}");
+        }
+    }
 
     /// Random submissions of lists (refreshes and shaders' writes of a few
     /// copies, new parts now and then): each list folded on its own and the
@@ -9162,6 +9512,13 @@ impl Batch {
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
+        // (Sorted and apart: the last that starts at or before `address`.)
+        if let Some(runs) = self.ahead_runs.get(&key) {
+            let i = runs.partition_point(|&(from, _)| from <= address);
+            if i > 0 && end <= runs[i - 1].1 {
+                return;
+            }
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -9227,6 +9584,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.ahead_runs.clear();
         self.textures.clear();
     }
 
@@ -9235,6 +9593,8 @@ impl Batch {
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut due = Vec::new();
+        // (Read once for the submission: `VICTORY_AB` may flip it between.)
+        let pages = refresh_pages();
         // Renderer port #6: each list's part made on the threads beside, and
         // joined here in order (`list_front`, `join_fronts`): one submission
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
@@ -9257,7 +9617,7 @@ impl Batch {
                 // SAFETY: as above; a list's deferred steps are behind its lock.
                 let list = unsafe { &**at.0.add(n) };
                 debug_assert!(n < at.1);
-                let front = list_front(&list.deferred().copies, textures);
+                let front = list_front(&list.deferred().copies, textures, pages);
                 *out[n].lock().unwrap_or_else(|e| e.into_inner()) = Some(front);
             });
             drop(lists);
@@ -9269,6 +9629,20 @@ impl Batch {
                         due.push(staging.clone());
                     }
                 }
+            }
+            if pages {
+                let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+                for front in &fronts {
+                    for (key, shadow) in &front.shadows {
+                        shadows.entry(*key).or_insert_with(|| shadow.clone());
+                    }
+                }
+                let groups = join_runs(fronts.iter().map(|f| f.runs.as_slice()), parts)
+                    .into_iter()
+                    .filter_map(|(key, runs)| Some((shadows.remove(&key)?, runs)))
+                    .collect();
+                self.refresh_runs(groups, due, planning);
+                return;
             }
             let spans = join_fronts(&fronts, parts);
             self.refresh_spans(spans, due, planning);
@@ -9302,11 +9676,95 @@ impl Batch {
             }
         }
         planning.next("refreshes in front: the spans");
+        if pages {
+            let groups = front_runs(touches.into_iter())
+                .into_iter()
+                .filter_map(|(key, runs)| Some((copies.remove(&key)?, runs)))
+                .collect();
+            self.refresh_runs(groups, due, planning);
+            return;
+        }
         let spans: Vec<_> = front_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
         self.refresh_spans(spans, due, planning);
+    }
+
+    /// [`Batch::refresh_spans`] under [`refresh_pages`]: each copy's ranges
+    /// (`groups`, from [`front_runs`]) brought up to date one after the other
+    /// on one thread, the copies on several (DissolveDZ 77d3f507: a copy's
+    /// refreshes share its write-watch record), and the textures `due`.
+    fn refresh_runs(
+        &mut self,
+        groups: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+        due: Vec<std::sync::Arc<crate::texture::Staging>>,
+        planning: crate::timeline::Span,
+    ) {
+        planning.end();
+        self.front = true;
+        for (shadow, runs) in &groups {
+            self.ahead_runs.insert(std::sync::Arc::as_ptr(shadow) as usize, runs.clone());
+        }
+        let count: usize = groups.iter().map(|(_, runs)| runs.len()).sum();
+        #[cfg(feature = "diagnostics")]
+        {
+            FLUSHES[0].fetch_add(1, Ordering::Relaxed);
+            FLUSHES[1].fetch_add(count as u64, Ordering::Relaxed);
+        }
+        let _flush = crate::timeline::span("refreshes of copies");
+        let started = std::time::Instant::now();
+        let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
+        // As in `refresh_spans`: those known to copy nothing said so here,
+        // unless they are very many.
+        const FEW: usize = 256;
+        let mut groups = groups;
+        let many = count > FEW || crate::watch::port_guard_plan() && groups.len() + due.len() >= 4;
+        let mut count = count;
+        if !many {
+            let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
+            for (shadow, runs) in &mut groups {
+                runs.retain(|&(from, to)| !shadow.nothing_new(from, to - from));
+            }
+            groups.retain(|(_, runs)| !runs.is_empty());
+            let left: usize = groups.iter().map(|(_, runs)| runs.len()).sum();
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((count - left) as u64, Ordering::Relaxed);
+            count = left;
+        }
+        let ahead = count > 1;
+        if ahead {
+            let ranges: Vec<(usize, usize)> =
+                groups.iter().filter(|(shadow, _)| shadow.asked_ahead()).flat_map(|(_, runs)| runs.iter().copied()).collect();
+            crate::watch::ask_ahead(&ranges);
+        }
+        #[cfg(feature = "diagnostics")]
+        FLUSHES[3].fetch_add(count as u64, Ordering::Relaxed);
+        crate::shadow::wide_each(groups.len() + due.len(), move |i| {
+            let Some(i) = i.checked_sub(due.len()) else {
+                due[i].refresh();
+                return;
+            };
+            let (shadow, runs) = &groups[i];
+            for &(from, to) in runs {
+                if many && shadow.nothing_new(from, to - from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Self::update(shadow, from, to);
+            }
+        });
+        if ahead {
+            crate::watch::ask_ahead_done();
+        }
+        let took = started.elapsed().as_micros() as u64;
+        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
+        preparing_take_back(&PREPARING[2], summed[1]);
+        preparing_take_back(&PREPARING[0], summed[0]);
+        PREPARING[0].fetch_add(took, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// The rest of [`Batch::refresh_front`]: `spans` brought up to date in

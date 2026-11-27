@@ -89,6 +89,22 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_INPLACE_CONSTANTS`: 0 (unset) off, 1 on. Steps done on the card
+/// (`host::card_steps`, `VICTORY_CARD_STEPS`) may read title memory in place
+/// (this file's windows and buffers, renderer port 1's regions) as their
+/// source: the card reads the title's own bytes there, behind the flights
+/// that write them. Off, such a step is refused ("no host copy holds all of
+/// it") and the submission waits for its flights. After
+/// Maykzera/victory-rtx3060 e67ab0708 (and fxceless bcc542151, whose
+/// constants heap in place made the refusal show): on an RTX 3060 + 5600X
+/// the waits went (30-40 ms a frame) and the run went 15-16 -> 17.2 fps.
+/// Worth anything only with title memory in place (`VICTORY_INPLACE` at 1
+/// or 2, or `VICTORY_PORT_CONSTANTS=1`).
+pub(crate) fn constants_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `VICTORY_UMA_DIRECT`: 0 (unset) off, 1 on. A copy that is the title's
 /// own memory and that no shader writes ([`crate::shadow::Shadow::direct_read`])
 /// is not refreshed: the refresh would copy nothing (`Shadow::update`), and

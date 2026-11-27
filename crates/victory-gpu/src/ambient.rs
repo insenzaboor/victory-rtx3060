@@ -47,6 +47,9 @@
 //! `VICTORY_AMBIENT_REFLECT=<most>[,<least>]` holds what the title's last
 //! reflection pass (`CS_UpdateHistory`) leaves between those parts of the
 //! light around (beloooo's 44dcd437, 0.5 there, and c3bd5612, 0 there).
+//! With `VICTORY_REFLECT_SCREEN=1` too, the most of that part also holds
+//! what the screen-space resolve (`CS_ResolveScreenSpace`) leaves, before
+//! the history is updated from it ([`reflect_screen`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -67,10 +70,38 @@ pub(crate) enum Role {
     Air,
     /// Writes the reflections for the last time in a frame.
     Reflect,
+    /// Resolves the screen-space reflections, a typed R11G11B10_FLOAT image
+    /// ([`reflect_screen`]).
+    ReflectScreen,
+}
+
+/// `VICTORY_REFLECT_SCREEN=1` (off by default; with `VICTORY_AMBIENT` and
+/// `VICTORY_AMBIENT_REFLECT`): the reflections are held to the most of their
+/// part of the light around right after `CS_ResolveScreenSpace` too, not only
+/// after `CS_UpdateHistory`. Without rays the screen-space resolve is where
+/// the sky's light lands, unoccluded, on glossy floors, glass and the phone's
+/// screen: a white glaze that upscalers turn into shimmer, and that the
+/// history then carries from frame to frame.
+///
+/// Ported from DissolveDZ 2feeb26f ("Port Whiplash reflection clamp to the
+/// DLSS renderer"), itself an adaptation of Trexies' Whiplash fix
+/// (GPL-3.0-or-later): the program `CS_ResolveScreenSpace_ed816b5d`, its
+/// image at (1, 128), a quarter of the picture (640x360 at 1280x720, their
+/// run RSS1), held only where the device loads and stores that format
+/// through typed views. Only a most: where the screen finds nothing the
+/// title falls back on its own, and no least is put there.
+pub(crate) fn reflect_screen() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFLECT_SCREEN"))
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
+    role_with(container, reflect_screen())
+}
+
+/// [`role`], [`Role::ReflectScreen`] only when `screen` ([`reflect_screen`]).
+fn role_with(container: &[u8], screen: bool) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
     if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
@@ -80,6 +111,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Air)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflect)
+    } else if screen && has(b"CS_ResolveScreenSpace_ed816b5d") {
+        Some(Role::ReflectScreen)
     } else {
         None
     }
@@ -96,6 +129,9 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// Where the last reflection pass writes the reflections (R9G9B9E5 as
 /// 32-bit integers).
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// Where `CS_ResolveScreenSpace` writes its reflections (R11G11B10_FLOAT;
+/// DissolveDZ 2feeb26f).
+pub(crate) const REFLECTIONS_SCREEN: (u8, u32) = (1, 128);
 
 /// The most and the least of a reflection, as parts of the light around
 /// (`VICTORY_AMBIENT_REFLECT=<most>[,<least>]`; unset or 0: the title's
@@ -468,26 +504,48 @@ uint pack(float3 c) {
 }
 #endif
 
+#if defined(HOLD) || defined(HOLDF)
+// The light around a pixel of the reflections: the set light (the sky's,
+// the constant), or the estimate gathered for the point seen there.
+float3 around_at(uint2 at) {
+    if (gain > 0.0 || least > 0.0) {
+        float4 s = cells[SKY_AT];
+        float3 hue = any(s.rgb > 0.0) ? s.rgb : float3(0.6, 0.75, 1.0);
+        return hue * (gain * (s.w > 0.0 ? pow(s.w, power) : 0.0) + least);
+    }
+    if (constant > 0.0) {
+        return float3(1.0, 0.98, 0.94) * constant;
+    }
+    uint2 q = min(uint2((float2(at) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    return float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w) * level;
+}
+#endif
+
+#ifdef HOLDF
+// (`VICTORY_REFLECT_SCREEN`; DissolveDZ 2feeb26f after Trexies' Whiplash)
+// What the screen-space resolve leaves, no brighter than the most part of the
+// light around; nothing is raised.
+RWTexture2D<float3> screen : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_screen(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 c = screen[at.xy];
+    float has = dot(c, LUMA);
+    float most = dot(around_at(at.xy), LUMA) * reflect_most;
+    if (has > most) screen[at.xy] = c * (most / max(has, 1e-6));
+}
+#endif
+
 #ifdef HOLD
 // The reflections between parts of the light around (beloooo's 44dcd437
-// and c3bd5612): the set light (the sky's, the constant), or the estimate
-// gathered for the point seen there.
+// and c3bd5612).
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void hold(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
-    float3 around;
-    if (gain > 0.0 || least > 0.0) {
-        float4 s = cells[SKY_AT];
-        float3 hue = any(s.rgb > 0.0) ? s.rgb : float3(0.6, 0.75, 1.0);
-        around = hue * (gain * (s.w > 0.0 ? pow(s.w, power) : 0.0) + least);
-    } else if (constant > 0.0) {
-        around = float3(1.0, 0.98, 0.94) * constant;
-    } else {
-        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-        uint at0 = (q.y * PX + q.x) * 3;
-        around = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w) * level;
-    }
+    float3 around = around_at(at.xy);
     float3 c = unpack(light[at.xy]);
     float has = dot(c, LUMA);
     float most = dot(around, LUMA) * reflect_most;
@@ -611,6 +669,9 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     hold: ID3D12PipelineState,
+    /// [`Role::ReflectScreen`]'s hold: made only under [`reflect_screen`],
+    /// with a most set, where the device takes the image's typed views.
+    hold_screen: Option<ID3D12PipelineState>,
     /// The sky's mean ([`Set::Sky`]), and the views it reads, in a heap of
     /// its own, used in turn: more than the passes of every list in flight
     /// (a view of the sky, a null view for the table the pass does not read).
@@ -626,6 +687,24 @@ struct Pass {
 unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
+
+/// Whether the device loads and stores R11G11B10_FLOAT through typed views,
+/// as [`Role::ReflectScreen`]'s hold does (an optional format for typed
+/// loads).
+fn screen_typed(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT;
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R11G11B10_FLOAT, ..Default::default() };
+    let wanted = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+    // SAFETY: the check writes into this structure of its size.
+    let asked = unsafe {
+        device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32)
+    };
+    let typed = asked.is_ok() && support.Support2.0 & wanted == wanted;
+    if !typed {
+        tracing::warn!("VICTORY_REFLECT_SCREEN: the device has no typed loads and stores of R11G11B10_FLOAT; not held");
+    }
+    typed
+}
 
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
@@ -652,6 +731,14 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let air = pipeline("AIR", s!("clear_air"))?;
     let sky = pipeline("SKY", s!("sky_mean"))?;
     let hold = pipeline("HOLD", s!("hold"))?;
+    // (Its own failure leaves the others.)
+    let hold_screen = (reflect_screen() && reflect()[0] > 0.0 && screen_typed(device))
+        .then(|| {
+            pipeline("HOLDF", s!("hold_screen"))
+                .inspect_err(|e| tracing::warn!(error = %e, "no hold of the screen-space reflections"))
+                .ok()
+        })
+        .flatten();
     let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     // SAFETY: plain creations; null views in the heap's own slots.
     let (views, step) = unsafe {
@@ -684,6 +771,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         hold,
+        hold_screen,
         sky,
         views,
         step,
@@ -765,6 +853,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Reflect && reflect_most <= 0.0 {
         return false;
     }
+    if role == Role::ReflectScreen && (reflect_most <= 0.0 || pass.hold_screen.is_none()) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -823,6 +914,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| tracing::info!(reflect_most, reflect_least, "reflections held to the light around"));
                 run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
+            Role::ReflectScreen => {
+                if let Some(hold_screen) = &pass.hold_screen {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| tracing::info!(reflect_most, size = ?views.size, "screen-space reflections held to the light around"));
+                    run(hold_screen, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                }
             }
             Role::Resolve => {
                 if !fixed {
@@ -902,6 +1000,10 @@ mod tests {
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
         assert_eq!(role(b"..CS_UpdateHistory_0f3c.."), Some(Role::Reflect));
+        // `VICTORY_REFLECT_SCREEN`: only when it is on, and only that program.
+        assert_eq!(role_with(b"..CS_ResolveScreenSpace_ed816b5d_Wrapped..", false), None);
+        assert_eq!(role_with(b"..CS_ResolveScreenSpace_ed816b5d_Wrapped..", true), Some(Role::ReflectScreen));
+        assert_eq!(role_with(b"..CS_ResolveScreenSpace_0000aaaa..", true), None);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
@@ -911,5 +1013,14 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+    }
+
+    /// The screen-space hold ([`reflect_screen`]) and the history's compile,
+    /// with or without a device.
+    #[test]
+    fn the_holds_compile() {
+        for (part, entry) in [("HOLDF", s!("hold_screen")), ("HOLD", s!("hold"))] {
+            crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1")).expect(part);
+        }
     }
 }

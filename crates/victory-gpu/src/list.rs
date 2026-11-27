@@ -135,6 +135,11 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    /// A list of ours behind a `VICTORY_THIN` recording whose `host` is
+    /// taken at its reset and given away at its submission, so that idle
+    /// ones in `thin::BACKS` hold no host list (`VICTORY_THIN_RELEASE_BACK=1`).
+    #[cfg(windows)]
+    lazy_host: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -285,6 +290,57 @@ fn idle_most_for(avail_phys: Option<u64>) -> usize {
     }
 }
 
+/// `VICTORY_LIST_IDLE_MAX=N` (unset: as before): at most `N` host lists kept
+/// idle, beside what [`idle_most`] keeps by the PC's free memory, and at most
+/// `min(N, 128)` lists of ours kept behind `VICTORY_THIN` recordings
+/// (`thin::BACKS`, else never let go), trimmed to `min(N, 64)` while the PC
+/// is short of memory. After MKmajster/victory-fork-8gb bb119618b and
+/// fbf89b7c: ~1,540 host lists alive (+3.1 GiB private) from the thin back
+/// lists alone on a 16 GB PC; the floors are fbf89b7c's, below which list
+/// creation thrashed (~480 lists a second, 131k waits for residency).
+#[cfg(windows)]
+pub(super) fn idle_list_max() -> Option<usize> {
+    static MAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| parse_idle_list_max(std::env::var("VICTORY_LIST_IDLE_MAX").ok().as_deref()))
+}
+
+#[cfg(windows)]
+fn parse_idle_list_max(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse().ok())
+}
+
+/// While the PC is short of memory (`crate::host`'s sweep), with
+/// [`idle_list_max`]: the lists of ours behind thin recordings over its floor
+/// go. (The idle host lists come down with free memory already, [`recycle`].)
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    if let Some(max) = idle_list_max() {
+        thin::trim_backs(max.min(64));
+    }
+}
+
+/// A host list never submitted (a thin recording's, let go of before its
+/// submission) back to [`IDLE`], or let go.
+#[cfg(windows)]
+pub(super) fn recycle_host(host: crate::host::HostList) {
+    if !pools() {
+        reap(vec![Box::new(Unpooled(host))]);
+        return;
+    }
+    let most = idle_most(crate::host::available_physical_ram_recent(), alloc_trim() > 0, lean_lists())
+        .min(idle_list_max().unwrap_or(usize::MAX));
+    host.reset();
+    let bytes = host.scratch_kept();
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
+        idle.0.push(Idle(host, bytes));
+        idle.1 += bytes;
+    } else {
+        drop(idle);
+        reap(vec![Box::new(Unpooled(host))]);
+    }
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -332,7 +388,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     // and fewer made anew (each new list makes its own small buffers, and
     // each of those waits for residency); with `VICTORY_LIST_LEAN=1` not
     // while the PC is short of memory.
-    let most = idle_most(crate::host::available_physical_ram_recent(), trim > 0, lean_lists());
+    let most = idle_most(crate::host::available_physical_ram_recent(), trim > 0, lean_lists())
+        .min(idle_list_max().unwrap_or(usize::MAX));
     // Kept while the PC had more room: the ones over `most` go (they have
     // run), dropped outside the lock.
     {
@@ -675,16 +732,22 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let host = if list.lazy_host {
+            // (A thin recording's list of ours: its next reset takes one.)
+            list.host.take()
+        } else {
+            let Some(fresh) = fresh_list() else {
+                continue;
+            };
+            // A new host list is open; the title's next call on its list is a
+            // reset, which wants it closed.
+            fresh.close();
+            list.host.replace(fresh)
+        };
+        let Some(host) = host else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -747,17 +810,23 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let host = if (*list).lazy_host {
+                // (A thin recording's list of ours: its next reset takes one.)
+                (*list).host.take()
+            } else {
+                let Some(fresh) = fresh_list() else {
+                    continue;
+                };
+                // A new host list is open; the title's next call on its list
+                // is a reset, which wants it closed.
+                fresh.close();
+                (*list).host.replace(fresh)
+            };
+            let Some(host) = host else {
                 continue;
             };
             let uploads =
@@ -856,8 +925,19 @@ fn new_list(
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
 fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    boxed_with(kind, pipeline, thin, false)
+}
+
+/// A list of ours behind a thin recording whose host list is taken at its
+/// reset and given away at its submission (`VICTORY_THIN_RELEASE_BACK=1`).
+#[cfg(windows)]
+fn boxed_back(kind: u32) -> Box<List> {
+    boxed_with(kind, std::ptr::null(), false, true)
+}
+
+fn boxed_with(kind: u32, pipeline: This, thin: bool, lazy_host: bool) -> Box<List> {
     #[cfg(not(windows))]
-    let _ = thin;
+    let _ = (thin, lazy_host);
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -878,7 +958,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin && !lazy_host).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -897,6 +977,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        lazy_host,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -956,6 +1038,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        if list.lazy_host && list.host.is_none() {
+            // Closed, as a reset wants it (as `detach` leaves one).
+            list.host = fresh_list();
+            if let Some(host) = &list.host {
+                host.close();
+            }
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {

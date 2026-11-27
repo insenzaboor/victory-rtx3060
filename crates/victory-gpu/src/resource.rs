@@ -1988,7 +1988,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// before) less what such copies hold now; under `VICTORY_RT_ROOM_PEAK=1`
+/// sized by their peak instead ([`targets_kept_from_peak`]).
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -2014,7 +2015,45 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    // The most the targets have held this run, kept whether or not the
+    // switch below is on, so that `VICTORY_AB` can flip it.
+    static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    if rt_room_peak() {
+        return targets_kept_from_peak(most, targets, peak);
+    }
     most.saturating_sub(targets)
+}
+
+/// `VICTORY_RT_ROOM_PEAK=1` (off by default; `VICTORY_AB` may flip it):
+/// [`targets_room_kept`] sizes the room by the peak the targets have held
+/// ([`targets_kept_from_peak`]) instead of keeping the flat amount.
+#[cfg(windows)]
+fn rt_room_peak() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| crate::switch::on("VICTORY_RT_ROOM_PEAK"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_RT_ROOM_PEAK").unwrap_or(on);
+    on
+}
+
+/// What [`targets_room_kept`] keeps of `most` under `VICTORY_RT_ROOM_PEAK`:
+/// half as much again as the targets have held at their most (`peak`), at
+/// least 256 MiB, never more than `most`, less what they hold now.
+///
+/// Ported from MKmajster's victory-4060 (0a1e1113, "size the render
+/// targets' room by the peak they have held"). The flat 3,072 MB is only
+/// given back as the targets fill it, which the targets of a 720p world
+/// (the SeriesS profile) never do: on an 8 GB RTX 4060 Laptop they held
+/// 390 MB, so about 2.7 GB stayed reserved the whole run and the texture
+/// queue was refused with the card 41 % used (passers-by's skin and the
+/// phone's screen never uploaded). Sized by the peak the same run keeps
+/// 195 MB; a 1440p world's peak of 2.9 GB still gets what it had.
+#[cfg(any(windows, test))]
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
+    /// Room for targets to grow into while they are still being made.
+    const LEAST: u64 = 256 << 20;
+    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -5053,6 +5092,26 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// `VICTORY_RT_ROOM_PEAK`: the room kept for render targets follows the
+    /// most they have held, not the flat 3,072 MB (MKmajster 0a1e1113).
+    #[test]
+    fn room_for_targets_follows_their_peak() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // SeriesS at 720p: the targets stay at 390 MB, 195 MB is kept.
+        assert_eq!(targets_kept_from_peak(most, 390 * MIB, 390 * MIB), 195 * MIB);
+        // A world's first frames: half as much again as their peak so far.
+        assert_eq!(targets_kept_from_peak(most, 650 * MIB, 650 * MIB), 325 * MIB);
+        // 1440p: the peak passes the flat amount; never more than it.
+        assert_eq!(targets_kept_from_peak(most, 2900 * MIB, 2900 * MIB), 172 * MIB);
+        // Targets given back: the peak still holds what they may want.
+        assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB), most);
+        // Nothing made yet: at least 256 MiB.
+        assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
+        // The flat amount set to none (0) still keeps none.
+        assert_eq!(targets_kept_from_peak(0, 0, 390 * MIB), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

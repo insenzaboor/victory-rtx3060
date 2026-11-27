@@ -3326,7 +3326,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_SCREEN, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3336,17 +3336,19 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Reflect => REFLECTIONS,
+            Role::ReflectScreen => REFLECTIONS_SCREEN,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflect => image,
+            Role::Radiance | Role::Air | Role::Reflect | Role::ReflectScreen => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
-        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT, as the screen-space
+        // reflections are.)
         let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
@@ -4824,6 +4826,16 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if is_spread {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
+            }
+            // The screen-space reflections' hold after an indirect dispatch
+            // too (`VICTORY_REFLECT_SCREEN`; DissolveDZ 2feeb26f): the role
+            // is only given with it on.
+            if let Some(role @ crate::ambient::Role::ReflectScreen) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

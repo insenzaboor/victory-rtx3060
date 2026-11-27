@@ -145,6 +145,13 @@ fn build() -> [u8; 32] {
         if victory_shader::structure::mask_copies() {
             bytes.extend_from_slice(b"VICTORY_MASK_COPIES=1");
         }
+        // Likewise, only when on (on by default; `=0` keeps the key of the
+        // translations made before it): console threads of groups of several
+        // host waves taken from a counter (`VICTORY_THREAD_TICKET`, trustno1
+        // 854f57ff7). The first run with it translates every shader again.
+        if victory_shader::emit::thread_ticket() {
+            bytes.extend_from_slice(b"VICTORY_THREAD_TICKET=1");
+        }
         let listed = wave_wide_listed();
         if !listed.is_empty() {
             bytes.extend_from_slice(b"VICTORY_WAVE_WIDE_ONLY=");
