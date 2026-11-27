@@ -1595,6 +1595,39 @@ mod difference_tests {
         assert_eq!(first_difference(&b, &a), Some(32));
         assert_eq!(last_difference(&a, &b), Some(64));
     }
+
+    /// Port of fxceless 81d54b06f (PR #1407, PiloteCode). The compare after
+    /// a submission (`Shadow::differing`) cuts a range of 32 MiB or more
+    /// into slices on several threads, each cut on a piece of title memory.
+    /// For a copy that starts inside a piece, compared from its first byte,
+    /// the first cut lay below the copy's start: the subtraction wrapped
+    /// (a panic with overflow checks) and in a release build the first slice
+    /// was never compared. Every changed byte is found now, in the first
+    /// slice too, and no unchanged piece.
+    #[test]
+    fn a_big_compare_finds_changes_in_its_first_slice() {
+        use super::{PIECE, Shadow};
+        const LEN: usize = 48 << 20;
+        let before = vec![0u8; LEN];
+        let mut copy = before.clone();
+        let changed = [0usize, 100, PIECE - 1, PIECE + 5, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for &at in &changed {
+            copy[at] = 1;
+        }
+        // A title address half a piece in (never read: the compare reads
+        // the copy's own bytes).
+        let start = 0x0012_3450_0000u64 + PIECE as u64 / 2;
+        let shadow = Shadow::unbacked(start, copy.as_mut_ptr(), LEN as u64, false);
+        let found = shadow.differing(0, LEN, &before);
+        for &at in &changed {
+            assert!(found.iter().any(|&(a, n)| (a..a + n).contains(&at)), "the change at {at:#x} was not found: {found:x?}");
+        }
+        for &(a, n) in &found {
+            assert!(changed.iter().any(|&at| (a..a + n).contains(&at)), "an unchanged piece at {a:#x}+{n:#x}");
+            // Cut on pieces of title memory: each ends on a piece or at the range's end.
+            assert!((start as usize + a + n) % PIECE == 0 || a + n == LEN, "{a:#x}+{n:#x}");
+        }
+    }
 }
 
 /// The unit shader writes are looked for and put back in.
@@ -3870,7 +3903,10 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does; the subtraction wrapped, and in a
+            // release build the first slice was never compared)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
