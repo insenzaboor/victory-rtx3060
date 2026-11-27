@@ -295,10 +295,10 @@
       "id": "levels-on-demand",
       "title": "Texture mip levels get VRAM on demand",
       "category": "memory",
-      "status": "ready",
+      "status": "no-gain",
       "source": "ours (a26859fc) / used by CGBJ",
       "switch": "VICTORY_LEVELS_ON_DEMAND=1",
-      "effect": "-3.1 GB VRAM allocated on an RTX 4070",
+      "effect": "Run q5: host textures 3.4 -> 6.4 GB of RAM on this PC (Resizable BAR off); killed by the RAM monitor. Off.",
       "issue": 6
     },
     {
@@ -309,7 +309,7 @@
       "source": "cool_fox cf3f615",
       "commit": "a01ca023",
       "switch": "VICTORY_STAGING_IDLE_MS, VICTORY_WINDOW_IDLE_MS, VICTORY_READ_KEEP_MB",
-      "effect": "Upstream: up to 40-46 GB kept alive in long runs",
+      "effect": "Run q5 with 10 s idle kept windows longer (+1.1 GB): must be set BELOW our 2-5 s defaults; retest in q5b at 1.5 s",
       "issue": 7
     },
     {
@@ -852,6 +852,27 @@
       "commit": "55eee34e",
       "effect": "Were sized but never mapped; widened on upload",
       "issue": 48
+    },
+    {
+      "id": "layout-probe",
+      "title": "Layout probes: where descriptors, allocations and copy traffic come from",
+      "category": "tooling",
+      "status": "ready",
+      "source": "ours",
+      "switch": "VICTORY_PROBE_LAYOUT=1",
+      "commit": "540890ee",
+      "effect": "Counts descriptor origins, allocation origins and refresh/fault/landing bytes by region; decides which in-place stage pays",
+      "issue": 49
+    },
+    {
+      "id": "inplace-stages",
+      "title": "In-place memory stages 1-3 (one heap per allocation, owned allocator, self-indexing descriptors)",
+      "category": "performance",
+      "status": "planned",
+      "source": "ours (docs/design/in-place-memory.md)",
+      "commit": "ceae18c0",
+      "effect": "Estimate 3-6 ms/frame (stage 1), 10-20 ms with stage 2, 1-4 GB RAM; waits on probe numbers",
+      "issue": 50
     }
   ]
 }

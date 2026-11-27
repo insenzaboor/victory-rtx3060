@@ -10,8 +10,8 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | 🔵 on, untested | On by default, merged, not yet verified in a game run | 11 |
 | 🔵 ready to test | Merged behind a switch (off), waiting for a game run | 29 |
 | 🟡 in progress | Being ported or built | 0 |
-| ⬜ planned | Designed or queued, not started | 7 |
-| ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 12 |
+| ⬜ planned | Designed or queued, not started | 8 |
+| ⚪ no gain (off) | Measured: no gain or worse on this hardware (kept off) | 13 |
 | ⚫ n/a | Does not apply to NVIDIA / this title (documented why) | 2 |
 
 ## Frame time / CPU
@@ -37,6 +37,7 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Audio decoded on a worker thread | 🔵 ready to test | ours | `VICTORY_APU_ASYNC=1` | Opus decode was ~5% of title thread time (run 52 profile) | [`c6ed52d8`](https://github.com/insenzaboor/victory-rtx3060/commit/c6ed52d8) | [#4](https://github.com/insenzaboor/victory-rtx3060/issues/4) |
 | Residency wait for textures only | 🔵 ready to test | Belobug#346 | `VICTORY_WAIT_RESIDENT=textures` | Buffers skip the residency wait | [`4bd60465`](https://github.com/insenzaboor/victory-rtx3060/commit/4bd60465) | [#29](https://github.com/insenzaboor/victory-rtx3060/issues/29) |
 | Joined submissions 16 parts / 96 lists | ⬜ planned | Maykzera (RTX 3060) | `VICTORY_JOIN_PARTS=16, VICTORY_JOIN_LISTS=96` | 1% low +18%, P99 -15% on an RTX 3060 |  | [#5](https://github.com/insenzaboor/victory-rtx3060/issues/5) |
+| In-place memory stages 1-3 (one heap per allocation, owned allocator, self-indexing descriptors) | ⬜ planned | ours (docs/design/in-place-memory.md) |  | Estimate 3-6 ms/frame (stage 1), 10-20 ms with stage 2, 1-4 GB RAM; waits on probe numbers | [`ceae18c0`](https://github.com/insenzaboor/victory-rtx3060/commit/ceae18c0) | [#50](https://github.com/insenzaboor/victory-rtx3060/issues/50) |
 | Page mapping threads: 8 (default) vs 1 | ⚪ no gain (off) | ours |  | A/B run 48 with the first minute of streaming excluded: 31.0 vs 32.2 ms per 1k draws (noise); 8 kept. An earlier reading of 30.9 vs 37.7 included streaming phases. |  |  |
 | Plain release build (no diagnostics) | ⚪ no gain (off) | cool_fox / CGBJ |  | q1-release vs q1-diag: 31.2 vs 31.6 ms per 1k draws (noise); loads fine (89 s). Use it to play, not for speed. | [`ca28c339`](https://github.com/insenzaboor/victory-rtx3060/commit/ca28c339) | [#2](https://github.com/insenzaboor/victory-rtx3060/issues/2) |
 | Renderer port 7: heap journal | ⚪ no gain (off) | avatarmanz | `VICTORY_PORT_JOURNAL` | A/B run 49: 24.4 vs 24.8 ms per 1k draws |  |  |
@@ -58,14 +59,14 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 |---|---|---|---|---|---|---|
 | Residency budgets (pareto-residency) | 🟢 shipped | cool_fox | `VICTORY_RESIDENCY=1` | Admission control against out-of-memory |  |  |
 | Ray-tracing memory counting leak fixed | 🔵 on, untested | Belobug e9428969 | `VICTORY_BY_ADDRESS_COUNT (on)` | Areas stayed off the card after one did not fit | [`078fec6a`](https://github.com/insenzaboor/victory-rtx3060/commit/078fec6a) | [#24](https://github.com/insenzaboor/victory-rtx3060/issues/24) |
-| Texture mip levels get VRAM on demand | 🔵 ready to test | ours (a26859fc) / used by CGBJ | `VICTORY_LEVELS_ON_DEMAND=1` | -3.1 GB VRAM allocated on an RTX 4070 |  | [#6](https://github.com/insenzaboor/victory-rtx3060/issues/6) |
-| Idle times for staging/windows, read-buffer cap | 🔵 ready to test | cool_fox cf3f615 | `VICTORY_STAGING_IDLE_MS, VICTORY_WINDOW_IDLE_MS, VICTORY_READ_KEEP_MB` | Upstream: up to 40-46 GB kept alive in long runs | [`a01ca023`](https://github.com/insenzaboor/victory-rtx3060/commit/a01ca023) | [#7](https://github.com/insenzaboor/victory-rtx3060/issues/7) |
+| Idle times for staging/windows, read-buffer cap | 🔵 ready to test | cool_fox cf3f615 | `VICTORY_STAGING_IDLE_MS, VICTORY_WINDOW_IDLE_MS, VICTORY_READ_KEEP_MB` | Run q5 with 10 s idle kept windows longer (+1.1 GB): must be set BELOW our 2-5 s defaults; retest in q5b at 1.5 s | [`a01ca023`](https://github.com/insenzaboor/victory-rtx3060/commit/a01ca023) | [#7](https://github.com/insenzaboor/victory-rtx3060/issues/7) |
 | Caps on spare scratch and send memory | 🔵 ready to test | cool_fox 39318a8 | `VICTORY_SCRATCH_SPARE_MB, VICTORY_SEND_SPARE_MB` | Up to ~1.8 GB of unused upload memory | [`6bc60929`](https://github.com/insenzaboor/victory-rtx3060/commit/6bc60929) | [#8](https://github.com/insenzaboor/victory-rtx3060/issues/8) |
 | Shared pool of indirect scratch buffers | 🔵 ready to test | Belobug e9428969 | `VICTORY_BATCH_POOL=1` | Less VRAM for idle lists | [`e8d846ca`](https://github.com/insenzaboor/victory-rtx3060/commit/e8d846ca) | [#25](https://github.com/insenzaboor/victory-rtx3060/issues/25) |
 | Spare texture blocks scale with free VRAM | 🔵 ready to test | avatarmanz#94 / PR #119 | `VICTORY_SPARES_HEADROOM=1` | Late textures near the 12 GB budget | [`2f65cd92`](https://github.com/insenzaboor/victory-rtx3060/commit/2f65cd92) | [#31](https://github.com/insenzaboor/victory-rtx3060/issues/31) |
 | Texture size cap under VRAM pressure | 🔵 ready to test | pr0vId3nce c392501 | `VICTORY_TEXTURE_MAX=<N>` | Halves at 92% VRAM, quarters at 97% | [`38e1a8f4`](https://github.com/insenzaboor/victory-rtx3060/commit/38e1a8f4) | [#44](https://github.com/insenzaboor/victory-rtx3060/issues/44) |
 | Cap idle host lists (5.8-10.9 GB grew while lists were made) | ⬜ planned | ours | `VICTORY_ALLOC_TRIM` | Lead from run 51/52 memory lines |  | [#9](https://github.com/insenzaboor/victory-rtx3060/issues/9) |
 | Card buffer cap 2 GB | ⬜ planned | grimygunnz / Rubenpannen | `VICTORY_CARD_BUFFERS_MB=2048` | Upstream 327 -> 61 ms on a 3070 Ti; our runs 38/38b hit the load hang, retest |  | [#10](https://github.com/insenzaboor/victory-rtx3060/issues/10) |
+| Texture mip levels get VRAM on demand | ⚪ no gain (off) | ours (a26859fc) / used by CGBJ | `VICTORY_LEVELS_ON_DEMAND=1` | Run q5: host textures 3.4 -> 6.4 GB of RAM on this PC (Resizable BAR off); killed by the RAM monitor. Off. |  | [#6](https://github.com/insenzaboor/victory-rtx3060/issues/6) |
 
 ## Picture correctness
 
@@ -138,3 +139,4 @@ _Generated from [`docs/data/ports.json`](data/ports.json) by `scripts/tracker/bu
 | Timeline traces with critical-path breakdown | 🟢 shipped | ours | `VICTORY_TIMELINE` | Found every bottleneck above |  |  |
 | RAM/commit monitor that kills the game before the PC pages to death | 🟢 shipped | ours |  | Remote sessions survived every out-of-memory run |  |  |
 | On-screen fps / frame-time panel | 🔵 ready to test | Belobug e9428969 | `VICTORY_PANEL=1` | fps, frame-time graph, VRAM/RAM and per-core CPU, in release builds too | [`fcd42dfd`](https://github.com/insenzaboor/victory-rtx3060/commit/fcd42dfd) | [#21](https://github.com/insenzaboor/victory-rtx3060/issues/21) |
+| Layout probes: where descriptors, allocations and copy traffic come from | 🔵 ready to test | ours | `VICTORY_PROBE_LAYOUT=1` | Counts descriptor origins, allocation origins and refresh/fault/landing bytes by region; decides which in-place stage pays | [`540890ee`](https://github.com/insenzaboor/victory-rtx3060/commit/540890ee) | [#49](https://github.com/insenzaboor/victory-rtx3060/issues/49) |
