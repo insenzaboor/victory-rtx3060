@@ -91,6 +91,7 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+mod submit_stages;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
