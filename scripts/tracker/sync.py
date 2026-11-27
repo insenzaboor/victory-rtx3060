@@ -11,6 +11,10 @@ OPEN = {"default-untested", "ready", "in-progress", "planned"}
 STAT = {"shipped": "Shipped", "default-untested": "On (untested)", "ready": "Ready to test", "in-progress": "In progress", "planned": "Planned", "no-gain": "No gain (off)", "not-applicable": "Not applicable"}
 BOARD = {"shipped": "Done", "no-gain": "Done", "not-applicable": "Done", "ready": "In Progress", "default-untested": "In Progress", "in-progress": "In Progress", "planned": "Todo"}
 cats = {k: v.replace(", ", " / ") for k, v in d["categories"].items()}
+have = {l["name"] for l in json.loads(gh("label", "list", "--repo", REPO, "--json", "name", "--limit", "200") or "[]")}
+for name in [f"status:{s}" for s in d["statuses"]] + [f"cat:{c}" for c in d["categories"]] + ["needs-game-run"]:
+    if name not in have:
+        gh("label", "create", name, "--repo", REPO, "--color", "ededed"); print("label", name)
 proj = json.loads(gh("project", "view", NUM, "--owner", OWNER, "--format", "json"))
 pid = proj["id"]
 F = {f["name"]: f for f in json.loads(gh("project", "field-list", NUM, "--owner", OWNER, "--format", "json", "--limit", "50"))["fields"]}
@@ -24,7 +28,7 @@ for it in d["items"]:
         old = [l["name"] for l in cur["labels"] if l["name"].startswith("status:") or l["name"] == "needs-game-run"]
         want = [l for l in labels if l.startswith("status:") or l == "needs-game-run"]
         if set(old) != set(want):
-            gh("issue", "edit", str(it["issue"]), "--repo", REPO, "--remove-label", ",".join(old) or "none", "--add-label", ",".join(want))
+            gh("issue", "edit", str(it["issue"]), "--repo", REPO, *(["--remove-label", ",".join(old)] if old else []), "--add-label", ",".join(want))
             print("relabelled", it["issue"], want)
     elif it["status"] in OPEN:
         body = f"**Category:** {d['categories'][it['category']]}\n**Status:** {d['statuses'][it['status']]}\n**Source:** {it['source']}" + \
