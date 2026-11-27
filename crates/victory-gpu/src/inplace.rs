@@ -169,6 +169,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // The 32-bit heap at home in a driver heap (`VICTORY_PORT_DRIVER=1`):
+    // copied over the write watch, never imported.
+    if crate::uma_driver::homed(start as usize, len as usize) {
+        return None;
+    }
     // A title allocation made a driver heap (`VICTORY_UMA_DRIVER=1`): a
     // buffer in that heap, nothing imported (or pinned: the heap is resident
     // already).
