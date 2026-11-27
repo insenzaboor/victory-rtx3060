@@ -32,6 +32,16 @@ pub mod console;
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
+#[cfg(feature = "mimalloc")]
+mod heap;
+/// Builds with the `mimalloc` feature (off by default) and without
+/// diagnostics: the Rust side allocates through mimalloc instead of the
+/// process heap it shares with the title and the drivers, unless
+/// `VICTORY_ALLOC=system` (`heap`). Diagnostics builds count every block
+/// through `copystat`'s allocator, which then makes the same choice.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static HEAP: heap::Chosen = heap::Chosen;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;

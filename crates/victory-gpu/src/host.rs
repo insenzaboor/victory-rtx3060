@@ -1146,6 +1146,10 @@ fn create() -> windows::core::Result<Host> {
             );
         }
         tracing::info!("host D3D12 device ready");
+        #[cfg(feature = "mimalloc")]
+        tracing::info!("the Rust side's blocks come from {}", crate::heap::name());
+        #[cfg(not(feature = "mimalloc"))]
+        tracing::info!("the Rust side's blocks come from the process heap (built without the mimalloc feature)");
         Ok(Host {
             device,
             queue,
