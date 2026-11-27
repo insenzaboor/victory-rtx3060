@@ -48,7 +48,7 @@ $set = [ordered]@{
 }
 if ($Experimental) {
     # merged, waiting for verification (see docs/TRACKER.md)
-    $set.VICTORY_WAVE_LDS_LOOSE = '1'; $set.VICTORY_LOOKUP_CACHE = '1'; $set.VICTORY_APU_ASYNC = '1'
+    $set.VICTORY_WAVE_PAIRS = '1'; $set.VICTORY_WATCH_RESERVATION = '1'; $set.VICTORY_LOOKUP_CACHE = '1'; $set.VICTORY_APU_ASYNC = '1'
     $set.VICTORY_EARLY_TABLES = '1'; $set.VICTORY_INDIRECT_REST = '0'; $set.VICTORY_LEVELS_ON_DEMAND = '1'
     $set.VICTORY_PRELUDE_UPLOADS = '1'
 }

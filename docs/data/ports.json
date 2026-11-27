@@ -924,6 +924,91 @@
       "source": "ours (memory accounting, run b1)",
       "effect": "Biggest duplicate we own: about 1.5-2.5 GB; large shadow.rs change",
       "issue": 54
+    },
+    {
+      "id": "wave-pairs",
+      "title": "Paired wave64 form: exact translation of the 27 refused shaders",
+      "category": "shaders",
+      "status": "ready",
+      "source": "MoonYueya/VIctory-Kira 243533d (from proneonn/Vertex 26600c6)",
+      "switch": "VICTORY_WAVE_PAIRS=1",
+      "commit": "a297fad5",
+      "effect": "Offline: 27/27 wave64-only shaders translate exactly and the driver builds all 27 pipelines; 106 approximate forms replaced too. Not yet seen in game",
+      "issue": 55
+    },
+    {
+      "id": "uma-direct",
+      "title": "Placed read-only title memory skips the refresh step",
+      "category": "performance",
+      "status": "ready",
+      "source": "MoonYueya/VIctory-Kira 9223b21 / df6ef57",
+      "switch": "VICTORY_UMA_DIRECT=1",
+      "commit": "6c4c341e",
+      "effect": "Needs VICTORY_INPLACE 1 or 2",
+      "issue": 56
+    },
+    {
+      "id": "watch-reservation",
+      "title": "One write-watch query per memory reservation",
+      "category": "performance",
+      "status": "ready",
+      "source": "MoonYueya/VIctory-Kira ab8fae2",
+      "switch": "VICTORY_WATCH_RESERVATION=1",
+      "commit": "39ad907b",
+      "effect": "kelvaroq: heavy frame 129 -> 110 ms",
+      "issue": 57
+    },
+    {
+      "id": "tile-pool-guard",
+      "title": "Texture-tile pool refuses heaps that are not card memory",
+      "category": "stability",
+      "status": "default-untested",
+      "source": "MoonYueya/VIctory-Kira 478b188",
+      "commit": "8aa162ec",
+      "effect": "Guard only; not the cause of the levels-on-demand RAM rise",
+      "issue": 58
+    },
+    {
+      "id": "submit-stages",
+      "title": "Per-stage timing of the submit thread",
+      "category": "tooling",
+      "status": "ready",
+      "source": "MoonYueya/VIctory-Kira ff9d4c1",
+      "switch": "VICTORY_SUBMIT_STAGES=1",
+      "commit": "2c3d2eb1",
+      "effect": "Diagnostics builds: where the submit thread spends its time",
+      "issue": 59
+    },
+    {
+      "id": "wide-threads",
+      "title": "Wide-comparison thread count settable",
+      "category": "performance",
+      "status": "ready",
+      "source": "MoonYueya/VIctory-Kira eb6dd4f",
+      "switch": "VICTORY_WIDE_THREADS=<n>",
+      "commit": "13c91ee7",
+      "effect": "Unset keeps the old count",
+      "issue": 60
+    },
+    {
+      "id": "compute-pipeline-wait",
+      "title": "A dispatch waits for its compute pipeline instead of being dropped",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "fxceless 4c60466 / upstream #1312",
+      "switch": "VICTORY_PIPELINE_COMPUTE_WAIT (on)",
+      "commit": "8654c155",
+      "effect": "Correctness fix; may stall once per new compute pipeline with a cold cache",
+      "issue": 61
+    },
+    {
+      "id": "peppa-cold-skip",
+      "title": "Refreshes skip 2 MiB chunks with no writes",
+      "category": "performance",
+      "status": "no-gain",
+      "source": "Peppacodes 44d8d30",
+      "switch": "VICTORY_COLD_SKIP",
+      "effect": "Not ported: Peppa lists it as tried without gain"
     }
   ]
 }
