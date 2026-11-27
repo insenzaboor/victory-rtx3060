@@ -4366,6 +4366,12 @@ pub(crate) mod rec;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
+
+/// Whether the sends of copies in the card's memory are taken into memory of
+/// the submission's own (`VICTORY_SEND_OWN`).
+pub(crate) fn send_own() -> bool {
+    send::own()
+}
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -4964,6 +4970,26 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        // `VICTORY_CARD_NO_CPU_SIDE`: a copy without a CPU side that this
+        // submission's shaders may write (or that the structure builder may
+        // store in) is given one now, and goes up whole from it ahead of the
+        // lists, before its hashes are made below.
+        if crate::shadow::card_no_cpu_side() {
+            let wanting: Vec<Arc<crate::shadow::Shadow>> = declared
+                .iter()
+                .map(|d| d.0.clone())
+                .chain(looked.iter().map(|l| l.0.clone()))
+                .chain(crate::shadow::side_wanted())
+                .collect();
+            for shadow in wanting {
+                if let Some(whole) = shadow.card_side_now(sent_as) {
+                    match dirty.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &shadow)) {
+                        Some((_, ranges)) => *ranges = whole,
+                        None => dirty.push((shadow, whole)),
+                    }
+                }
+            }
+        }
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -5033,7 +5059,7 @@ impl Host {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some((Some(staging), _, _)) = side {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
@@ -5046,7 +5072,13 @@ impl Host {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() && up.is_none() {
+                        // (A copy without a CPU side has its sends taken into
+                        // the submission's own memory, `send::take`: the
+                        // switch is turned down without that.)
+                        if own.is_none()
+                            && up.is_none()
+                            && let Some(staging) = staging
+                        {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
@@ -10287,6 +10319,22 @@ impl Meter {
                         per_frame(5),
                         per_frame(6) / 1e3
                     );
+                    if crate::shadow::card_no_cpu_side() {
+                        let side = crate::shadow::no_side_stats();
+                        let [read, runs] = [0, 1].map(|i| send::TITLE_READS[i].load(Ordering::Relaxed));
+                        tracing::info!(
+                            "host copies in the card's memory without a CPU side (VICTORY_CARD_NO_CPU_SIDE=1): {} of them, {} MB \
+                             of CPU sides not held; {} given their CPU side later for shader writes ({} MB); since the start {} MB \
+                             sent up from title memory in {} runs; upload ring kept {} MB",
+                            side[0] + side[3],
+                            (side[2] + side[5]) >> 20,
+                            side[6],
+                            side[7] >> 20,
+                            read >> 20,
+                            runs,
+                            crate::shadow::card_upload_ring_mb(),
+                        );
+                    }
                 }
                 crate::sampler::line();
                 let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();

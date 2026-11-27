@@ -132,10 +132,17 @@ impl Copied {
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
-    /// The CPU's side, in the PC's memory: what `data` maps. Title memory
-    /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// The CPU's side, in the PC's memory, and where it is mapped: what
+    /// `data` maps. Title memory is copied into it as into any copy, and
+    /// what changed in it goes to the card's side before the next
+    /// submission. Set when the copy is made, except with
+    /// [`card_no_cpu_side`]: then only once the copy needs a reference for
+    /// shader writes ([`Shadow::card_side_now`]), and until then what
+    /// changed goes up from title memory itself.
+    side: std::sync::OnceLock<(ID3D12Resource, usize)>,
+    /// With [`card_no_cpu_side`], of a copy without its CPU side: a CPU side
+    /// is to be made at the next submission ([`Shadow::keep_stores`]).
+    wants_side: std::sync::atomic::AtomicBool,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -153,6 +160,205 @@ struct Card {
     touched: std::sync::atomic::AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+impl Card {
+    /// The card part of a copy of `size` bytes, with its CPU side if given
+    /// (the buffer and its mapping).
+    fn new(side: Option<(ID3D12Resource, *mut u8)>, size: u64) -> Card {
+        let made = std::sync::OnceLock::new();
+        if let Some((buffer, data)) = side {
+            let _ = made.set((buffer, data as usize));
+        }
+        Card {
+            side: made,
+            wants_side: Default::default(),
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            size,
+        }
+    }
+}
+
+/// Whether copies in the card's memory are made without their CPU side
+/// (`VICTORY_CARD_NO_CPU_SIDE=1`; off by default). Read once.
+///
+/// Every copy in the card's memory had a CPU side of its size in the PC's
+/// memory (`Card::side`): title memory was copied into it, what changed in it
+/// went up, and it was the reference what the card wrote is told by
+/// ([`Shadow::card_merge`], [`Shadow::land_card`],
+/// [`Shadow::merge_under_writes`]). Run q15 held 1.6 GB of them. A copy no
+/// shader writes needs no reference, so with the switch it has none: a
+/// refresh only notes what changed (as it did), and when the submission's
+/// sends are taken (`crate::host::send`, the memory those come from kept as a
+/// ring of [`card_upload_ring_mb`]) the bytes are read from title memory
+/// itself. The first time a shader write is declared for such a copy (or the
+/// structure builder may store in it by address, [`Shadow::keep_stores`]) it
+/// is given its CPU side, filled from title memory, and sent up whole ahead of
+/// that submission's lists: from there on it is the copy it was.
+///
+/// What it rests on, and `docs/design/card-no-cpu-side.md` says more: a send
+/// read from title memory when the submission's sends are taken holds what
+/// the CPU side would have held, or newer bytes the title wrote since the
+/// refresh asked, which the next refresh sends again anyway. It needs the
+/// sends taken into memory of the submission's own (`VICTORY_SEND_OWN`, on by
+/// default), and is turned down with a line saying why under
+/// `VICTORY_SEND_CHANGED=1` and `VICTORY_PICKED_WRITES` (they compare with the
+/// CPU side of copies nobody declared written) and `VICTORY_UPCOPY_CHECK=1`
+/// (it compares the two sides). The arenas by address
+/// ([`by_address`]) keep theirs: shaders store there unseen.
+pub(crate) fn card_no_cpu_side() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if !crate::switch::on("VICTORY_CARD_NO_CPU_SIDE") {
+            return false;
+        }
+        let refused = no_cpu_side_refused(
+            crate::host::send_own(),
+            send_changed(),
+            crate::picked::on(),
+            crate::host::upcheck::on(),
+        );
+        match refused {
+            Some(why) => tracing::warn!("VICTORY_CARD_NO_CPU_SIDE=1 is turned down: {why}; copies in the card's memory keep their CPU side"),
+            None => tracing::info!(
+                ring_mb = card_upload_ring_mb(),
+                "VICTORY_CARD_NO_CPU_SIDE=1: copies in the card's memory have no CPU side until a shader write is declared for them; \
+                 their sends are read from title memory into a ring of upload memory (VICTORY_CARD_UPLOAD_RING_MB)"
+            ),
+        }
+        refused.is_none()
+    })
+}
+
+/// Why [`card_no_cpu_side`] cannot be on with these switches, if it cannot.
+fn no_cpu_side_refused(send_own: bool, send_changed: bool, picked: bool, upcheck: bool) -> Option<&'static str> {
+    if !send_own {
+        Some("VICTORY_SEND_OWN=0 sends from the CPU side itself")
+    } else if send_changed {
+        Some("VICTORY_SEND_CHANGED=1 compares every refresh with the CPU side")
+    } else if picked {
+        Some("VICTORY_PICKED_WRITES lands what nobody declared, against the CPU side")
+    } else if upcheck {
+        Some("VICTORY_UPCOPY_CHECK=1 compares the CPU side with the card's")
+    } else {
+        None
+    }
+}
+
+/// The upload memory the sends of copies in the card's memory are taken
+/// into, kept between submissions with [`card_no_cpu_side`], in MiB
+/// (`VICTORY_CARD_UPLOAD_RING_MB`; 128 unless it says another).
+pub(crate) fn card_upload_ring_mb() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| ring_mb(std::env::var("VICTORY_CARD_UPLOAD_RING_MB").ok().as_deref()))
+}
+
+/// [`card_upload_ring_mb`] of the variable's value.
+fn ring_mb(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(128)
+}
+
+/// Copies in the card's memory without a CPU side ([`card_no_cpu_side`]),
+/// title buffers' and windows': how many, the title bytes they hold, and the
+/// bytes their CPU sides would have taken.
+static NO_SIDE: [[AtomicU64; 3]; 2] = [const { [const { AtomicU64::new(0) }; 3] }; 2];
+
+/// Such copies that were given their CPU side later, and its bytes.
+static SIDE_MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Copies whose `wants_side` is set.
+static WANTS_SIDE: AtomicU64 = AtomicU64::new(0);
+
+/// For the memory lines: of title buffers' copies and windows', how many have
+/// no CPU side now, the title bytes they hold and the bytes not held for
+/// their CPU sides; then how many were given one later and its bytes.
+pub(crate) fn no_side_stats() -> [u64; 8] {
+    let [b, w] = &NO_SIDE;
+    let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    [n(&b[0]), n(&b[1]), n(&b[2]), n(&w[0]), n(&w[1]), n(&w[2]), n(&SIDE_MADE[0]), n(&SIDE_MADE[1])]
+}
+
+fn no_side_note(window: bool, len: u64, size: u64, made: bool) {
+    let kind = &NO_SIDE[usize::from(window)];
+    if made {
+        kind[0].fetch_add(1, Ordering::Relaxed);
+        kind[1].fetch_add(len, Ordering::Relaxed);
+        kind[2].fetch_add(size, Ordering::Relaxed);
+    } else {
+        kind[0].fetch_sub(1, Ordering::Relaxed);
+        kind[1].fetch_sub(len, Ordering::Relaxed);
+        kind[2].fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+/// The copies in the card's memory that asked for a CPU side since the last
+/// call ([`Shadow::keep_stores`]), their asks taken.
+pub(crate) fn side_wanted() -> Vec<Arc<Shadow>> {
+    if WANTS_SIDE.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for shadow in carded.iter().filter_map(|c| c.shadow.upgrade()) {
+        if let Some(card) = &shadow.card
+            && card.wants_side.swap(false, Ordering::AcqRel)
+        {
+            WANTS_SIDE.fetch_sub(1, Ordering::AcqRel);
+            out.push(shadow);
+        }
+    }
+    out
+}
+
+/// Copies offsets `[a, a + n)` of a copy of title memory `[start, start +
+/// len)` from title memory to `to`, zeros past `len` (the copy's buffer is
+/// rounded up beyond the title buffer, and its CPU side held zeros there).
+/// Pages that are not there read as zeros, as a refresh reads them.
+///
+/// # Safety
+/// `to` has room for `n` bytes.
+pub(crate) unsafe fn title_run(start: usize, len: usize, a: usize, n: usize, to: *mut u8) {
+    let have = n.min(len.saturating_sub(a));
+    if have > 0 {
+        crate::host::copy_mapped(to, (start + a) as *const u8, have, false);
+    }
+    if have < n {
+        // SAFETY: the caller's.
+        unsafe { to.add(have).write_bytes(0, n - have) };
+    }
+}
+
+/// [`title_run`] of each of `reads` (title start, title length, offset,
+/// bytes, where to), on several threads if they are many bytes.
+pub(crate) fn title_runs(reads: Vec<(usize, usize, usize, usize, usize)>) {
+    let bytes: usize = reads.iter().map(|r| r.3).sum();
+    if bytes > 4 << 20 && reads.len() > 1 {
+        let n = reads.len();
+        wide_each(n, move |i| {
+            let (start, len, a, n, to) = reads[i];
+            // SAFETY: the caller's places, each with room for its bytes.
+            unsafe { title_run(start, len, a, n, to as *mut u8) };
+        });
+        return;
+    }
+    for (start, len, a, n, to) in reads {
+        // SAFETY: as above.
+        unsafe { title_run(start, len, a, n, to as *mut u8) };
+    }
+}
+
+/// Where what goes up to a copy in the card's memory is read
+/// (`crate::host::send`).
+#[derive(Clone, Copy)]
+pub(crate) enum CardSource {
+    /// Its CPU side, mapped here.
+    Side(usize),
+    /// Title memory: the copy has no CPU side ([`card_no_cpu_side`]); the
+    /// title buffer's start and length.
+    Title(usize, usize),
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -851,7 +1057,8 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    // (A copy without a CPU side holds nothing on the CPU to compare.)
+    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1 && !s.sideless());
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
@@ -882,7 +1089,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             done += hi - lo;
             // SAFETY: inside the mapping; nothing is in the air and the
             // submission lock is held.
-            let held = unsafe { std::slice::from_raw_parts(shadow.data.add(lo - start).cast_const(), hi - lo) };
+            let held = unsafe { std::slice::from_raw_parts(shadow.data().add(lo - start).cast_const(), hi - lo) };
             if held == title {
                 continue;
             }
@@ -1979,7 +2186,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
+                Some(before) => (shadow.data() as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
         })
@@ -2955,6 +3162,12 @@ impl Drop for Shadow {
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
+            if card.side.get().is_none() {
+                no_side_note(window, self.len, card.size, false);
+            }
+            if *card.wants_side.get_mut() {
+                WANTS_SIDE.fetch_sub(1, Ordering::AcqRel);
+            }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
@@ -3140,6 +3353,123 @@ mod landing_tests {
         copy.take_landed(from, from + 100);
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
+        drop(room);
+    }
+}
+
+#[cfg(test)]
+mod no_side_tests {
+    use super::{CardSource, PIECE, SIDE_MADE, Shadow, no_cpu_side_refused, ring_mb, title_run};
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
+    /// Title memory of `len` bytes, each its offset's low byte, and where it
+    /// starts.
+    fn title(len: usize) -> (Vec<u8>, usize) {
+        let room: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let at = room.as_ptr() as usize;
+        (room, at)
+    }
+
+    #[test]
+    fn the_switch_is_turned_down_where_the_cpu_side_is_compared() {
+        assert_eq!(no_cpu_side_refused(true, false, false, false), None);
+        for (own, changed, picked, upcheck) in [(false, false, false, false), (true, true, false, false), (true, false, true, false), (true, false, false, true)]
+        {
+            assert!(no_cpu_side_refused(own, changed, picked, upcheck).is_some(), "{own} {changed} {picked} {upcheck}");
+        }
+    }
+
+    #[test]
+    fn the_ring_is_128_mb_unless_asked() {
+        assert_eq!(ring_mb(None), 128);
+        assert_eq!(ring_mb(Some("64")), 64);
+        assert_eq!(ring_mb(Some(" 256 ")), 256);
+        assert_eq!(ring_mb(Some("lots")), 128);
+    }
+
+    /// What goes up from title memory is title memory's bytes, and zeros
+    /// past the title buffer, where the CPU side held zeros.
+    #[test]
+    fn a_run_from_title_memory_is_zeros_past_the_buffer() {
+        let (room, at) = title(100);
+        let mut to = [0xeeu8; 20];
+        // SAFETY: `to` has room for 20 bytes.
+        unsafe { title_run(at, 100, 90, 20, to.as_mut_ptr()) };
+        assert_eq!(&to[..10], &room[90..100]);
+        assert_eq!(&to[10..], &[0u8; 10]);
+        // Wholly past it: zeros only.
+        let mut to = [0xeeu8; 8];
+        // SAFETY: as above.
+        unsafe { title_run(at, 100, 120, 8, to.as_mut_ptr()) };
+        assert_eq!(to, [0u8; 8]);
+    }
+
+    /// A refresh of a copy without a CPU side writes nothing on the CPU and
+    /// notes what changed, to go up from title memory; nothing compares with
+    /// a CPU side it does not have.
+    #[test]
+    fn a_copy_without_a_cpu_side_only_notes_what_changed() {
+        let (room, at) = title(3 * PIECE + 100);
+        let copy = Shadow::unbacked_sideless(at as u64, room.len() as u64);
+        assert!(copy.sideless());
+        assert!(matches!(copy.card_source(), CardSource::Title(start, len) if start == at && len == room.len()));
+        assert_eq!(copy.copy(at + 10, at + 5000), 4990);
+        assert_eq!(copy.take_dirty(), [(10, 5000)]);
+        // Cut to the buffer, as with a CPU side.
+        copy.copy(at + 3 * PIECE, at + 4 * PIECE);
+        assert_eq!(copy.take_dirty(), [(3 * PIECE, 3 * PIECE + 100)]);
+        // Only dwords that differ go up for such a copy: without a CPU side to
+        // compare with the refresh takes the range whole, and asks for one.
+        copy.keep_stores();
+        copy.take(at + 64, at + 128, true);
+        assert_eq!(copy.take_dirty(), [(64, 128)]);
+        assert!(copy.card.as_ref().unwrap().wants_side.load(Ordering::Relaxed));
+        assert!(copy.card_held(0, 64).is_empty());
+        // What the card wrote cannot be told without a reference: nothing
+        // is merged (the copy is given one before shaders write it).
+        let mut scratch = Vec::new();
+        assert_eq!(copy.card_merge(0, &[1u8; 64], &mut scratch), 0);
+        assert_eq!(copy.card_merge_relay(0, &[1u8; 64], 0, &mut scratch), 0);
+        drop(room);
+    }
+
+    /// The CPU side made when shader writes are declared holds title memory
+    /// (zeros past the buffer), the whole copy goes up from it, and from then
+    /// on what the card wrote is told from it as for any copy.
+    #[test]
+    fn a_cpu_side_made_later_holds_title_memory_and_lands_what_the_card_wrote() {
+        let len = PIECE + 100;
+        let (mut room, at) = title(len);
+        let copy = Shadow::unbacked_sideless(at as u64, len as u64);
+        let size = 2 * PIECE;
+        let side: &mut [u8] = Box::leak(vec![0xaau8; size].into_boxed_slice());
+        let data = side.as_mut_ptr();
+        // SAFETY: an interface pointer nothing calls (the copy is never let go).
+        let none = unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let made = SIDE_MADE[0].load(Ordering::Relaxed);
+        let whole = copy.card_side_with(7, |bytes| {
+            assert_eq!(bytes, size as u64);
+            Some((none, data))
+        });
+        assert_eq!(whole, Some(vec![(0, size)]));
+        assert!(SIDE_MADE[0].load(Ordering::Relaxed) > made);
+        assert!(!copy.sideless());
+        assert!(matches!(copy.card_source(), CardSource::Side(from) if from == data as usize));
+        // SAFETY: the side's memory, leaked above.
+        let side = unsafe { std::slice::from_raw_parts(data.cast_const(), size) };
+        assert_eq!(&side[..len], &room[..]);
+        assert!(side[len..].iter().all(|&b| b == 0));
+        // Made once.
+        assert_eq!(copy.card_side_with(8, |_| panic!("made twice")), None);
+        // A shader wrote byte 50; the title meanwhile wrote byte 70.
+        let mut gpu = side[..PIECE].to_vec();
+        gpu[50] = 0x55;
+        room[70] = 0x77;
+        let mut scratch = Vec::new();
+        assert!(copy.card_merge(0, &gpu, &mut scratch) > 0);
+        assert_eq!(room[50], 0x55);
+        assert_eq!(room[70], 0x77);
         drop(room);
     }
 }
@@ -3435,6 +3765,22 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Where the copy's bytes the CPU writes are mapped: the copy itself, or
+    /// for one in the card's memory its CPU side. Null for a copy in the
+    /// card's memory that has no CPU side ([`card_no_cpu_side`]).
+    fn data(&self) -> *mut u8 {
+        if !self.data.is_null() {
+            return self.data;
+        }
+        self.card.as_ref().and_then(|c| c.side.get()).map_or(std::ptr::null_mut(), |s| s.1 as *mut u8)
+    }
+
+    /// Whether this is a copy in the card's memory without a CPU side
+    /// ([`card_no_cpu_side`]).
+    pub(crate) fn sideless(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.side.get().is_none())
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3685,7 +4031,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        std::ptr::copy_nonoverlapping(self.data().add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -3699,7 +4045,7 @@ impl Shadow {
             // then. The snapshot's memory stays where it is until the
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+            let (data, snapshot) = (self.data() as usize, snapshot.as_mut_ptr() as usize);
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
             return;
         }
@@ -3708,7 +4054,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data().add(from), snapshot.as_mut_ptr().add(from), to - from);
                 }
             }
         }
@@ -3773,7 +4119,7 @@ impl Shadow {
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data().add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
@@ -3846,7 +4192,7 @@ impl Shadow {
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(self.data().add(at), now.as_mut_ptr(), n);
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -3879,7 +4225,7 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
+        let (start, data) = (self.start as usize, self.data() as usize);
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
@@ -4151,7 +4497,7 @@ impl Shadow {
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             let held = if self.card.is_some() {
-                self.data as usize
+                self.data() as usize
             } else {
                 before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
             };
@@ -4322,7 +4668,7 @@ impl Shadow {
                 // SAFETY: inside the copy's mapping. The card may be
                 // writing the copy beside these bytes; they are
                 // written here and nothing around them.
-                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data().add(at + r), m) };
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
             }
             Ok(Some(runs))
@@ -4436,7 +4782,8 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        // (Without a CPU side the copy's bytes are on the card only.)
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.sideless() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -4451,7 +4798,7 @@ impl Shadow {
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
-                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let copy = unsafe { std::slice::from_raw_parts(self.data().add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
@@ -4644,7 +4991,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side, which
                     // nothing else reads or writes there: no shader's range
                     // holds it, and the parts of a refresh lie apart.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data().add(at - start), next - at) };
                     if title == held {
                         ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
                     } else {
@@ -4667,8 +5014,13 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
-            if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
+        // (A copy without a CPU side has nothing to compare with: what the
+        // refresh takes is noted and goes up from title memory, whole.)
+        let sided = !self.sideless();
+        let Some(card) =
+            self.card.as_ref().filter(|_| sided && (self.changes_only.load(Ordering::Relaxed) || send_changed()))
+        else {
+            if known && sided && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
             return self.copy(from, to);
@@ -4687,7 +5039,7 @@ impl Shadow {
                 // nothing else reads or writes there (the card copies from
                 // it): no shader's range holds it, and the parts of a
                 // refresh lie apart.
-                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data().add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
                 let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
                 for &(a, len) in &runs {
@@ -4714,13 +5066,22 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if self.sideless() {
+            // No CPU side ([`card_no_cpu_side`]): the range goes up from title
+            // memory when the submission's sends are taken.
+            if from < to {
+                self.changed(from - start, to - start);
+                self.card_changed(from - start, to - start);
+            }
+            return to.saturating_sub(from);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
+        let at = unsafe { self.data().add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
             for_pieces_of(from - start, to - start, |a, b| {
                 let was = self.card_held(a, b - a);
                 // SAFETY: inside the mapping, as above.
-                crate::host::copy_mapped(unsafe { self.data.add(a) }, (start + a) as *const u8, b - a, false);
+                crate::host::copy_mapped(unsafe { self.data().add(a) }, (start + a) as *const u8, b - a, false);
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
             });
         } else {
@@ -4740,8 +5101,19 @@ impl Shadow {
 
     /// Shaders store in it what is not declared: from here on only the dwords
     /// the title changes go up ([`by_address`]).
+    ///
+    /// Only dwords that differ from the CPU side go up, so a copy without one
+    /// ([`card_no_cpu_side`]) asks for it: it is made at the next submission,
+    /// on the submitting thread ([`side_wanted`], `Host::card_before`), before
+    /// any store the builder was given this copy for runs.
     pub(crate) fn keep_stores(&self) {
         self.changes_only.store(true, Ordering::Relaxed);
+        if let Some(card) = &self.card
+            && card.side.get().is_none()
+            && !card.wants_side.swap(true, Ordering::AcqRel)
+        {
+            WANTS_SIDE.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
@@ -4804,9 +5176,15 @@ impl Shadow {
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         if self.card.is_some() {
-            // SAFETY: inside the mapping of the CPU's side, in a range no
-            // refresh writes; the lock keeps the landing out.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            // A copy without a CPU side has no reference to keep: the range is
+            // declared written, and so the copy has one by now (made ahead of
+            // the submission's lists, `Host::card_before`).
+            let data = self.data();
+            if !data.is_null() {
+                // SAFETY: inside the mapping of the CPU's side, in a range no
+                // refresh writes; the lock keeps the landing out.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.add(from), bytes.len()) };
+            }
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             // SAFETY: the snapshot's allocation holds the copy's length.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
@@ -4814,21 +5192,24 @@ impl Shadow {
         self.changed(from, to);
     }
 
-    /// Of a copy in the card's memory: where its CPU side is.
-    pub(crate) fn card_data(&self) -> *const u8 {
-        self.data
+    /// Of a copy in the card's memory: where what goes up to its card side
+    /// is read, its CPU side or, without one ([`card_no_cpu_side`]), title
+    /// memory.
+    pub(crate) fn card_source(&self) -> CardSource {
+        let data = self.data();
+        if data.is_null() { CardSource::Title(self.start as usize, self.len as usize) } else { CardSource::Side(data as usize) }
     }
 
     /// Diagnostics: of a copy in the card's memory, what its CPU side holds
     /// at offsets `[at, at + len)` (cut to the copy).
     pub(crate) fn card_held(&self, at: usize, len: usize) -> Vec<u8> {
         let to = (at + len).min(self.len as usize);
-        if self.card.is_none() || at >= to {
+        if self.card.is_none() || at >= to || self.sideless() {
             return Vec::new();
         }
         // SAFETY: inside the mapping; the caller holds the submission lock,
         // under which it is written but for what is being landed.
-        unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), to - at) }.to_vec()
+        unsafe { std::slice::from_raw_parts(self.data().add(at).cast_const(), to - at) }.to_vec()
     }
 
     /// Diagnostics: the offsets whose bytes have not gone to the card's side
@@ -4837,12 +5218,83 @@ impl Shadow {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side (PC memory) if it has
+    /// one ([`card_no_cpu_side`]), the card side's bytes from before if made
+    /// yet, and their size.
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.side.get().map(|s| &s.0), before, card.size))
+    }
+
+    /// With [`card_no_cpu_side`]: a copy in the card's memory without a CPU
+    /// side is given one now, as shader writes are declared for it (or the
+    /// structure builder stores in it, [`Shadow::keep_stores`]), at the
+    /// submission, on the submitting thread, ahead of its lists. The CPU side
+    /// takes title memory as it is now (zeros past the title buffer, as the
+    /// CPU side made with the copy held), and the whole copy goes up from it
+    /// with this submission's sends (`sent_as`, as [`card_dirty`] notes
+    /// them): from then on the two sides hold the same, as they would have,
+    /// and the copy is one with a CPU side like any other.
+    ///
+    /// The ranges to send (the whole copy), if one was made now. `None` if it
+    /// has one already, or if none can be made (no memory: its sends then
+    /// keep coming from title memory and what shaders write is not landed,
+    /// said once).
+    pub(crate) fn card_side_now(&self, sent_as: u64) -> Option<Vec<(usize, usize)>> {
+        self.card_side_with(sent_as, |size| host()?.shared_buffer(size))
+    }
+
+    /// [`Shadow::card_side_now`], the CPU side made by `make` (bytes to a
+    /// mapped buffer).
+    fn card_side_with(&self, sent_as: u64, make: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>) -> Option<Vec<(usize, usize)>> {
+        let card = self.card.as_ref()?;
+        if card.side.get().is_some() {
+            return None;
+        }
+        let Some((buffer, data)) = make(card.size) else {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    "VICTORY_CARD_NO_CPU_SIDE: no memory for the CPU side of a copy in the card's memory that shaders write:                      what they write there is not landed"
+                )
+            });
+            return None;
+        };
+        crate::host::name(&buffer, || format!("title memory {:#x}+{:#x}, the CPU's side, made for shader writes", self.start, self.len));
+        // SAFETY: the buffer is mapped at `data` with room for `card.size`
+        // bytes, and nothing else has it yet.
+        unsafe { title_run(self.start as usize, self.len as usize, 0, card.size as usize, data) };
+        // Under the dirty list's lock: what takes the list after this finds
+        // the CPU side there, and reads it.
+        let whole = vec![(0, card.size as usize)];
+        {
+            let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            if card.side.set((buffer, data as usize)).is_err() {
+                return None;
+            }
+            if relay() {
+                let mut sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.note_joined(sent_as, whole.clone());
+            }
+        }
+        no_side_note(self.window, self.len, card.size, false);
+        SIDE_MADE[0].fetch_add(1, Ordering::Relaxed);
+        SIDE_MADE[1].fetch_add(card.size, Ordering::Relaxed);
+        let n = SIDE_MADE[0].load(Ordering::Relaxed);
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(
+                start = format_args!("{:#x}", self.start),
+                len = self.len,
+                window = self.window,
+                made = n,
+                made_mb = SIDE_MADE[1].load(Ordering::Relaxed) >> 20,
+                "VICTORY_CARD_NO_CPU_SIDE: a copy in the card's memory is given its CPU side for shader writes, and goes up whole"
+            );
+        }
+        Some(whole)
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4958,12 +5410,13 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        // (No CPU side: none could be made for the copy, `card_side_now`.)
+        if self.card.is_none() || at + gpu.len() > self.len as usize || self.sideless() {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let old = unsafe { std::slice::from_raw_parts_mut(self.data().add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -5023,7 +5476,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        if at + gpu.len() > self.len as usize || self.sideless() {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -5031,7 +5484,7 @@ impl Shadow {
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data().add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -5073,15 +5526,22 @@ impl Shadow {
         let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
-            shadow.card = Some(Card {
-                staging: none(),
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                size: len.next_multiple_of(PIECE as u64),
-            });
+            shadow.card = Some(Card::new(Some((none(), data)), len.next_multiple_of(PIECE as u64)));
         }
+        let shadow = Arc::new(shadow);
+        std::mem::forget(shadow.clone());
+        shadow
+    }
+
+    /// A copy in the card's memory of title memory `[start, start + len)`
+    /// without a CPU side ([`card_no_cpu_side`]), as [`Shadow::unbacked`].
+    pub(crate) fn unbacked_sideless(start: u64, len: u64) -> Arc<Shadow> {
+        // SAFETY: an interface pointer nothing calls.
+        let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let mut shadow = Shadow::new(none(), std::ptr::null_mut(), 0, start, len);
+        let size = len.next_multiple_of(PIECE as u64);
+        shadow.card = Some(Card::new(None, size));
+        no_side_note(false, len, size, true);
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
         shadow
@@ -5144,6 +5604,10 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        // (No CPU side: none could be made for the copy, `card_side_now`.)
+        if self.sideless() {
+            return 0;
+        }
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
@@ -5168,7 +5632,7 @@ impl Shadow {
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data().add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -5201,7 +5665,7 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        unsafe { crate::land::piece(self.start as usize + at, self.data().add(at), held.add(at), &[(0, n)], false, notes, self) }
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this
@@ -5234,7 +5698,6 @@ impl Shadow {
 #[cfg(test)]
 mod land_tests {
     use super::{Card, PIECE, Shadow};
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// A copy in the card's memory of title memory at `title` (its card side
@@ -5244,14 +5707,7 @@ mod land_tests {
         // SAFETY: the mapping, `len` bytes.
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
-        shadow.card = Some(Card {
-            staging: buffer,
-            before: Mutex::default(),
-            dirty: Mutex::default(),
-            sent: Mutex::default(),
-                touched: Default::default(),
-            size: len as u64,
-        });
+        shadow.card = Some(Card::new(Some((buffer, data)), len as u64));
         Some(shadow)
     }
 
@@ -5960,11 +6416,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        // With `card_no_cpu_side` the buffer in the PC's memory is made only
+        // if the copy does not go to the card's: there it has no CPU side.
+        let sideless = card_no_cpu_side() && big;
+        let made = if sideless { None } else { Some(host()?.shared_buffer(size)?) };
+        if let Some((buffer, _)) = &made {
+            crate::host::name(buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        }
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -5972,17 +6433,23 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                    size,
-                };
-                (on_card, Some(card))
+                let data = made.as_ref().map_or(std::ptr::null_mut(), |m| m.1);
+                if made.is_none() {
+                    no_side_note(false, len, size, true);
+                }
+                (on_card, data, Some(Card::new(made, size)))
             }
-            None => (buffer, None),
+            None => {
+                let (buffer, data) = match made {
+                    Some(made) => made,
+                    None => {
+                        let (buffer, data) = host()?.shared_buffer(size)?;
+                        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                        (buffer, data)
+                    }
+                };
+                (buffer, data, None)
+            }
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6219,14 +6686,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
-    shadow.card = Some(Card {
-        staging,
-        before: Mutex::default(),
-        dirty: Mutex::default(),
-        sent: Mutex::default(),
-        touched: Default::default(),
-        size: len,
-    });
+    // (Its CPU side stays with `card_no_cpu_side`: shaders store there by
+    // address unseen, and only dwords the title changed may go up.)
+    shadow.card = Some(Card::new(Some((staging, data)), len));
     let shadow = Arc::new(shadow);
     carded(&shadow);
     Some(shadow)
@@ -6344,24 +6806,33 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, seen: Option<&mut
             shadow.mapped = true;
             return Some(Arc::new(shadow));
         }
-        let (buffer, data) = host()?.shared_buffer(len)?;
-        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // With `card_no_cpu_side` a window that goes to the card's memory has
+        // no CPU side: the buffer in the PC's memory is made only if it
+        // does not.
+        // (Without the switch, made first, as before.)
+        let first = if card_no_cpu_side() { None } else { Some(host()?.shared_buffer(len)?) };
+        let on_card = window_card_for(len);
+        let made = match first {
+            Some(made) => Some(made),
+            None if on_card.is_some() => None,
+            None => Some(host()?.shared_buffer(len)?),
+        };
+        if let Some((buffer, _)) = &made {
+            crate::host::name(buffer, || format!("title memory {start:#x}+{len:#x}"));
+        }
         // With room for windows on the card (`window_card_most`): shaders get a
         // buffer there, and the one just made is the CPU's side.
-        let (buffer, card) = match window_card_for(len) {
-            Some(on_card) => {
+        let (buffer, data, card) = match (on_card, made) {
+            (Some(on_card), made) => {
                 crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    touched: Default::default(),
-                    size: len,
-                };
-                (on_card, Some(card))
+                let data = made.as_ref().map_or(std::ptr::null_mut(), |m| m.1);
+                if made.is_none() {
+                    no_side_note(true, len, len, true);
+                }
+                (on_card, data, Some(Card::new(made, len)))
             }
-            None => (buffer, None),
+            (None, Some((buffer, data))) => (buffer, data, None),
+            (None, None) => return None,
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
