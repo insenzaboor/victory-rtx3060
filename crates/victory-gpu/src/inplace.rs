@@ -169,6 +169,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // The 32-bit heap at home in a driver heap (`VICTORY_PORT_DRIVER=1`):
+    // copied over the write watch, never imported.
+    if crate::uma_driver::homed(start as usize, len as usize) {
+        return None;
+    }
     // A title allocation made a driver heap (`VICTORY_UMA_DRIVER=1`): a
     // buffer in that heap, nothing imported (or pinned: the heap is resident
     // already).
@@ -733,7 +738,15 @@ pub(crate) struct Rig {
     fence: ID3D12Fence,
     done: u64,
     event: HANDLE,
+    /// [`Rig::load_ms`]'s root signature, pipeline and the buffer its
+    /// shader may write, made at its first call.
+    loads: Option<(ID3D12RootSignature, ID3D12PipelineState, ID3D12Resource)>,
 }
+
+/// The threads of [`Rig::load_ms`]'s dispatch: 1,024 groups of 64, more
+/// than an RTX 3060 holds at once (28 SMs of 1,536), so that the loads of
+/// one wait while others are in the air.
+pub(crate) const LOAD_THREADS: u32 = 1024 * 64;
 
 impl Drop for Rig {
     fn drop(&mut self) {
@@ -755,7 +768,7 @@ impl Rig {
             list.Close()?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
             let event = CreateEventW(None, false, false, None)?;
-            Ok(Rig { device: device.clone(), queue, allocator, list, fence, done: 0, event })
+            Ok(Rig { device: device.clone(), queue, allocator, list, fence, done: 0, event, loads: None })
         }
     }
 
@@ -861,6 +874,91 @@ impl Rig {
             let started = std::time::Instant::now();
             // SAFETY: two live buffers of `bytes` bytes or more.
             self.run(|list| unsafe { list.CopyBufferRegion(&to, 0, from, 0, bytes) })?;
+            best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        Ok(best)
+    }
+
+    /// A buffer of `bytes` in the card's own memory (zeros), for
+    /// [`Rig::load_ms`] to read beside title memory.
+    pub(crate) fn card(&self, bytes: u64) -> windows::core::Result<ID3D12Resource> {
+        self.committed(D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON)
+    }
+
+    /// Milliseconds a compute shader takes for `steps` dependent scattered
+    /// 16-byte loads in each of [`LOAD_THREADS`] threads, over the first
+    /// `bytes` (a power of two, 16 or more) of `src`, the best of three: wall
+    /// time around a fenced run. Each load's address waits for the one
+    /// before (latency-bound, as XCL's slow programs were), so the time is
+    /// what reads of that memory cost a shader, which the copy engine's rate
+    /// does not show. `src` is read through a root shader-resource view
+    /// (buffers in the common state are promoted).
+    pub(crate) fn load_ms(&mut self, src: &ID3D12Resource, bytes: u64, steps: u32) -> windows::core::Result<f64> {
+        const SOURCE: &str = "#define RS \"SRV(t0), UAV(u0), RootConstants(num32BitConstants=2, b0)\"\n\
+            ByteAddressBuffer src : register(t0);\n\
+            RWByteAddressBuffer dst : register(u0);\n\
+            cbuffer c : register(b0) { uint mask; uint steps; };\n\
+            [RootSignature(RS)]\n\
+            [numthreads(64, 1, 1)]\n\
+            void main(uint id : SV_DispatchThreadID) {\n\
+                uint at = id * 2654435761u, sum = 0;\n\
+                for (uint i = 0; i < steps; i++) {\n\
+                    uint4 v = src.Load4((at & mask) << 4);\n\
+                    sum += v.x ^ v.w;\n\
+                    at = at * 1664525u + 1013904223u + v.y;\n\
+                }\n\
+                if (sum == 0x12345678u) dst.Store(0, sum);\n\
+            }\n";
+        if !bytes.is_power_of_two() || bytes < 16 {
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+        }
+        if self.loads.is_none() {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: as in `shade`.
+            let made = unsafe {
+                D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("loads"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
+                let code = code.ok_or_else(windows::core::Error::empty)?;
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                })?;
+                (root, pso)
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut dst: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut dst,
+                )?
+            };
+            self.loads = Some((made.0, made.1, dst.ok_or_else(windows::core::Error::empty)?));
+        }
+        let (root, pso, dst) = self.loads.clone().ok_or_else(windows::core::Error::empty)?;
+        let constants = [(bytes / 16 - 1) as u32, steps];
+        // SAFETY: live buffers.
+        let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            // SAFETY: an open list of ours; the views name live buffers, the
+            // reads stay in the first `bytes` of `src`.
+            self.run(|list| unsafe {
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootShaderResourceView(0, src_gpu);
+                list.SetComputeRootUnorderedAccessView(1, dst_gpu);
+                list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.Dispatch(LOAD_THREADS / 64, 1, 1);
+            })?;
             best = best.min(started.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(best)

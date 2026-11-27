@@ -50,7 +50,11 @@
 //! windows, `=2` title buffers too) places its buffers in them, with no
 //! `ALLOW_CROSS_ADAPTER`, before it would import. Renderer port 1
 //! (`crate::port`) does not: its memory is views of a section (the title's
-//! physical pages), which a driver heap cannot be.
+//! physical pages), which a driver heap cannot be. With
+//! `VICTORY_PORT_DRIVER=1` its 32-bit heap's reservation is remade as a
+//! driver heap at the first map into it ([`title_reservation`]), and `xmem`
+//! keeps that section's pages there (homes); copies of it stay, found by the
+//! write watch (stage 2b, `docs/design/in-place-memory.md`).
 //!
 //! Cost: a driver heap is resident at once, every page of it, where the
 //! title's committed memory takes RAM only as it is touched. On the RTX 3060
@@ -85,6 +89,49 @@ pub fn on() -> bool {
 
 fn decide(switch: Option<&str>) -> bool {
     matches!(switch.map(str::trim), Some("1" | "custom"))
+}
+
+/// `VICTORY_PORT_DRIVER` as asked: 0 (unset, or anything else) off and
+/// exactly as before, 1 or 2 (`docs/design/in-place-memory.md`, stage 2b).
+/// 1: renderer port 1's 32-bit heap has its physical pages in a driver heap
+/// at their own reservation ([`title_reservation`]); copies of that memory
+/// stay, found by the write watch instead of guards. 2 (port 1 placing its
+/// buffers in that heap) is not built yet and runs as 1.
+fn port_asked_raw() -> u8 {
+    static ASKED: OnceLock<u8> = OnceLock::new();
+    *ASKED.get_or_init(|| decide_port(std::env::var("VICTORY_PORT_DRIVER").ok().as_deref()))
+}
+
+fn decide_port(switch: Option<&str>) -> u8 {
+    match switch.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// [`port_asked_raw`], and renderer port 1 on (`VICTORY_PORT_CONSTANTS=1`,
+/// whose `arrange` makes the reservation one stretch of its section): what
+/// the self-test runs for. Not yet whether it passed ([`port_driver`]).
+pub fn port_asked() -> u8 {
+    if crate::port::on() { port_asked_raw() } else { 0 }
+}
+
+/// Set by [`before_title`]: `VICTORY_PORT_DRIVER`'s level for the run, 0
+/// unless asked for and the self-test passed.
+static PORT: OnceLock<u8> = OnceLock::new();
+
+/// `VICTORY_PORT_DRIVER`'s level for the run: 0 off (unset, not asked, port
+/// 1 off, or the self-test failed), 1 the 32-bit heap's pages at home in a
+/// driver heap. 0 until [`before_title`] has run.
+pub fn port_driver() -> u8 {
+    PORT.get().copied().unwrap_or(0)
+}
+
+/// Whether anything of this file may remake memory in the run (the grooming
+/// then holds [`gate`]'s lock).
+fn active() -> bool {
+    on() || port_asked() > 0
 }
 
 fn megabytes(name: &str, default: u64) -> u64 {
@@ -154,10 +201,10 @@ fn headroom() -> (u64, u64) {
 static GATE: RwLock<()> = RwLock::new(());
 
 /// Held around a call that takes address space (an allocation, a view), so
-/// that it does not fall into a remake's grooming; `None` with the switch
-/// off.
+/// that it does not fall into a remake's grooming; `None` with both switches
+/// (`VICTORY_UMA_DRIVER`, `VICTORY_PORT_DRIVER`) off.
 pub fn gate() -> Option<RwLockReadGuard<'static, ()>> {
-    on().then(|| GATE.read().unwrap_or_else(|e| e.into_inner()))
+    active().then(|| GATE.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The reservations (start, bytes) that leave a window of `len` bytes no
@@ -305,7 +352,6 @@ pub(crate) fn remake(device: &ID3D12Device, base: usize, size: usize, lost: Lost
     remake_with_after_release(device, base, size, lost, || Ok(()))
 }
 
-
 fn remake_with_after_release(
     device: &ID3D12Device,
     base: usize,
@@ -314,47 +360,98 @@ fn remake_with_after_release(
     after_release: impl FnOnce() -> Result<(), String>,
 ) -> Result<Remade, Failure> {
     let t0 = std::time::Instant::now();
-    let _groomed_alone = GATE.write().unwrap_or_else(|e| e.into_inner());
     // SAFETY: the caller's committed allocation.
     let pages = unsafe { written_pages(base, size) }.map_err(Failure::Kept)?;
     let kept: usize = pages.iter().map(|p| p.1.len()).sum();
-    // SAFETY: the caller's own allocation; its pages are copied out above.
-    if unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) } == 0 {
-        return Err(Failure::Kept(format!("VirtualFree of the memory at {base:#x} failed")));
+    let copy_back = || {
+        for (a, bytes) in &pages {
+            // SAFETY: pages of the memory at its address again (the heap's
+            // mapping, or the memory made again, or never released), as
+            // they were.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), *a as *mut u8, bytes.len()) };
+        }
+    };
+    let made = rebuild(
+        device,
+        base,
+        size,
+        lost,
+        || {
+            // SAFETY: the caller's own allocation; its pages are copied out above.
+            if unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) } == 0 {
+                return Err(Failure::Kept(format!("VirtualFree of the memory at {base:#x} failed")));
+            }
+            Ok(())
+        },
+        || {
+            // SAFETY: a reservation at an address the caller had.
+            let p = unsafe { mem::VirtualAlloc(base as *const c_void, size, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE) };
+            p as usize == base
+        },
+        after_release,
+    );
+    match made {
+        Ok((heap, whole, reservations)) => {
+            copy_back();
+            Ok(Remade { heap, whole, said: (reservations, pages.len(), kept, t0.elapsed().as_millis()) })
+        }
+        Err(Failure::Kept(why)) => {
+            copy_back();
+            Err(Failure::Kept(why))
+        }
+        Err(gone) => Err(gone),
     }
+}
+
+/// The line, and what to do, when memory was released and could not be had
+/// again at its address: [`Failure::Gone`] with [`Lost::Report`]; the
+/// process ends with [`Lost::Stop`].
+fn lost_it(lost: Lost, line: String) -> Failure {
+    match lost {
+        Lost::Report => Failure::Gone(line),
+        Lost::Stop => {
+            tracing::error!("{line}; stopping before title memory is used");
+            eprintln!("{line}; stopping before title memory is used");
+            // SAFETY: ends this process.
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), STOPPED);
+            }
+            std::process::abort();
+        }
+    }
+}
+
+/// The remake's steps that do not depend on what the memory was (XCL's):
+/// with the address space to itself ([`GATE`]), `release` lets the memory
+/// at `[base, base + size)` go (`Err`: it is as it was, or gone), every
+/// other free stretch it would fit in is reserved for a moment, a driver
+/// heap of `size` bytes is made and one buffer over it mapped; if the
+/// mapping is not at `base`, or `GetWriteWatch` cannot read it, `again`
+/// makes the memory again at its address (a few tries; true: it is there)
+/// while the address space is still groomed. The heap, its buffer (mapped
+/// for good) and how many reservations groomed.
+fn rebuild(
+    device: &ID3D12Device,
+    base: usize,
+    size: usize,
+    lost: Lost,
+    release: impl FnOnce() -> Result<(), Failure>,
+    again: impl Fn() -> bool,
+    after_release: impl FnOnce() -> Result<(), String>,
+) -> Result<(ID3D12Heap, ID3D12Resource, usize), Failure> {
+    let _groomed_alone = GATE.write().unwrap_or_else(|e| e.into_inner());
+    release()?;
     let restore = |why: String| -> Failure {
         // A heap's mapping may go a moment after its last reference: a few
         // tries (here, not in XCL).
-        let mut p = std::ptr::null_mut();
         for _ in 0..50 {
-            // SAFETY: a reservation at an address the caller had.
-            p = unsafe { mem::VirtualAlloc(base as *const c_void, size, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE) };
-            if p as usize == base {
-                break;
+            if again() {
+                return Failure::Kept(why);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        if p as usize != base {
-            let error = std::io::Error::last_os_error();
-            let line = format!("UMA driver: the memory at {base:#x} ({size} bytes) could not be restored at its address (got {p:?}: {error}) after {why}");
-            match lost {
-                Lost::Report => return Failure::Gone(line),
-                Lost::Stop => {
-                    tracing::error!("{line}; stopping before title memory is used");
-                    eprintln!("{line}; stopping before title memory is used");
-                    // SAFETY: ends this process.
-                    unsafe {
-                        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), STOPPED);
-                    }
-                    std::process::abort();
-                }
-            }
-        }
-        for (a, bytes) in &pages {
-            // SAFETY: pages of the memory just made again, as they were.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), *a as *mut u8, bytes.len()) };
-        }
-        Failure::Kept(why)
+        let error = std::io::Error::last_os_error();
+        lost_it(lost, format!("UMA driver: the memory at {base:#x} ({size} bytes) could not be restored at its address ({error}) after {why}"))
     };
     let groomed = groom(base, size);
     let reservations = groomed.len();
@@ -404,7 +501,7 @@ fn remake_with_after_release(
     // Checked, and restored on failure, while the address space is still
     // groomed (XCL ungrooms first): the hole is still free then.
     let result = match made {
-        Ok((heap, whole, p)) if p == base && watched() => Ok((heap, whole)),
+        Ok((heap, whole, p)) if p == base && watched() => Ok((heap, whole, reservations)),
         Ok((heap, whole, p)) => {
             // SAFETY: mapped above.
             unsafe { whole.Unmap(0, None) };
@@ -418,12 +515,115 @@ fn remake_with_after_release(
         Err(e) => Err(restore(e)),
     };
     ungroom(groomed);
-    let (heap, whole) = result?;
-    for (a, bytes) in &pages {
-        // SAFETY: pages of the heap's mapping at the memory's address.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), *a as *mut u8, bytes.len()) };
+    result
+}
+
+// A reservation of placeholders (renderer port 1's 32-bit heap,
+// `VICTORY_PORT_DRIVER`).
+
+/// A placeholder at `[at, at + len)` (free address space before).
+fn placeholder(at: usize, len: usize) -> bool {
+    // SAFETY: a reservation at an address the caller had; no pages.
+    let p = unsafe {
+        mem::VirtualAlloc2(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            at as *const c_void,
+            len,
+            mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+            mem::PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    p as usize == at
+}
+
+/// The placeholders that make up `[base, base + size)`, in order: (start,
+/// bytes). Err if anything else is there (a view, committed memory, a hole)
+/// or they do not end at the range's end.
+pub(crate) fn placeholders(base: usize, size: usize) -> Result<Vec<(usize, usize)>, String> {
+    let (end, mut at, mut out) = (base + size, base, Vec::new());
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { mem::VirtualQuery(at as *const c_void, &mut m, size_of::<mem::MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return Err(format!("VirtualQuery at {at:#x} failed"));
+        }
+        let (start, next) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
+        if m.State != mem::MEM_RESERVE || start != at || next > end || m.AllocationBase as usize != at {
+            return Err(format!(
+                "not a placeholder of the reservation at {at:#x}: state {:#x}, type {:#x}, allocation {:#x}, region {start:#x}+{:#x}",
+                m.State, m.Type, m.AllocationBase as usize, m.RegionSize
+            ));
+        }
+        out.push((start, next - start));
+        at = next;
     }
-    Ok(Remade { heap, whole, said: (reservations, pages.len(), kept, t0.elapsed().as_millis()) })
+    Ok(out)
+}
+
+/// Placeholders at `pieces` (in order, one after the other) where one
+/// placeholder of all of them is now: split as they were. False if a split
+/// failed (the placeholders are then fewer, bigger ones).
+fn split_as(pieces: &[(usize, usize)]) -> bool {
+    let mut all = true;
+    for &(at, len) in pieces.iter().take(pieces.len().saturating_sub(1)) {
+        // SAFETY: cuts a placeholder of ours in two.
+        all &= unsafe { mem::VirtualFree(at as *mut c_void, len, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER) } != 0;
+    }
+    all
+}
+
+/// A reservation of placeholders `[base, base + size)` (`size` a multiple
+/// of 64 KiB, nothing mapped in it) remade as a driver heap mapped at
+/// `base`, committed read-write, zeros, write-watched. On failure the
+/// placeholders are there again, split as they were; or, if the address
+/// cannot be had again, [`Lost`] says what happens.
+pub(crate) fn remake_reservation(device: &ID3D12Device, base: usize, size: usize, lost: Lost) -> Result<Remade, Failure> {
+    remake_reservation_with_after_release(device, base, size, lost, || Ok(()))
+}
+
+fn remake_reservation_with_after_release(
+    device: &ID3D12Device,
+    base: usize,
+    size: usize,
+    lost: Lost,
+    after_release: impl FnOnce() -> Result<(), String>,
+) -> Result<Remade, Failure> {
+    let t0 = std::time::Instant::now();
+    let pieces = placeholders(base, size).map_err(Failure::Kept)?;
+    let (heap, whole, reservations) = rebuild(
+        device,
+        base,
+        size,
+        lost,
+        || {
+            for (k, &(at, _)) in pieces.iter().enumerate() {
+                // SAFETY: a placeholder of the reservation, nothing in it.
+                if unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) } == 0 {
+                    let error = std::io::Error::last_os_error();
+                    // Those let go already, back as they were.
+                    if pieces[..k].iter().all(|&(at, len)| placeholder(at, len)) {
+                        return Err(Failure::Kept(format!("VirtualFree of the placeholder at {at:#x} failed ({error})")));
+                    }
+                    return Err(lost_it(lost, format!("UMA driver: placeholders of the reservation at {base:#x} could not be made again after a failed release at {at:#x} ({error})")));
+                }
+            }
+            Ok(())
+        },
+        || {
+            if !placeholder(base, size) {
+                return false;
+            }
+            if !split_as(&pieces) {
+                tracing::warn!(at = format_args!("{base:#x}"), pieces = pieces.len(), "UMA driver: a reservation's placeholders are back, but not all split as they were");
+            }
+            true
+        },
+        after_release,
+    )?;
+    Ok(Remade { heap, whole, said: (reservations, pieces.len(), 0, t0.elapsed().as_millis()) })
 }
 
 // The title's allocations in driver heaps.
@@ -456,8 +656,12 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Set by [`before_title`]: the self-test passed.
 static READY: OnceLock<bool> = OnceLock::new();
 
-fn ready() -> bool {
-    READY.get().copied().unwrap_or(false)
+/// Set by [`before_title`]: title allocations become driver heaps
+/// (`VICTORY_UMA_DRIVER=1`, in-place memory on, the self-test passed).
+static ALLOCATIONS: OnceLock<bool> = OnceLock::new();
+
+fn allocations() -> bool {
+    ALLOCATIONS.get().copied().unwrap_or(false)
 }
 
 /// What became of a title allocation ([`title_allocation`]).
@@ -483,7 +687,7 @@ fn count(at: usize, bytes: u64) {
 /// passed, made a driver heap at the same address if [`refuse`] lets it.
 /// The caller holds no [`gate`].
 pub fn title_allocation(at: usize, size: usize, gpu: bool) -> Allocation {
-    if !ready() {
+    if !allocations() {
         return Allocation::Plain;
     }
     let size = size.next_multiple_of(K64);
@@ -546,8 +750,12 @@ fn region_of(regions: &BTreeMap<usize, Region>, at: usize) -> Option<(usize, usi
     (at < base + r.len).then_some((base, r.len))
 }
 
-/// Whether `[at, at + len)` lies in one driver heap.
+/// Whether `[at, at + len)` lies in one driver heap (a title allocation's,
+/// or a home, [`homed`]).
 pub fn holds(at: usize, len: usize) -> bool {
+    if homed(at, len) {
+        return true;
+    }
     if BYTES.load(Ordering::Relaxed) == 0 {
         return false;
     }
@@ -559,8 +767,11 @@ pub fn holds(at: usize, len: usize) -> bool {
 /// heap, done here: `Some` with the call's result, `None` if the memory is
 /// no driver heap's. A release of the whole lets the heap go; a decommit
 /// zeroes the pages (they stay committed: a heap cannot lose pages, and a
-/// commit there again is a no-op, [`holds`]).
+/// commit there again is a no-op, [`holds`]). In a home, `home_free`.
 pub fn title_free(address: usize, size: usize, kind: u32) -> Option<bool> {
+    if let Some(done) = home_free(address, size, kind) {
+        return Some(done);
+    }
     if BYTES.load(Ordering::Relaxed) == 0 {
         return None;
     }
@@ -614,6 +825,265 @@ pub(crate) fn place_for(start: u64, len: u64) -> Option<crate::inplace::Placed> 
     Some(crate::inplace::Placed { buffer, heap, gpu, bias: start - at })
 }
 
+// Renderer port 1's 32-bit heap at home (`VICTORY_PORT_DRIVER`).
+
+/// Reservations of physical pages that are driver heaps, by address: the
+/// pages of one section live there, each at its offset (`xmem`'s home).
+static HOMES: RwLock<BTreeMap<usize, Region>> = RwLock::new(BTreeMap::new());
+/// Bytes in [`HOMES`] (0: none, a quick look).
+static HOME_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Since the start: reservations made homes, their bytes; left as they were
+/// (refused by the driver, mapped elsewhere, or limits); pages of a home's
+/// section mapped elsewhere (aliases); pages mapped into a home away from
+/// their own; the title's releases there, kept; buffers and windows there
+/// copied (port 1 at level 1).
+static HOME_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Why the last reservation was left as it was.
+static HOME_REFUSED: Mutex<String> = Mutex::new(String::new());
+
+/// The title's reservation of placeholders `[base, base + bytes)`, which
+/// one section's pages are about to be mapped into, each at its offset
+/// (renderer port 1's 32-bit heap, `xmem`'s `arrange`), before any page is
+/// mapped there: with `VICTORY_PORT_DRIVER` on, remade as a driver heap at
+/// its address ([`remake_reservation`]), so that the pages can live there
+/// and be no section views. True if it is one now. On failure the
+/// placeholders are as they were (split as before); if even that cannot be
+/// had, the process stops (the title holds the address: [`Lost::Stop`]).
+/// The caller holds no [`gate`].
+pub fn title_reservation(base: usize, bytes: usize) -> bool {
+    if port_driver() == 0 {
+        return false;
+    }
+    let refused = |why: String| {
+        HOME_STATS[2].fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            at = format_args!("{base:#x}"),
+            mb = bytes >> 20,
+            why,
+            "renderer port 1, VICTORY_PORT_DRIVER: the 32-bit heap stays views of its section (copies over guards, as before)"
+        );
+        *HOME_REFUSED.lock().unwrap_or_else(|e| e.into_inner()) = why;
+        false
+    };
+    if !bytes.is_multiple_of(K64) || !base.is_multiple_of(K64) {
+        return refused(format!("not on 64 KiB: {base:#x}+{bytes:#x}"));
+    }
+    let _alone = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    let (ram, commit) = headroom();
+    let made = BYTES.load(Ordering::Relaxed) + HOME_BYTES.load(Ordering::Relaxed);
+    if let Some(why) = refuse(bytes as u64, made, ram, commit, Limits { least: 0, ..limits() }) {
+        return refused(format!("{why:?}: {} MB in driver heaps, {} MB RAM and {} MB commit free (VICTORY_UMA_DRIVER_MB, _KEEP_MB)", made >> 20, ram >> 20, commit >> 20));
+    }
+    let Some(host) = crate::host::host() else {
+        return refused("no host device".to_owned());
+    };
+    match remake_reservation(&host.device, base, bytes, Lost::Stop) {
+        Ok(Remade { heap, whole, said: (reservations, pieces, _, ms) }) => {
+            HOMES.write().unwrap_or_else(|e| e.into_inner()).insert(base, Region { len: bytes, heap, whole });
+            HOME_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+            HOME_STATS[0].fetch_add(1, Ordering::Relaxed);
+            HOME_STATS[1].fetch_add(bytes as u64, Ordering::Relaxed);
+            tracing::info!(
+                at = format_args!("{base:#x}"),
+                mb = bytes >> 20,
+                pieces,
+                reservations,
+                ms,
+                "renderer port 1, VICTORY_PORT_DRIVER=1: the 32-bit heap's reservation is a driver CUSTOM write-back L0 heap mapped at its address, write-watched; \
+                 its physical pages live there"
+            );
+            true
+        }
+        Err(Failure::Kept(why) | Failure::Gone(why)) => refused(why),
+    }
+}
+
+/// Whether `[at, at + len)` lies in a home ([`title_reservation`]).
+pub fn homed(at: usize, len: usize) -> bool {
+    if HOME_BYTES.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let homes = HOMES.read().unwrap_or_else(|e| e.into_inner());
+    region_of(&homes, at).is_some_and(|(base, n)| at.saturating_add(len) <= base + n)
+}
+
+/// `xmem` mapped `len` bytes of a home's pages at `at` elsewhere
+/// (`inside`: into a home, away from their own place, where nothing is
+/// mapped and the heap's bytes stay): an alias, which the heap cannot be.
+/// Counted, and said at error level the first times.
+pub fn home_alias(at: usize, len: usize, inside: bool) {
+    let n = HOME_STATS[if inside { 4 } else { 3 }].fetch_add(len.div_ceil(K64) as u64, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        tracing::error!(
+            at = format_args!("{at:#x}"),
+            len,
+            inside,
+            "renderer port 1, VICTORY_PORT_DRIVER: a page of the 32-bit heap's section mapped {}",
+            if inside {
+                "into the heap away from its own place: left as the heap shows it"
+            } else {
+                "elsewhere too: a plain view of the section there, whose bytes are not the heap's"
+            }
+        );
+    }
+}
+
+/// Pages of homes' sections mapped elsewhere, since the start ([`home_alias`]).
+pub fn home_aliases() -> u64 {
+    HOME_STATS[3].load(Ordering::Relaxed) + HOME_STATS[4].load(Ordering::Relaxed)
+}
+
+/// Renderer port 1 left a title buffer or window in a home copied (level 1).
+pub(crate) fn home_copied() {
+    HOME_STATS[6].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The title's `VirtualFree` in a home: placeholder splits and joins do
+/// nothing (there are none), a decommit zeroes the pages, a release keeps
+/// the heap (shortcut: its section's pages live there, and `xmem` writes
+/// them there; the 32-bit heap is never released). `None` if not a home's.
+fn home_free(address: usize, size: usize, kind: u32) -> Option<bool> {
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if HOME_BYTES.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let homes = HOMES.read().unwrap_or_else(|e| e.into_inner());
+    let (base, len) = region_of(&homes, address)?;
+    if kind & (mem::MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0 {
+        return Some(true);
+    }
+    if kind & mem::MEM_RELEASE != 0 {
+        if HOME_STATS[5].fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{address:#x}"),
+                "renderer port 1, VICTORY_PORT_DRIVER: the title releases memory of the 32-bit heap at home: the driver heap is kept"
+            );
+        }
+        return Some(true);
+    }
+    if kind & mem::MEM_DECOMMIT != 0 {
+        let from = address & !0xFFF;
+        let to = if size == 0 { base + len } else { (address + size).next_multiple_of(0x1000).min(base + len) };
+        // SAFETY: pages of the heap's mapping, which stays.
+        unsafe { std::ptr::write_bytes(from as *mut u8, 0, to.saturating_sub(from)) };
+        return Some(true);
+    }
+    None
+}
+
+/// For port 1's line: the homes.
+pub(crate) fn home_line() -> Option<String> {
+    let level = port_driver();
+    if level == 0 {
+        return None;
+    }
+    let s: Vec<u64> = HOME_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let why = HOME_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Some(format!(
+        "renderer port 1, VICTORY_PORT_DRIVER={level}: {} reservations' physical pages at home in driver heaps ({} MB), {} title buffers and windows there copied \
+         over the write watch (no guards); {} reservations left views of their section{}; aliases: {} pages mapped elsewhere (plain views, not the heap's bytes), \
+         {} mapped into a home away from their own; {} title releases there kept",
+        s[0],
+        s[1] >> 20,
+        s[6],
+        s[2],
+        if why.is_empty() { String::new() } else { format!(" (last: {why})") },
+        s[3],
+        s[4],
+        s[5],
+    ))
+}
+
+/// Stage 2b's self-test of a reservation (with `VICTORY_PORT_DRIVER`): 48 MB
+/// of placeholders of its own, split in three as the title splits its heap,
+/// remade at its address as [`title_reservation`] remakes one; the memory is
+/// committed read-write, the GPU reads a CPU write, the write watch sees
+/// one. Then let go.
+fn reservation_test(device: &ID3D12Device) -> Result<String, String> {
+    const SIZE: usize = 48 << 20;
+    // SAFETY: address space of the test's own.
+    let base = unsafe {
+        mem::VirtualAlloc2(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            std::ptr::null(),
+            SIZE,
+            mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+            mem::PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    } as usize;
+    if base == 0 {
+        return Err("the reservation: no address space".to_owned());
+    }
+    let pieces = [(base, 8 << 20), (base + (8 << 20), 24 << 20), (base + (32 << 20), 16 << 20)];
+    let release = || {
+        for &(at, _) in &pieces {
+            // SAFETY: placeholders of the test's own.
+            unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) };
+        }
+    };
+    if !split_as(&pieces) {
+        release();
+        return Err("the reservation: its placeholder could not be split".to_owned());
+    }
+    let remade = match remake_reservation(device, base, SIZE, Lost::Report) {
+        Ok(remade) => remade,
+        Err(Failure::Kept(why)) => {
+            let back = placeholders(base, SIZE).is_ok_and(|p| p == pieces);
+            release();
+            return Err(format!("the reservation's remake: {why} (its placeholders back as they were: {back})"));
+        }
+        Err(Failure::Gone(why)) => return Err(format!("the reservation's remake: {why}")),
+    };
+    let (reservations, _, _, ms) = remade.said;
+    let checked = (|| -> Result<(), String> {
+        let mut here = base;
+        while here < base + SIZE {
+            // SAFETY: plain data filled in by the query.
+            let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { mem::VirtualQuery(here as *const c_void, &mut info, size_of_val(&info)) } == 0
+                || info.State != mem::MEM_COMMIT
+                || info.Protect != mem::PAGE_READWRITE
+            {
+                return Err(format!("the reservation: VirtualQuery at {here:#x}: state {:#x}, protection {:#x}", info.State, info.Protect));
+            }
+            here = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        }
+        let at = base + (8 << 20) + K64;
+        fill(at, K64, 77);
+        let mut rig = crate::inplace::Rig::new(device).map_err(|e| format!("the reservation: no queue of its own: {e}"))?;
+        let got = rig.fetch(&remade.whole, (at - base) as u64, K64).map_err(|e| format!("the reservation: the GPU's copy failed: {e}"))?;
+        if !same(at, &got) {
+            return Err("the reservation: the GPU read other bytes than the CPU wrote".to_owned());
+        }
+        // SAFETY: the heap's mapping.
+        unsafe { mem::ResetWriteWatch(base as *const c_void, SIZE) };
+        let page = base + (40 << 20);
+        // SAFETY: as above.
+        unsafe { (page as *mut u8).write_volatile(9) };
+        let (mut found, mut n, mut granularity) = ([std::ptr::null_mut::<c_void>(); 16], 16usize, 0u32);
+        // SAFETY: a sized answer buffer.
+        let asked = unsafe { mem::GetWriteWatch(0, base as *const c_void, SIZE, found.as_mut_ptr(), &mut n, &mut granularity) } == 0;
+        if !asked || !found[..n].iter().any(|&p| (p as usize) <= page && page < p as usize + granularity as usize) {
+            return Err(format!("the reservation: the write watch did not see a CPU write (asked {asked}, {n} pages)"));
+        }
+        Ok(())
+    })();
+    // SAFETY: mapped when made; the test's memory goes.
+    unsafe { remade.whole.Unmap(0, None) };
+    drop(remade);
+    checked.map(|()| {
+        format!(
+            "a reservation of {} placeholders ({} MB) remade at its address {base:#x} as a driver heap in {ms} ms ({reservations} reservations groomed): \
+             committed read-write, the GPU reads a CPU write, the write watch sees one",
+            pieces.len(),
+            SIZE >> 20
+        )
+    })
+}
+
 /// For the in-place line every ten seconds.
 pub(crate) fn line() -> Option<String> {
     if !on() {
@@ -651,44 +1121,103 @@ pub(crate) fn line() -> Option<String> {
 
 // Before the title.
 
+/// The prefix of every line the start-up self-test logs, for grepping.
+const SAID: &str = "UMA self-test:";
+
 /// Before the title's first code (its TLS callbacks and `DllMain`s): with
-/// the switch on, the host device is made and [`self_test`] run; title
-/// allocations become driver heaps only if it passed.
+/// `VICTORY_UMA_DRIVER=1` or `VICTORY_PORT_DRIVER=1|2` (with renderer port
+/// 1), the host device is made and [`self_test`] run, its lines logged
+/// beginning "UMA self-test:"; title allocations become driver heaps, and
+/// the 32-bit heap's pages go into one, only if it passed. With both off,
+/// nothing.
 pub fn before_title() {
-    if !on() {
+    let asked = port_asked_raw();
+    if asked > 0 && !crate::port::on() {
+        tracing::error!(
+            "{SAID} VICTORY_PORT_DRIVER={asked} needs renderer port 1 (VICTORY_PORT_CONSTANTS=1, whose arrange makes the 32-bit heap one stretch of its section): off for the run"
+        );
+    }
+    let port = port_asked();
+    if !on() && port == 0 {
+        let _ = PORT.set(0);
+        return;
+    }
+    if on() && port == 0 && crate::inplace::level() == 0 {
+        // As before: nothing would read the driver heaps, so no test.
+        tracing::error!(
+            why = "VICTORY_INPLACE is 0: nothing places title memory in a heap, so no driver heap would be read (set VICTORY_INPLACE=1 or 2)",
+            "UMA driver: the self-test failed; off for the run, title memory as before"
+        );
+        let _ = (READY.set(false), ALLOCATIONS.set(false), PORT.set(0));
         return;
     }
     let verdict = (|| -> Result<Vec<String>, String> {
-        if crate::inplace::level() == 0 {
-            return Err("VICTORY_INPLACE is 0: nothing places title memory in a heap, so no driver heap would be read (set VICTORY_INPLACE=1 or 2)".to_owned());
-        }
         let host = crate::host::host().ok_or("no host device")?;
         self_test(&host.device)
     })();
-    if crate::port::on() {
-        tracing::info!(
-            "UMA driver: renderer port 1's 32-bit heap stays imported (OpenExistingHeapFromAddress1 on a view of its section): \
-             a section's pages cannot be a driver heap"
-        );
-    }
-    let l = limits();
+    let passed = verdict.is_ok();
     match verdict {
         Ok(lines) => {
             for line in lines {
-                tracing::info!("UMA driver self-test: {line}");
+                tracing::info!("{SAID} {line}");
             }
-            tracing::info!(
-                least_mb = l.least >> 20,
-                most_mb = l.most >> 20,
-                keep_mb = l.keep >> 20,
-                "UMA driver: on; title allocations reserved and committed at once with GPU access bits become driver heaps"
-            );
-            let _ = READY.set(true);
         }
         Err(why) => {
+            tracing::error!("{SAID} FAILED: {why}");
             tracing::error!(why, "UMA driver: the self-test failed; off for the run, title memory as before");
-            let _ = READY.set(false);
         }
+    }
+    let _ = READY.set(passed);
+    // Title allocations in driver heaps: VICTORY_UMA_DRIVER=1, read by
+    // in-place memory.
+    let allocations = on() && passed && crate::inplace::level() > 0;
+    if on() && passed && !allocations {
+        tracing::error!(
+            "UMA driver: VICTORY_INPLACE is 0: nothing places title memory in a heap, so no driver heap would be read (set VICTORY_INPLACE=1 or 2); \
+             title allocations stay the title's own"
+        );
+    }
+    let _ = ALLOCATIONS.set(allocations);
+    if allocations {
+        let l = limits();
+        tracing::info!(
+            least_mb = l.least >> 20,
+            most_mb = l.most >> 20,
+            keep_mb = l.keep >> 20,
+            "UMA driver: on; title allocations reserved and committed at once with GPU access bits become driver heaps"
+        );
+    }
+    // Stage 2b: a reservation of placeholders remade as the 32-bit heap's
+    // will be; only with the switch, and only if the rest passed.
+    let homes = if port > 0 && passed {
+        let tested = crate::host::host().ok_or_else(|| "no host device".to_owned()).and_then(|host| reservation_test(&host.device));
+        match &tested {
+            Ok(line) => tracing::info!("{SAID} {line}"),
+            Err(why) => tracing::error!("{SAID} FAILED: {why}"),
+        }
+        tested.is_ok()
+    } else {
+        false
+    };
+    let level = if homes { port.min(1) } else { 0 };
+    let _ = PORT.set(level);
+    if port > 0 {
+        if level == 0 {
+            tracing::error!("{SAID} VICTORY_PORT_DRIVER={port} off for the run: renderer port 1's 32-bit heap as before (views of its section, copies over guards)");
+        } else {
+            if port == 2 {
+                tracing::warn!("{SAID} VICTORY_PORT_DRIVER=2 (port 1 placing in the driver heap) is not built yet: running as 1");
+            }
+            tracing::info!(
+                "{SAID} passed; VICTORY_PORT_DRIVER=1 on: the 32-bit heap's reservation becomes a driver heap at its first map, its physical pages live \
+                 there (no views), and copies of it are found by the write watch instead of guards"
+            );
+        }
+    } else if crate::port::on() && allocations {
+        tracing::info!(
+            "UMA driver: renderer port 1's 32-bit heap stays imported (OpenExistingHeapFromAddress1 on a view of its section): \
+             a section's pages cannot be a driver heap (VICTORY_PORT_DRIVER=1 puts them in one at their reservation)"
+        );
     }
 }
 
@@ -704,15 +1233,90 @@ fn same(at: usize, bytes: &[u8]) -> bool {
     unsafe { std::slice::from_raw_parts(at as *const u8, bytes.len()) == bytes }
 }
 
+/// What the self-test measures copies and loads on: 16 MB.
+const RATE: usize = 16 << 20;
+
+/// The most steps [`timed_loads`] doubles to.
+const MOST_STEPS: u32 = 1 << 16;
+
+/// [`crate::inplace::Rig::load_ms`] of `src`, its steps doubled from 16
+/// until the run takes 5 ms or more, or `most` steps: (ms, steps). Each run
+/// is at most about twice the one before, so memory that is very slow costs
+/// a few short runs, not a long one (a long one would end in a timeout of
+/// the device).
+fn timed_loads(rig: &mut crate::inplace::Rig, src: &ID3D12Resource, most: u32) -> windows::core::Result<(f64, u32)> {
+    let mut steps = 16u32;
+    loop {
+        let ms = rig.load_ms(src, RATE as u64, steps)?;
+        if ms >= 5.0 || steps >= most {
+            return Ok((ms, steps));
+        }
+        steps *= 2;
+    }
+}
+
+/// A load time of `steps` steps said at `want` steps (scaled, marked `~`).
+fn at_steps(ms: f64, steps: u32, want: u32) -> (f64, bool) {
+    (ms * f64::from(want) / f64::from(steps.max(1)), steps < want)
+}
+
+/// The shaders' line and the ratios' lines, from (name, ms at the card's
+/// steps, scaled) for card memory, the driver heap and the imports (`None`:
+/// not measured, with why), and the card's steps.
+fn load_lines(card: (f64, u32), rest: &[(&str, Result<(f64, bool), String>)]) -> Vec<String> {
+    let (card_ms, steps) = card;
+    let say = |r: &Result<(f64, bool), String>| match r {
+        Ok((ms, scaled)) => format!("{}{ms:.1} ms", if *scaled { "~" } else { "" }),
+        Err(why) => format!("? ({why})"),
+    };
+    let mut lines = vec![format!(
+        "shaders read {} MB in dependent 16-byte loads ({} threads x {steps} steps; ~: scaled from fewer steps): card memory {card_ms:.1} ms ({:.2} us a step){}",
+        RATE >> 20,
+        crate::inplace::LOAD_THREADS,
+        card_ms * 1000.0 / f64::from(steps),
+        rest.iter().map(|(name, r)| format!(", {name} {}", say(r))).collect::<String>()
+    )];
+    let driver = rest.iter().find(|r| r.0 == "driver heap").and_then(|r| r.1.as_ref().ok()).map(|r| r.0);
+    let ratio = |of: f64, to: f64| format!("x{:.2}", of / to);
+    lines.push(format!(
+        "shader loads against card memory: {}",
+        rest.iter().map(|(name, r)| format!("{name} {}", r.as_ref().map_or("?".to_owned(), |r| ratio(r.0, card_ms)))).collect::<Vec<_>>().join(", ")
+    ));
+    if let Some(driver) = driver {
+        lines.push(format!(
+            "shader loads against the driver heap: card memory {}, {}",
+            ratio(card_ms, driver),
+            rest.iter()
+                .filter(|r| r.0 != "driver heap")
+                .map(|(name, r)| format!("{name} {}", r.as_ref().map_or("?".to_owned(), |r| ratio(r.0, driver))))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if let Some(Ok((file, _))) = rest.iter().find(|r| r.0 == "file-mapping import").map(|r| &r.1) {
+            let speed = driver / file;
+            lines.push(format!(
+                "the file-mapping import reads at {speed:.2} of the driver heap's speed: stage 2b's option (a), the pool's sections opened as heaps, {}",
+                if speed >= 0.5 { "is worth a run on this card (0.5 or more)" } else { "stays off on this card (under 0.5)" }
+            ));
+        }
+    }
+    lines
+}
+
 /// The start-up self-test (`docs/design/in-place-memory.md`), on memory of
 /// its own made as `xmem` makes title memory and remade through the same
 /// steps: the GPU sees the CPU's bytes (those kept through the remake, and
 /// a second write with no call in between), the GPU's writes (a copy, a
 /// shader through unordered access) show at the address, the memory stays
 /// committed and read-write, the write watch sees CPU writes, and the guard
-/// `crate::watch` sets takes. Then the card's copy rate out of it and out of
-/// an import of the same size, said and not judged. Ok with the lines, Err
-/// naming the step that failed.
+/// `crate::watch` sets takes. Then, said and not judged: the card's copy
+/// rate out of it, out of an import of the same size and out of a
+/// file-mapping import (`OpenExistingHeapFromFileMapping`, `SEC_COMMIT`),
+/// and the time shaders take for dependent scattered loads out of card
+/// memory, the driver heap and both imports (stage 2b's decider). A
+/// measurement the host refuses is said as such; one that removes the
+/// device fails the test. Ok with the lines, Err naming the step that
+/// failed.
 pub(crate) fn self_test(device: &ID3D12Device) -> Result<Vec<String>, String> {
     const SIZE: usize = 64 << 20;
     let mut lines = Vec::new();
@@ -801,43 +1405,97 @@ pub(crate) fn self_test(device: &ID3D12Device) -> Result<Vec<String>, String> {
             return Err(format!("step 6: VirtualProtect read-only {guarded}, read-write again {back}"));
         }
         lines.push(format!("steps 1-6 passed (the memory's type {kind:#x}: 0x20000 private, 0x40000 mapped)"));
-        // The rate, said only.
-        const RATE: usize = 16 << 20;
-        let gbs = |ms: f64| RATE as f64 / (ms / 1000.0) / 1e9;
-        let driver = rig.copy_ms(whole, RATE as u64).map(gbs);
-        let imported = (|| {
-            // SAFETY: memory of the test's own, opened and let go here.
-            let at = unsafe { mem::VirtualAlloc(std::ptr::null(), RATE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) } as usize;
-            if at == 0 {
-                return None;
-            }
-            let rate = crate::inplace::open(device, crate::inplace::From::Part(at, RATE))
-                .and_then(|heap| crate::inplace::place(device, &heap, 0, RATE as u64))
-                .and_then(|buffer| rig.copy_ms(&buffer, RATE as u64))
-                .map(gbs)
-                .ok();
-            // The import lets go of the pages a moment after its last reference.
-            for _ in 0..100 {
-                // SAFETY: as above.
-                if unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) } != 0 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            rate
-        })();
-        let say = |r: Option<f64>| r.map_or("?".to_owned(), |r| format!("{r:.1} GB/s"));
-        lines.push(format!(
-            "the card copies 16 MB out of the driver heap at {}, out of the same memory imported (OpenExistingHeapFromAddress1) at {}",
-            say(driver.ok()),
-            say(imported)
-        ));
+        lines.extend(measure(device, &mut rig, whole)?);
         Ok(())
     })();
     // SAFETY: mapped when made; the test's memory goes.
     unsafe { remade.whole.Unmap(0, None) };
     drop(remade);
     steps.map(|()| lines)
+}
+
+/// The measurements, said only: the card's copy rate out of the driver heap
+/// `whole` (64 MB), out of an import of private memory and out of a
+/// file-mapping import; the shaders' load times out of card memory and the
+/// three. Err only if the device was removed meanwhile.
+fn measure(device: &ID3D12Device, rig: &mut crate::inplace::Rig, whole: &ID3D12Resource) -> Result<Vec<String>, String> {
+    let gbs = |ms: f64| RATE as f64 / (ms / 1000.0) / 1e9;
+    let say = |r: &Result<f64, String>| r.as_ref().map_or_else(|e| format!("? ({e})"), |r| format!("{r:.1} GB/s"));
+    let mut lines = Vec::new();
+    // The imports, each a buffer of RATE bytes, let go at the end.
+    // SAFETY: memory of the test's own, opened and let go here.
+    let at = unsafe { mem::VirtualAlloc(std::ptr::null(), RATE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) } as usize;
+    let address = if at == 0 {
+        Err("no memory".to_owned())
+    } else {
+        crate::inplace::open(device, crate::inplace::From::Part(at, RATE))
+            .and_then(|heap| crate::inplace::place(device, &heap, 0, RATE as u64))
+            .map_err(|e| format!("refused: {e}"))
+    };
+    // SAFETY: a section of the test's own; closed at the end.
+    let section = unsafe {
+        mem::CreateFileMappingW(
+            windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            mem::PAGE_READWRITE | mem::SEC_COMMIT,
+            0,
+            RATE as u32,
+            std::ptr::null(),
+        )
+    };
+    let file = if section.is_null() {
+        Err(format!("no section: {}", std::io::Error::last_os_error()))
+    } else {
+        crate::inplace::open(device, crate::inplace::From::Section(section as usize))
+            .and_then(|heap| crate::inplace::place(device, &heap, 0, RATE as u64))
+            .map_err(|e| format!("refused: {e}"))
+    };
+    let copy = |rig: &mut crate::inplace::Rig, from: &Result<ID3D12Resource, String>| -> Result<f64, String> {
+        let from = from.as_ref().map_err(Clone::clone)?;
+        rig.copy_ms(from, RATE as u64).map(gbs).map_err(|e| format!("failed: {e}"))
+    };
+    let driver_copy = rig.copy_ms(whole, RATE as u64).map(gbs).map_err(|e| format!("failed: {e}"));
+    let address_copy = copy(rig, &address);
+    let file_copy = copy(rig, &file);
+    lines.push(format!(
+        "the card copies {} MB out of the driver heap at {}, out of the same memory imported (OpenExistingHeapFromAddress1) at {}, \
+         out of a file-mapping import (OpenExistingHeapFromFileMapping, SEC_COMMIT) at {}",
+        RATE >> 20,
+        say(&driver_copy),
+        say(&address_copy),
+        say(&file_copy)
+    ));
+    // The loads: card memory sets the steps, the others are scaled to them.
+    let card = rig.card(RATE as u64).and_then(|card| timed_loads(rig, &card, MOST_STEPS));
+    match card {
+        Ok(card) => {
+            let mut rest: Vec<(&str, Result<(f64, bool), String>)> = Vec::new();
+            for (name, src) in [("driver heap", Ok(whole.clone())), ("address import", address.clone()), ("file-mapping import", file.clone())] {
+                let r = src.and_then(|src| timed_loads(rig, &src, card.1).map_err(|e| format!("failed: {e}")));
+                rest.push((name, r.map(|(ms, steps)| at_steps(ms, steps, card.1))));
+            }
+            lines.extend(load_lines(card, &rest));
+        }
+        Err(e) => lines.push(format!("shaders' loads not measured: card memory failed: {e}")),
+    }
+    drop((address, file));
+    if !section.is_null() {
+        // SAFETY: our handle; the heap, gone, held the section itself.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
+    }
+    if at != 0 {
+        // The import lets go of the pages a moment after its last reference.
+        for _ in 0..100 {
+            // SAFETY: as above.
+            if unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) } != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    // SAFETY: plain call.
+    unsafe { device.GetDeviceRemovedReason() }.map_err(|e| format!("the device was removed during the measurements: {e}"))?;
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -853,6 +1511,42 @@ mod tests {
         assert!(decide(Some("1")));
         assert!(decide(Some(" 1 ")));
         assert!(decide(Some("custom")));
+    }
+
+    /// `VICTORY_PORT_DRIVER`: 1 and 2, anything else off.
+    #[test]
+    fn the_port_driver_switch_is_off_unless_asked_for() {
+        assert_eq!(decide_port(None), 0);
+        assert_eq!(decide_port(Some("0")), 0);
+        assert_eq!(decide_port(Some("yes")), 0);
+        assert_eq!(decide_port(Some("3")), 0);
+        assert_eq!(decide_port(Some("1")), 1);
+        assert_eq!(decide_port(Some(" 2 ")), 2);
+        // Not run before the title: off.
+        assert_eq!(port_driver(), 0);
+    }
+
+    /// Load times of fewer steps are scaled up to the card's, and marked.
+    #[test]
+    fn load_times_are_said_at_the_cards_steps() {
+        assert_eq!(at_steps(5.0, 256, 1024), (20.0, true));
+        assert_eq!(at_steps(7.0, 1024, 1024), (7.0, false));
+        let lines = load_lines(
+            (6.0, 1024),
+            &[("driver heap", Ok((30.0, false))), ("address import", Ok((360.0, true))), ("file-mapping import", Ok((300.0, true)))],
+        );
+        assert!(lines[0].starts_with("shaders read 16 MB in dependent 16-byte loads (65536 threads x 1024 steps"), "{}", lines[0]);
+        assert!(lines[0].contains("card memory 6.0 ms") && lines[0].contains("driver heap 30.0 ms") && lines[0].contains("address import ~360.0 ms"), "{}", lines[0]);
+        assert!(lines[1].contains("driver heap x5.00") && lines[1].contains("address import x60.00"), "{}", lines[1]);
+        assert!(lines[2].contains("card memory x0.20") && lines[2].contains("file-mapping import x10.00"), "{}", lines[2]);
+        assert!(lines[3].contains("0.10 of the driver heap's speed") && lines[3].contains("stays off"), "{}", lines[3]);
+        // As fast as the driver heap: worth a run.
+        let lines = load_lines((6.0, 1024), &[("driver heap", Ok((30.0, false))), ("file-mapping import", Ok((40.0, false)))]);
+        assert!(lines[3].contains("is worth a run"), "{lines:?}");
+        // A refused import is said, and no verdict drawn from it.
+        let lines = load_lines((6.0, 1024), &[("driver heap", Ok((30.0, false))), ("file-mapping import", Err("refused: E_INVALIDARG".into()))]);
+        assert!(lines[0].contains("file-mapping import ? (refused: E_INVALIDARG)"), "{}", lines[0]);
+        assert_eq!(lines.len(), 3);
     }
 
     const MB: usize = 1 << 20;
@@ -1056,6 +1750,103 @@ mod tests {
         }
         let (code, transcript) = alone("warp_a_failed_restore_of_fresh_memory_is_reported", "VICTORY_TEST_RESTORE_REPORT");
         assert_eq!(code, Some(0), "{transcript}");
+    }
+
+    /// A reservation of placeholders, split as the title splits its 32-bit
+    /// heap: a failure after the release puts the placeholders back as they
+    /// were; then it is remade at its address, committed, its CPU writes
+    /// seen by the GPU; then the self-test of a reservation. In a process
+    /// of its own (the grooming).
+    #[test]
+    fn warp_a_reservation_of_placeholders_is_remade_or_put_back() {
+        if std::env::var_os("VICTORY_TEST_UMA_RESERVATION").is_some() {
+            let device = crate::inplace::tests::warp().unwrap();
+            const SIZE: usize = 8 << 20;
+            // SAFETY: address space of the test's own.
+            unsafe {
+                let base = mem::VirtualAlloc2(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    std::ptr::null(),
+                    SIZE,
+                    mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                    mem::PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                ) as usize;
+                assert_ne!(base, 0);
+                let pieces = vec![(base, 2 << 20), (base + (2 << 20), 4 << 20), (base + (6 << 20), 2 << 20)];
+                assert!(split_as(&pieces));
+                assert_eq!(placeholders(base, SIZE).unwrap(), pieces);
+                let failed = remake_reservation_with_after_release(&device, base, SIZE, Lost::Report, || Err("synthetic post-release failure".into()));
+                assert!(matches!(failed, Err(Failure::Kept(_))), "{:?}", failed.err());
+                assert_eq!(placeholders(base, SIZE).unwrap(), pieces, "the placeholders back, split as they were");
+                let remade = match remake_reservation(&device, base, SIZE, Lost::Report) {
+                    Ok(remade) => remade,
+                    Err(e) => panic!("not remade: {e:?}"),
+                };
+                assert!(placeholders(base, SIZE).is_err(), "committed memory now");
+                fill(base + 3 * K64, K64, 5);
+                let mut rig = crate::inplace::Rig::new(&device).unwrap();
+                let got = rig.fetch(&remade.whole, 3 * K64 as u64, K64).unwrap();
+                assert!(same(base + 3 * K64, &got), "the GPU reads the CPU's bytes");
+                println!("reservation remade at its address");
+                match reservation_test(&device) {
+                    Ok(line) => println!("self-test: {line}"),
+                    Err(e) => panic!("reservation self-test failed: {e}"),
+                }
+                remade.whole.Unmap(0, None);
+            }
+            std::process::exit(0);
+        }
+        if crate::inplace::tests::warp().is_none() {
+            return;
+        }
+        let (code, transcript) = alone("warp_a_reservation_of_placeholders_is_remade_or_put_back", "VICTORY_TEST_UMA_RESERVATION");
+        eprintln!("{transcript}");
+        assert_eq!(code, Some(0), "{transcript}");
+    }
+
+    /// A reservation the title holds that cannot be had again ends the
+    /// process ([`Lost::Stop`], as `title_reservation` asks).
+    #[test]
+    fn warp_a_reservation_not_put_back_stops_the_process() {
+        const SIZE: usize = 2 << 20;
+        if std::env::var_os("VICTORY_TEST_RESERVATION_STOP").is_some() {
+            let device = crate::inplace::tests::warp().unwrap();
+            // SAFETY: address space of the test's own.
+            unsafe {
+                let base = mem::VirtualAlloc2(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    std::ptr::null(),
+                    SIZE,
+                    mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                    mem::PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                ) as usize;
+                let result = remake_reservation_with_after_release(&device, base, SIZE, Lost::Stop, || {
+                    mem::VirtualAlloc(base as *const c_void, SIZE, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
+                    Err("synthetic post-release failure".into())
+                });
+                eprintln!("continued after failed restore: {:?}", result.err());
+            }
+            return;
+        }
+        if crate::inplace::tests::warp().is_none() {
+            return;
+        }
+        let (code, transcript) = alone("warp_a_reservation_not_put_back_stops_the_process", "VICTORY_TEST_RESERVATION_STOP");
+        assert_eq!(code, Some(STOPPED as i32), "{transcript}");
+        assert!(transcript.contains("could not be restored at its address"), "{transcript}");
+    }
+
+    /// Not a home unless made one.
+    #[test]
+    fn nothing_is_a_home_before_one_is_made() {
+        assert!(!homed(0x3431_0000, 0x1000));
+        assert!(!title_reservation(0x3431_0000, 185 << 20), "off without the switch");
+        assert_eq!(home_free(0x3431_0000, 0, mem::MEM_RELEASE), None);
+        assert!(home_line().is_none());
     }
 
     /// XCL's (f78e05bcc): grooming for a window under 1 GiB leaves it no free
