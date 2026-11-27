@@ -1063,6 +1063,95 @@ fn log_memory() {
             category_text(fields)
         );
     }
+    log_ours(private, &copies, pool, &alive, &own, card);
+}
+
+/// Seconds between two [`log_ours`] lines.
+const OURS_EVERY_S: u64 = 30;
+
+/// Every [`OURS_EVERY_S`], after the memory lines: the eight biggest kinds of
+/// the process's private memory that are ours, in MB, without overlaps, and
+/// what they leave of the private total (the title's own heaps, some 3 GB in
+/// run fourth's memory map, and the driver's and the runtime's: command
+/// memory of host lists, pipelines). So a run shows at a glance what a switch
+/// changed (`VICTORY_POOL_PACK`, `VICTORY_LIST_LEAN`, the idle times).
+fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own: &[u64], card: [u64; 4]) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = now_us().max(1);
+    let last = LAST.load(Relaxed);
+    if last != 0 && now.saturating_sub(last) < OURS_EVERY_S * 1_000_000 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let [shared, upload] = [&crate::pool::SHARED, &crate::pool::UPLOAD].map(crate::pool::Placed::held);
+    let [buffers_on_card, windows_on_card] = crate::shadow::on_card_bytes();
+    // Disjoint: the copies' CPU sides lie in the shared heaps (or are
+    // allocations of their own), "unused" is the rest of the heaps; the
+    // staging blocks hold the staging alive; our heap holds the snapshots,
+    // shader containers and translations.
+    let kinds = [
+        ("copies of windows (CPU side)", copies[3]),
+        ("copies of title buffers (CPU side)", copies[1].saturating_sub(copies[3])),
+        ("shared heaps unused", shared[0].saturating_sub(shared[1])),
+        ("upload heaps unused", upload[0].saturating_sub(upload[1])),
+        ("texture staging blocks", pool[1] << 20),
+        ("list scratch", alive.get(2).copied().unwrap_or(0)),
+        ("lists' other uploads", alive.get(7).copied().unwrap_or(0)),
+        ("our heap", own.iter().take(4).sum()),
+    ];
+    let (text, ours) = biggest(&kinds, 8);
+    // Of the PC's memory the card shares, what the kinds above do not hold:
+    // the driver's command memory of host lists, and upload buffers of ours
+    // outside the pools (texture uploads, descriptor data).
+    let pooled = shared[0].max(copies[1]) + upload[0] + (pool[1] << 20) + kinds[5].1 + kinds[6].1;
+    let mb = |v: u64| v >> 20;
+    tracing::info!(
+        "memory, ours by kind, the biggest (MB, every {OURS_EVERY_S} s): {text}; in all {} of {} private, the rest {} is the \
+         title's own heaps, the driver's and the runtime's; of the copies {} MB have a card side too (buffers {}, windows {}); \
+         host lists {} alive, {} idle, {} preludes made, {} spare; the card {} MB in use of {}, {} MB of the PC's memory \
+         shared with it, {} MB of that not in the kinds above (the driver's command memory, uploads outside the pools) \
+         (VICTORY_POOL_PACK={}, VICTORY_LIST_LEAN={}, VICTORY_PRELUDE_POOL={})",
+        mb(ours),
+        mb(private),
+        mb(private.saturating_sub(ours)),
+        mb(buffers_on_card + windows_on_card),
+        mb(buffers_on_card),
+        mb(windows_on_card),
+        alive.first().copied().unwrap_or(0),
+        crate::list::idle_lists(),
+        crate::host::LISTS[1].load(Relaxed),
+        crate::host::preludes_kept(),
+        mb(card[1]),
+        mb(card[0]),
+        mb(card[3]),
+        mb(card[3].saturating_sub(pooled)),
+        u8::from(crate::switch::on("VICTORY_POOL_PACK")),
+        u8::from(crate::switch::on("VICTORY_LIST_LEAN")),
+        u8::from(crate::switch::on("VICTORY_PRELUDE_POOL")),
+    );
+}
+
+/// The `n` biggest of `kinds` (name, bytes) that are not zero, biggest
+/// first, as "name MB" joined by commas; and the bytes of all of them.
+fn biggest(kinds: &[(&str, u64)], n: usize) -> (String, u64) {
+    let mut sorted: Vec<&(&str, u64)> = kinds.iter().filter(|k| k.1 > 0).collect();
+    sorted.sort_by_key(|k| std::cmp::Reverse(k.1));
+    let text: Vec<String> = sorted.iter().take(n).map(|(name, bytes)| format!("{name} {}", bytes >> 20)).collect();
+    (if text.is_empty() { "none".into() } else { text.join(", ") }, kinds.iter().map(|k| k.1).sum())
+}
+
+#[cfg(test)]
+mod ours_tests {
+    use super::biggest;
+
+    #[test]
+    fn the_biggest_kinds_come_first_and_all_are_summed() {
+        const MB: u64 = 1 << 20;
+        let kinds = [("a", 3 * MB), ("b", 0), ("c", 9 * MB), ("d", MB), ("e", 5 * MB)];
+        assert_eq!(biggest(&kinds, 2), ("c 9, e 5".to_string(), 18 * MB));
+        assert_eq!(biggest(&kinds, 8), ("c 9, e 5, a 3, d 1".to_string(), 18 * MB));
+        assert_eq!(biggest(&[("z", 0)], 8), ("none".to_string(), 0));
+    }
 }
 
 /// Microseconds since the first call.
