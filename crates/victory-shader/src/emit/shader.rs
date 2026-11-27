@@ -223,6 +223,30 @@ pub fn constants_raw() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`constants_in_slot`].
+    pub(crate) static CONSTANTS_IN_SLOT_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renderer port 5 on a host without raw twins (`VICTORY_PORT_CBV_SLOT=1` with
+/// [`constants_raw`]; off by default): NVIDIA's view heaps hold 1,000,000 views, no room for a
+/// twin of every slot, so [`constants_raw`] alone leaves tables' constant buffers read as
+/// constant buffers, each copied at every submission (or by a step on the card behind the
+/// flights that write the title's ring of constants). With this switch a table's constant buffer
+/// read at an offset fixed in the code, where the table's used-resource entry is a constant
+/// buffer, is read as raw bytes through its own slot: such a table is made afresh for the draw
+/// (a slot of ours), and the host makes that slot a raw view of the bytes. Every other read of a
+/// constant buffer stays one. Part of the translation: the shader cache keys on it.
+pub fn constants_in_slot() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_IN_SLOT_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| constants_raw() && std::env::var("VICTORY_PORT_CBV_SLOT").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
 pub fn raw_views() -> u32 {
     #[cfg(test)]

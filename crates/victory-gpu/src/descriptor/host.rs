@@ -3401,6 +3401,35 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
+        // Renderer port 5 without raw twins: translated shaders read the slot
+        // itself as raw bytes, so it is a raw view of the same bytes.
+        if crate::port_cbv::slot_on() {
+            // SAFETY: a live buffer that holds the range.
+            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: desc.SizeInBytes / 4,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            if desc.SizeInBytes == 0 {
+                null_buffer_view(self.at(index));
+            } else {
+                // SAFETY: as below, and a slot of our heap.
+                unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), self.at(index)) };
+            }
+            self.put(index);
+            self.twin_made(index, false);
+            self.keep(index, holds.then(|| buffer.clone()));
+            return;
+        }
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -3432,6 +3461,52 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
+    }
+
+    /// Renderer port 5 without raw twins ([`crate::port_cbv::slot_on`]):
+    /// makes slot `index` (a dynamic one) a raw view of the constant buffer
+    /// of `size` bytes at `gpu` of `buffer`, the host copy of its memory,
+    /// which translated shaders read through the slot itself. `false`
+    /// (nothing made): not on 16 bytes in that copy.
+    pub(crate) fn constant_in_slot(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        let Some(host) = host() else { return false };
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+            return false;
+        };
+        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+        if bytes == 0 {
+            return false;
+        }
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (bytes / 4) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; the range lies in the live buffer.
+        unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), self.at(index)) };
+        self.put(index);
+        self.twin_made(index, false);
+        self.keep(index, Some(buffer.clone()));
+        true
+    }
+
+    /// [`HostHeap::make_null`] for a slot shaders read as a buffer: a null
+    /// buffer view (a null view of another dimension there is a mismatch).
+    pub(crate) fn make_null_buffer(&self, index: u32) {
+        null_buffer_view(self.at(index));
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, None);
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic

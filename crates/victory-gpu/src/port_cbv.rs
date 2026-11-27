@@ -46,10 +46,20 @@ pub(crate) fn in_place_on() -> bool {
     on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
 }
 
+/// The port on a host without raw twins (`VICTORY_PORT_CBV_SLOT=1`, see
+/// `victory_shader::emit::constants_in_slot`; NVIDIA): a table's constant
+/// buffer is a raw view in its own slot, of its bytes on the host copy they
+/// have (in place or not), brought up to date as a buffer view's are, and
+/// nothing is copied or done at submission for it.
+pub(crate) fn slot_on() -> bool {
+    victory_shader::emit::constants_in_slot() && victory_shader::emit::raw_views() == 0
+}
+
 /// Since the last line: tables' constant buffers given in place, their bytes;
-/// copied as before because not in place, because not on 16 bytes; title
-/// slots' constant buffers whose twin is a raw view.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// copied as before because not in place, because not on 16 bytes or with
+/// no twin; title slots' constant buffers whose twin is a raw view; tables'
+/// constant buffers made raw views in their own slot ([`slot_on`]).
+static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
@@ -57,10 +67,18 @@ pub(crate) fn in_place(size: u32) {
     STATS[1].fetch_add(u64::from(size), Relaxed);
 }
 
-/// A table's constant buffer was copied as before: `aligned` false when it
-/// is in place but not on 16 bytes.
-pub(crate) fn copied(aligned: bool) {
-    STATS[if aligned { 2 } else { 3 }].fetch_add(1, Relaxed);
+/// A table's constant buffer of `size` bytes was made a raw view in its own
+/// slot ([`slot_on`]).
+pub(crate) fn in_slot(size: u32) {
+    STATS[5].fetch_add(1, Relaxed);
+    STATS[1].fetch_add(u64::from(size), Relaxed);
+}
+
+/// A table's constant buffer was copied as before: `elsewhere` when its
+/// memory is not in place (with [`slot_on`]: has no host copy), else no raw
+/// view of it could be made (not on 16 bytes, or no twin).
+pub(crate) fn copied(elsewhere: bool) {
+    STATS[if elsewhere { 2 } else { 3 }].fetch_add(1, Relaxed);
 }
 
 /// A title slot's constant buffer view got a raw twin.
@@ -81,9 +99,11 @@ pub(crate) fn log(frames: f64) {
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
-        "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
-         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
+        "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place and {:.0} through \
+         their own slot (VICTORY_PORT_CBV_SLOT) ({:.1} KB not copied, no step at submission); copied as before: {:.0} not in place \
+         (with the slot: no host copy), {:.0} not on 16 bytes or with no twin; {:.0} title slots' constant buffers with a raw twin",
         s[0],
+        s[5],
         s[1] / 1024.0,
         s[2],
         s[3],
