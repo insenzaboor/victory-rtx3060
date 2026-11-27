@@ -1391,8 +1391,10 @@ pub(crate) struct HostList {
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// when the list first has such transitions ([`lazy_prelude`]); with
+    /// [`prelude_pool`] taken from the pool then and given back at the
+    /// list's reset.
+    prelude: Mutex<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1447,6 +1449,59 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a host list holds its prelude only from its recording to its
+/// reset, the preludes shared by all lists through a pool
+/// (`VICTORY_PRELUDE_POOL=1`; off by default: a list keeps the prelude it
+/// once needed for as long as it lives).
+///
+/// Nearly every list names textures, so nearly every host list alive had a
+/// prelude of its own, an allocator and a list (a host list with its
+/// allocator and list cost 0.68 MB of private memory in run 69): with 1,422
+/// host lists alive at the end of run b1 (4,314 preludes made), as many
+/// preludes, of which only those of the lists recorded or in the air are
+/// used. With the switch a list takes one when it first needs it (from the
+/// pool, made only if the pool is empty) and gives it back at its reset,
+/// after its last submission ran: what is alive is what the lists being
+/// recorded and those in the air use, and [`PRELUDES_KEPT`] spare ones.
+/// A prelude given back has run (a host list is reset only after its last
+/// submission finished), as its allocator is reset before every use.
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PRELUDE_POOL"))
+}
+
+/// The most spare preludes [`prelude_pool`] keeps.
+const PRELUDES_KEPT: usize = 64;
+
+/// A prelude in the pool: nobody records into it or runs it.
+struct SparePrelude(Prelude);
+
+// SAFETY: D3D12 objects are free-threaded; a spare prelude is touched by
+// nobody until it is taken out again.
+unsafe impl Send for SparePrelude {}
+
+/// The spare preludes ([`prelude_pool`]).
+static PRELUDES: Mutex<Vec<SparePrelude>> = Mutex::new(Vec::new());
+
+/// A prelude whose list has run goes back to the pool, or is let go when the
+/// pool has [`PRELUDES_KEPT`].
+fn give_prelude(prelude: Prelude) {
+    let mut spare = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+    if spare.len() < PRELUDES_KEPT {
+        spare.push(SparePrelude(prelude));
+        return;
+    }
+    // (Let go outside the lock: the kernel frees the allocator.)
+    drop(spare);
+    drop(prelude);
+}
+
+/// For the memory lines: the spare preludes kept now.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn preludes_kept() -> usize {
+    PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4395,6 +4450,17 @@ impl Host {
         list
     }
 
+    /// A list's prelude: with [`prelude_pool`] a spare one if there is one,
+    /// otherwise a new one ([`Host::make_prelude`]).
+    fn list_prelude(&self) -> Option<Prelude> {
+        if prelude_pool()
+            && let Some(SparePrelude(prelude)) = PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop()
+        {
+            return Some(prelude);
+        }
+        self.make_prelude()
+    }
+
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
@@ -4431,10 +4497,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
+            let prelude = Mutex::new(if !lazy_prelude() && !prelude_pool() { self.make_prelude() } else { None });
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -6779,15 +6842,25 @@ impl HostList {
     fn early_prelude(&self) {
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_PRELUDE").is_none_or(|v| v != "0"))
-            || self.prelude.get().is_some()
+            || self.prelude.lock().unwrap_or_else(|e| e.into_inner()).is_some()
         {
             return;
         }
         let names = !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             || !self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         if names {
-            // (Made already on another thread meanwhile: this one is dropped.)
-            let _ = self.prelude.set(host().and_then(|h| h.make_prelude()));
+            let made = host().and_then(|h| h.list_prelude());
+            let mut held = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+            if held.is_none() {
+                *held = made;
+            } else if let Some(made) = made
+                && prelude_pool()
+            {
+                // (Taken already on another thread meanwhile: this one goes
+                // back; without the pool it is dropped.)
+                drop(held);
+                give_prelude(made);
+            }
         }
     }
 
@@ -6858,6 +6931,12 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+        // Its prelude has run too: back to the pool for any list.
+        if prelude_pool()
+            && let Some(prelude) = self.prelude.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
+            give_prelude(prelude);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
@@ -7262,11 +7341,11 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut held = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = host().and_then(|h| h.list_prelude());
+        }
+        let Some((allocator, list)) = held.as_ref() else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
@@ -10935,6 +11014,40 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prelude_pool_tests {
+    use super::{PRELUDES, PRELUDES_KEPT, give_prelude, host, prelude_pool};
+
+    /// Preludes given back are kept up to [`PRELUDES_KEPT`], the rest let
+    /// go; one taken out records and closes again after its allocator's
+    /// reset. (Only without `VICTORY_PRELUDE_POOL`: with it, the other tests'
+    /// lists use the pool meanwhile.)
+    #[test]
+    fn spare_preludes_are_kept_up_to_their_limit_and_record_again() {
+        let Some(host) = host().filter(|_| !prelude_pool()) else { return };
+        let made: Vec<_> = (0..PRELUDES_KEPT + 3).filter_map(|_| host.make_prelude()).collect();
+        if made.len() < PRELUDES_KEPT + 3 {
+            return;
+        }
+        for prelude in made {
+            give_prelude(prelude);
+        }
+        let taken = {
+            let mut pool = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(pool.len(), PRELUDES_KEPT);
+            pool.pop()
+        };
+        let (allocator, list) = taken.expect("a spare prelude").0;
+        // SAFETY: nothing runs it; reset and closed as `HostList::prelude` does.
+        unsafe {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            list.Close().unwrap();
+        }
+        PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 

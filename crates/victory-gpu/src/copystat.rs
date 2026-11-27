@@ -1108,9 +1108,9 @@ fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own:
     tracing::info!(
         "memory, ours by kind, the biggest (MB, every {OURS_EVERY_S} s): {text}; in all {} of {} private, the rest {} is the \
          title's own heaps, the driver's and the runtime's; of the copies {} MB have a card side too (buffers {}, windows {}); \
-         host lists {} alive, {} idle; the card {} MB in use of {}, {} MB of the PC's memory shared with it, {} MB of that \
-         not in the kinds above (the driver's command memory, uploads outside the pools) \
-         (VICTORY_POOL_PACK={}, VICTORY_LIST_LEAN={})",
+         host lists {} alive, {} idle, {} preludes made, {} spare; the card {} MB in use of {}, {} MB of the PC's memory \
+         shared with it, {} MB of that not in the kinds above (the driver's command memory, uploads outside the pools) \
+         (VICTORY_POOL_PACK={}, VICTORY_LIST_LEAN={}, VICTORY_PRELUDE_POOL={})",
         mb(ours),
         mb(private),
         mb(private.saturating_sub(ours)),
@@ -1119,12 +1119,15 @@ fn log_ours(private: u64, copies: &[u64; 6], pool: [u64; 2], alive: &[u64], own:
         mb(windows_on_card),
         alive.first().copied().unwrap_or(0),
         crate::list::idle_lists(),
+        crate::host::LISTS[1].load(Relaxed),
+        crate::host::preludes_kept(),
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
         mb(card[3].saturating_sub(pooled)),
         u8::from(crate::switch::on("VICTORY_POOL_PACK")),
         u8::from(crate::switch::on("VICTORY_LIST_LEAN")),
+        u8::from(crate::switch::on("VICTORY_PRELUDE_POOL")),
     );
 }
 
