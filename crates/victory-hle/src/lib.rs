@@ -32,6 +32,10 @@ pub use victory_gpu::pipeline::known as known_pipelines;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]
 pub use victory_gpu::port_descriptors;
+/// Title memory in driver heaps (`VICTORY_UMA_DRIVER=1`): the launcher runs
+/// its self-test before the title's first code.
+#[cfg(windows)]
+pub use victory_gpu::uma_driver;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

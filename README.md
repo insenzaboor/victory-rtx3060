@@ -145,8 +145,11 @@ commits taken from elsewhere name the commit and its author.
   every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
   reads into title memory.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
+- **[XCL](https://github.com/xcl-dev/xcl)** was read for how the same title
+  behaves under another layer. Since its relicensing to GPL-3.0-or-later
+  (`06f90c198`), its driver heaps at the title's address (`f2248f068` by
+  Kalmarv, `f78e05bcc` by Prime1997) are ported here
+  (`VICTORY_UMA_DRIVER`); see [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
 - This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 
 ## License

@@ -169,6 +169,13 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // A title allocation made a driver heap (`VICTORY_UMA_DRIVER=1`): a
+    // buffer in that heap, nothing imported (or pinned: the heap is resident
+    // already).
+    if let Some(placed) = crate::uma_driver::place_for(start, len) {
+        counted(window, len);
+        return Some(placed);
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -251,6 +258,9 @@ fn say() {
         s[6],
         s[7]
     );
+    if let Some(line) = crate::uma_driver::line() {
+        tracing::info!("{line}");
+    }
     if direct_on() {
         let k: Vec<u64> = SKIPPED.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         tracing::info!(
@@ -301,9 +311,19 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// A buffer of `size` bytes at `offset` (a multiple of 64 KiB) of an
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
+    place_with(device, heap, offset, size, true)
+}
+
+/// [`place`] in any heap: `cross_adapter` for a heap opened on memory the
+/// process has (cross-adapter shared), not for a driver heap of ours
+/// (`crate::uma_driver`).
+pub(crate) fn place_with(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64, cross_adapter: bool) -> windows::core::Result<ID3D12Resource> {
     let mut placed: Option<ID3D12Resource> = None;
-    // The heap is cross-adapter shared, so the buffer must say so too.
-    let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // A cross-adapter shared heap: the buffer must say so too.
+    let mut flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if cross_adapter {
+        flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    }
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
     placed.ok_or_else(windows::core::Error::empty)
@@ -636,6 +656,8 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         Some(w) => w.1,
         None => {
             let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
+            // Not while a driver heap's remake holds the address space.
+            let _gate = crate::uma_driver::gate();
             // SAFETY: the whole of a section the runtime made; a view the
             // title sees is of it, so its handle is open.
             let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
@@ -798,7 +820,7 @@ impl Rig {
 
     /// A compute shader stores, through a root unordered-access view at
     /// `gpu`, the sum of the buffer's first two words in its third.
-    fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
+    pub(crate) fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
         const SOURCE: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { b.Store(8, b.Load(0) + b.Load(4)); }\n";
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; then the
@@ -826,7 +848,7 @@ impl Rig {
 
     /// Milliseconds the card takes to copy `bytes` of `from` into its own
     /// memory, the best of three.
-    fn copy_ms(&mut self, from: &ID3D12Resource, bytes: u64) -> windows::core::Result<f64> {
+    pub(crate) fn copy_ms(&mut self, from: &ID3D12Resource, bytes: u64) -> windows::core::Result<f64> {
         let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
         let mut to: Option<ID3D12Resource> = None;
         // SAFETY: plain creation.
