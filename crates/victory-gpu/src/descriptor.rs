@@ -541,6 +541,7 @@ pub(crate) fn sync_heaps() {
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes)
                     };
+                    crate::layout_probe::slot_changed(start + u64::from(index) * step, [word(0), word(1), word(2)]);
                     if check {
                         // Renderer port #2's fallback: what no mark told of.
                         crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
@@ -1474,6 +1475,7 @@ fn record(handle: u64, view: View) {
     let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    crate::layout_probe::slot_written(handle, [VIEW_TAG, i, generation], false);
     #[cfg(windows)]
     mirror(handle);
 }
@@ -1636,6 +1638,14 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         unsafe {
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
+        if crate::layout_probe::on() {
+            for i in 0..u64::from(count) {
+                let at = dst + i * step;
+                // SAFETY: a slot just written above, 16 bytes at least.
+                let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                crate::layout_probe::slot_written(at, words, true);
+            }
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
@@ -1749,6 +1759,7 @@ pub(crate) extern "system" fn create_heap(
         }
     };
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
+    crate::layout_probe::gpu_allocated(crate::layout_probe::Origin::DescriptorHeap, start as usize, size, 0, 0, !placed);
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,

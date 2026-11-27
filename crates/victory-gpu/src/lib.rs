@@ -49,6 +49,7 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+pub mod layout_probe;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]

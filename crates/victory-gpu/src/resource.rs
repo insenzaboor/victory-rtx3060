@@ -1191,6 +1191,14 @@ pub(crate) extern "system" fn create_heap(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    crate::layout_probe::gpu_allocated(
+        crate::layout_probe::Origin::DeviceHeap,
+        memory.address() as usize,
+        desc.size,
+        desc.properties.kind,
+        desc.properties.cpu_pages,
+        true,
+    );
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
         desc,
@@ -3128,6 +3136,14 @@ pub(crate) extern "system" fn create_committed(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    crate::layout_probe::gpu_allocated(
+        crate::layout_probe::Origin::Committed,
+        memory.address() as usize,
+        info.size,
+        heap.kind,
+        heap.cpu_pages,
+        memory.attributes.is_none(),
+    );
     hand_out_resource(
         desc,
         heap,
@@ -3240,6 +3256,11 @@ pub(crate) extern "system" fn create_at_address(
         creation_nodes: 1,
         visible_nodes: 1,
     };
+    if crate::layout_probe::on()
+        && let Some(info) = footprint(&desc)
+    {
+        crate::layout_probe::gpu_allocated(crate::layout_probe::Origin::AtAddress, address as usize, info.size, DEFAULT.kind, 0, false);
+    }
     hand_out_resource(
         desc,
         DEFAULT,
@@ -3445,6 +3466,18 @@ pub(crate) extern "system" fn create_placed(
             "placed resource does not fit"
         );
         return E_INVALIDARG;
+    }
+    if crate::layout_probe::on()
+        && let Some(info) = footprint(&desc)
+    {
+        crate::layout_probe::gpu_allocated(
+            crate::layout_probe::Origin::PlacedInHeap,
+            (h.memory.address() + offset) as usize,
+            info.size,
+            h.desc.properties.kind,
+            h.desc.properties.cpu_pages,
+            true,
+        );
     }
     object::add_ref(heap);
     let backing = Backing::Placed { heap, offset };
