@@ -1009,6 +1009,48 @@
       "source": "Peppacodes 44d8d30",
       "switch": "VICTORY_COLD_SKIP",
       "effect": "Not ported: Peppa lists it as tried without gain"
+    },
+    {
+      "id": "mimalloc",
+      "title": "mimalloc as the Rust allocator (returns memory after 250 ms)",
+      "category": "performance",
+      "status": "ready",
+      "source": "Peppacodes cd950293 (trustno1-coder PR 11 by Dastano)",
+      "switch": "cargo feature mimalloc; VICTORY_ALLOC=system to undo",
+      "commit": "6c7cf94f",
+      "effect": "Peppa: about -2 ms median on a 5080",
+      "issue": 62
+    },
+    {
+      "id": "wc-skip",
+      "title": "Shader writes to write-combining title memory stay on the card",
+      "category": "performance",
+      "status": "ready",
+      "source": "Peppacodes 6035addd / 3cc0a8d6 / ca2432bd",
+      "switch": "VICTORY_SKIP_WC_BACK=1 VICTORY_SKIP_WC_KEEP=1048576",
+      "commit": "6865100c",
+      "effect": "Peppa: -3.9 ms; without KEEP the picture breaks",
+      "issue": 63
+    },
+    {
+      "id": "bury-aside",
+      "title": "Retired objects dropped on their own thread",
+      "category": "performance",
+      "status": "in-progress",
+      "source": "Peppacodes 92b7cf93 (Steenax6) / e38bfb0d",
+      "switch": "VICTORY_BURY_ASIDE=1",
+      "effect": "Peppa: -23 ms mean",
+      "issue": 64
+    },
+    {
+      "id": "land-aside",
+      "title": "Landed lists reset on their own thread",
+      "category": "performance",
+      "status": "in-progress",
+      "source": "Peppacodes cb412956 (fxceless PR 1146, beamdotdev)",
+      "switch": "VICTORY_LAND_ASIDE=1",
+      "effect": "Peppa: -2 to -4 ms",
+      "issue": 65
     }
   ]
 }
