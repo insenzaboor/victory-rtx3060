@@ -608,6 +608,8 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        // (`VICTORY_LIST_IDLE_MAX`: the thin recordings' idle lists of ours.)
+        crate::list::trim_idle();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
