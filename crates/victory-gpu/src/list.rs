@@ -253,6 +253,12 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
+/// For the memory lines: host lists kept idle now.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn idle_lists() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,
@@ -324,9 +330,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     let trim = alloc_trim();
     // With the allocators trimmed an idle list holds little: more are kept,
     // and fewer made anew (each new list makes its own small buffers, and
-    // each of those waits for residency).
-    let most = idle_most_for(crate::host::available_physical_ram_recent());
-    let most = if trim > 0 { most.max(TRIMMED_IDLE_MOST) } else { most };
+    // each of those waits for residency); with `VICTORY_LIST_LEAN=1` not
+    // while the PC is short of memory.
+    let most = idle_most(crate::host::available_physical_ram_recent(), trim > 0, lean_lists());
     // Kept while the PC had more room: the ones over `most` go (they have
     // run), dropped outside the lock.
     {
@@ -388,9 +394,39 @@ struct Renewed(
 );
 
 /// The idle lists kept at least, whatever the free memory, while
-/// [`alloc_trim`] keeps their allocators small.
+/// [`alloc_trim`] keeps their allocators small (with [`lean_lists`]: only
+/// while 8 GiB or more is free).
 #[cfg(windows)]
 const TRIMMED_IDLE_MOST: usize = 256;
+
+/// Whether the idle lists kept come down with the PC's free memory also
+/// while [`alloc_trim`] keeps their allocators small (`VICTORY_LIST_LEAN=1`;
+/// off by default: at least [`TRIMMED_IDLE_MOST`] whatever is free).
+///
+/// An idle list keeps its two allocators (a trimmed one still holds up to
+/// `VICTORY_ALLOC_TRIM` calls' room, its prelude's is never trimmed), its two
+/// lists, its budget words and its scratch: 0.68 MB of private memory a host
+/// list in run 69. At the end of runs b1 and q1 the PC had 2.2-2.7 GB free,
+/// where [`idle_most_for`] keeps 16 idle lists, and the floor kept 256. With
+/// the switch the floor holds only while 8 GiB or more is free: some 240
+/// lists fewer (about 160 MB at 0.68 MB) once memory is short, at the cost
+/// of making lists again when flights land several at a time.
+#[cfg(windows)]
+fn lean_lists() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LIST_LEAN"))
+}
+
+/// The most host lists kept idle with `avail_phys` of the PC's memory free:
+/// [`idle_most_for`], and while allocators are `trimmed` at least
+/// [`TRIMMED_IDLE_MOST`], unless `lean` ([`lean_lists`]) and less than 8 GiB
+/// is free.
+#[cfg(windows)]
+fn idle_most(avail_phys: Option<u64>, trimmed: bool, lean: bool) -> usize {
+    let most = idle_most_for(avail_phys);
+    let short = avail_phys.is_some_and(|a| a < 8 << 30);
+    if trimmed && !(lean && short) { most.max(TRIMMED_IDLE_MOST) } else { most }
+}
 
 /// What [`recycle`] lets go, for the reaper thread.
 #[cfg(windows)]
@@ -2639,6 +2675,25 @@ mod tests {
         assert_eq!(idle_most_for(Some(4 * gib)), 64);
         assert_eq!(idle_most_for(Some(4 * gib - 1)), 16);
         assert_eq!(idle_most_for(Some(0)), 16);
+    }
+
+    /// With trimmed allocators the floor holds whatever is free, unless lean
+    /// and short of memory; untrimmed, the free memory alone decides.
+    #[test]
+    fn lean_idle_lists_drop_the_floor_when_memory_is_short() {
+        let gib = 1u64 << 30;
+        // As before without the switch.
+        assert_eq!(idle_most(Some(2 * gib), true, false), TRIMMED_IDLE_MOST);
+        assert_eq!(idle_most(Some(2 * gib), false, false), 16);
+        assert_eq!(idle_most(Some(16 * gib), true, false), 512);
+        // Lean: the floor goes below 8 GiB free.
+        assert_eq!(idle_most(Some(2 * gib), true, true), 16);
+        assert_eq!(idle_most(Some(6 * gib), true, true), 64);
+        assert_eq!(idle_most(Some(8 * gib), true, true), TRIMMED_IDLE_MOST);
+        assert_eq!(idle_most(Some(16 * gib), true, true), 512);
+        // Nothing known: as before.
+        assert_eq!(idle_most(None, true, true), 512);
+        assert_eq!(idle_most(Some(2 * gib), false, true), 16);
     }
 
     #[test]

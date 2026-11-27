@@ -169,12 +169,13 @@ impl Ripe {
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
-/// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+/// The free ranges of a block: start and length, never two that touch; and
+/// their bytes in all.
+struct Ranges(BTreeMap<u64, u64>, u64);
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges(BTreeMap::from([(0, size)]), size)
     }
 
     /// The lowest place for `len` bytes at a multiple of `align`.
@@ -190,10 +191,12 @@ impl Ranges {
         if at + len < start + size {
             self.0.insert(at + len, start + size - at - len);
         }
+        self.1 -= len;
         Some(at)
     }
 
     fn give(&mut self, mut start: u64, mut len: u64) {
+        self.1 += len;
         if let Some((&before, &size)) = self.0.range(..start).next_back()
             && before + size == start
         {
@@ -209,6 +212,31 @@ impl Ranges {
     fn whole(&self, size: u64) -> bool {
         self.0.get(&0) == Some(&size)
     }
+
+    /// The free bytes, in all the ranges.
+    fn bytes(&self) -> u64 {
+        self.1
+    }
+}
+
+/// Whether a piece is cut from the fullest block that has room for it
+/// instead of the first one in order, and fewer empty blocks of the PC's
+/// memory are kept (`VICTORY_POOL_PACK=1`; off by default).
+///
+/// First in order, a piece given back in an old block is taken again by the
+/// next piece of any size, so every block keeps a few long-lived pieces and
+/// none empties: 250 shared heaps of 16 MB held 4,000 MB for 2,885 MB of
+/// buffers at the end of run b1 (1,448 MB for 2,552 MB in q1), and the
+/// staging blocks of textures 256-576 MB for 52-96 MB of staging alive.
+/// Fullest first, new pieces fill the blocks that are nearly full, the
+/// emptier ones drain and are let go once empty (one empty block is kept of
+/// each pool in the PC's memory, [`Pool::lean`]; the pools in the card's
+/// memory keep theirs, which the card's room decides). Which block a piece
+/// lies in is all that changes: pieces rest as long before they are used
+/// again, and blocks not ripe are passed over as before.
+fn pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_POOL_PACK"))
 }
 
 /// A part of a block.
@@ -247,6 +275,11 @@ struct Pool<B> {
     /// blocks made ahead, [`ahead`]).
     block: u64,
     largest: u64,
+    /// The most empty blocks kept while packing ([`pack`]): the pools of
+    /// the PC's memory keep one; `usize::MAX`, no other limit than `most`.
+    lean: usize,
+    /// Whether to pack, if not as [`pack`] says (tests).
+    packed: Option<bool>,
 }
 
 impl<B: Clone> Pool<B> {
@@ -257,7 +290,40 @@ impl<B: Clone> Pool<B> {
     /// A pool of blocks of `block` bytes, which gives pieces of at most
     /// `largest`.
     const fn sized(most: usize, block: u64, largest: u64) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, block, largest }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            block,
+            largest,
+            lean: usize::MAX,
+            packed: None,
+        }
+    }
+
+    /// The same, keeping at most `lean` empty blocks while packing.
+    const fn lean(mut self, lean: usize) -> Pool<B> {
+        self.lean = lean;
+        self
+    }
+
+    fn packing(&self) -> bool {
+        self.packed.unwrap_or_else(pack)
+    }
+
+    /// The ripe block with room for `len` bytes at `align` that is fullest
+    /// ([`pack`]), and where the piece begins in it (taken).
+    fn take_fullest(&mut self, len: u64, align: u64, ripe: Ripe) -> Option<(usize, u64)> {
+        let mut order: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().filter(|b| ripe.is(b) && b.free.bytes() >= len).map(|b| (b.free.bytes(), i)))
+            .collect();
+        order.sort_unstable();
+        order.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)))
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -283,13 +349,17 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if self.packing() {
+            found = self.take_fullest(len, align, ripe);
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -377,7 +447,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = limit.min(self.most);
+        let most = limit.min(self.most).min(if self.packing() { self.lean } else { usize::MAX });
         if sweep || any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -405,7 +475,7 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT).lean(1));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -598,7 +668,20 @@ impl Placed {
 
     fn pool_of(this: &Placed) -> Pool<ID3D12Heap> {
         let block = this.bytes().max(4 * PLACED_ALIGN);
-        Pool::sized(PLACED_KEPT, block, block / 4)
+        let pool = Pool::sized(PLACED_KEPT, block, block / 4);
+        // Packing ([`pack`]): one empty heap kept of the PC's memory; the
+        // card's keep theirs.
+        if this.switch == CARD.switch { pool } else { pool.lean(1) }
+    }
+
+    /// For the memory lines: the bytes of the heaps alive and of the
+    /// buffers' pieces in them (zeros with the switch off).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn held(&self) -> [u64; 2] {
+        if self.bytes() == 0 {
+            return [0, 0];
+        }
+        [self.lock().blocks() as u64 * self.bytes(), self.stats[3].load(Ordering::Relaxed)]
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Pool<ID3D12Heap>> {
@@ -1154,6 +1237,78 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn ranges_count_their_free_bytes() {
+        let mut r = Ranges::new(1024);
+        assert_eq!(r.bytes(), 1024);
+        let a = r.take(100, 64).unwrap();
+        let b = r.take(200, 64).unwrap();
+        assert_eq!(r.bytes(), 724);
+        r.give(a, 100);
+        assert_eq!(r.bytes(), 824);
+        r.give(b, 200);
+        assert_eq!(r.bytes(), 1024);
+        assert!(r.whole(1024));
+    }
+
+    /// Packing: a piece goes to the fullest block with room, not the first,
+    /// so the emptier block drains; and of the empty blocks one is kept.
+    #[test]
+    fn packing_fills_the_fullest_block_and_keeps_one_empty() {
+        let pool = |packed| {
+            let mut p: Pool<u32> = Pool::sized(4, 1024, 1024).lean(1);
+            p.packed = Some(packed);
+            p
+        };
+        for packed in [false, true] {
+            let mut p = pool(packed);
+            let made = std::cell::Cell::new(0);
+            let make = || {
+                made.set(made.get() + 1);
+                Some(made.get())
+            };
+            let (a, _, _) = p.take(512, 1, 0, make).unwrap();
+            let (b, _, _) = p.take(512, 1, 0, make).unwrap();
+            let (c, _, _) = p.take(512, 1, 0, make).unwrap();
+            let (d, _, _) = p.take(256, 1, 0, make).unwrap();
+            assert_eq!((a.block, b.block, c.block, d.block), (0, 0, 1, 1));
+            // Block 0 has 512 free, block 1 256.
+            p.give(a, 0);
+            let (e, _, _) = p.take(256, 1, REST, make).unwrap();
+            assert_eq!(e.block, if packed { 1 } else { 0 }, "packed: {packed}");
+            assert_eq!(made.get(), 2);
+            // Everything back: two empty blocks; packing keeps one of them.
+            for piece in [b, c, d, e] {
+                p.give(piece, REST);
+            }
+            p.rested(2 * REST);
+            assert_eq!(p.blocks(), if packed { 1 } else { 2.min(SPARES.load(Ordering::Relaxed)) }, "packed: {packed}");
+        }
+    }
+
+    /// Packing passes over blocks that are not ripe, as without it.
+    #[test]
+    fn packing_takes_only_ripe_blocks_first() {
+        let mut p: Pool<u64> = Pool::sized(8, 1024, 512);
+        p.packed = Some(true);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let at = |started, finished| Ripe { started, finished, ahead: 1 };
+        // Block 0 made long ago, block 1 while submission 10 ran, and fuller.
+        p.add(100, 0);
+        p.add(101, 10);
+        p.blocks[1].as_mut().unwrap().free.take(800, 1).unwrap();
+        // Not ripe before submission 10 finished: block 0, though emptier.
+        let (first, memory, _) = p.take_ripe(200, 1, 0, at(11, 5), make).unwrap();
+        assert_eq!((first.block, memory), (0, 100));
+        // Ripe now, and the fullest.
+        let (second, memory, _) = p.take_ripe(200, 1, 0, at(11, 10), make).unwrap();
+        assert_eq!((second.block, memory), (1, 101));
     }
 
     #[test]
