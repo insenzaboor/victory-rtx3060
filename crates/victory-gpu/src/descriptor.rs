@@ -1634,6 +1634,7 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = normal_placed(false, resource, desc);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1645,8 +1646,113 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = normal_placed(true, resource, desc);
         record(handle, View::Placed(true, resource, desc));
     }
+}
+
+/// A placed view as the title gives it carries bytes no view reads: the
+/// padding of the resource description (words 1 and 13), of a shader
+/// resource view's description (word 3), and the union's words past the
+/// member of the view's dimension. The title leaves them as its stack held
+/// them, so nearly every view of placed memory was a shape of its own: the
+/// shapes the records can name filled up, then every view was a table entry
+/// that nothing lets go. After readmet3xt-lab/foxhound 0.2.0-pre.3
+/// (b364baa70): there RAM grew about 3 GB every 20 minutes of play, and the
+/// frame got slower each minute. Those bytes are cleared, so equal views
+/// share one shape. `VICTORY_PLACED_NORMAL=0`: kept as the title gave them,
+/// as before.
+///
+/// `VICTORY_PLACED_FOLD=1` (off by default; foxhound does it always): a
+/// buffer view's first element is also folded into its address and its
+/// buffer's width made the view's own length, so views of one ring of
+/// buffers at many offsets are one shape. Off here because the host copy of
+/// a placed buffer view is then looked for by the view's own range, not by
+/// its buffer's (`VICTORY_VIEW_EXTENT`), which no run of ours has measured.
+fn normal_placed(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16]) -> ([u32; 14], [u32; 16]) {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let &(on, fold) = ON.get_or_init(|| {
+        (
+            std::env::var_os("VICTORY_PLACED_NORMAL").is_none_or(|v| v != "0"),
+            std::env::var_os("VICTORY_PLACED_FOLD").is_some_and(|v| v == "1"),
+        )
+    });
+    if !on {
+        return (resource, desc);
+    }
+    clear_placed(unordered, &mut resource, &mut desc);
+    if fold {
+        fold_placed(unordered, &mut resource, &mut desc);
+    }
+    (resource, desc)
+}
+
+/// [`normal_placed`]'s clearing: the padding and the union's unused words.
+fn clear_placed(unordered: bool, resource: &mut [u32; 14], desc: &mut [u32; 16]) {
+    resource[1] = 0;
+    resource[13] = 0;
+    // Where the union starts, and the words of the dimension's member
+    // (unknown dimensions keep all of them).
+    let (start, used) = if unordered {
+        (2, match desc[1] {
+            1 => 7,
+            2 => 1,
+            3 => 3,
+            4 => 2,
+            5 => 4,
+            6 => 1,
+            7 => 2,
+            8 => 3,
+            _ => 8,
+        })
+    } else {
+        desc[3] = 0;
+        (4, match desc[1] {
+            1 => 5,
+            2 => 3,
+            3 => 5,
+            4 => 4,
+            5 => 6,
+            6 => 1,
+            7 => 2,
+            8 => 3,
+            9 => 3,
+            10 => 5,
+            11 => 2,
+            _ => 6,
+        })
+    };
+    for w in &mut desc[(start + used).min(10)..10] {
+        *w = 0;
+    }
+}
+
+/// [`normal_placed`]'s fold (`VICTORY_PLACED_FOLD=1`): a buffer view of a
+/// buffer begins at its first element, which goes into the address, and its
+/// buffer is as wide as the view reads.
+fn fold_placed(unordered: bool, resource: &mut [u32; 14], desc: &mut [u32; 16]) {
+    if resource[0] != 1 || desc[1] != 1 {
+        return;
+    }
+    let start = if unordered { 2 } else { 4 };
+    let (count, stride, flags) = if unordered { (desc[4], desc[5], desc[8]) } else { (desc[6], desc[7], desc[8]) };
+    // (Raw: a flag of 1 in both kinds of view.)
+    let element = if stride > 0 {
+        u64::from(stride)
+    } else if flags & 1 != 0 {
+        4
+    } else {
+        crate::resource::element(desc[0]).map_or(0, |(bytes, _)| bytes)
+    };
+    if element == 0 {
+        return;
+    }
+    let first = u64::from(desc[start]) | u64::from(desc[start + 1]) << 32;
+    let address = (u64::from(desc[10]) | u64::from(desc[11]) << 32).wrapping_add(first.wrapping_mul(element));
+    let len = u64::from(count) * element;
+    (desc[start], desc[start + 1]) = (0, 0);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    (resource[4], resource[5]) = (len as u32, (len >> 32) as u32);
 }
 
 /// Device method.
@@ -2053,6 +2159,57 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
+    /// foxhound's leak (b364baa70): placed views that differ only in the
+    /// bytes no view reads, as a stack leaves them, are one shape; what the
+    /// host reads of them is kept.
+    #[test]
+    fn placed_views_differing_in_padding_are_one_shape() {
+        if !inline() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // A raw buffer view of 17 dwords (format 0x27, raw flag) at 3
+        // elements in, its resource 0x44 bytes wide; padding as a stack
+        // might leave it.
+        let resource = |junk: u32| -> [u32; 14] { [1, junk, 0, 0, 0x44, 0, 1, 0x10001, 0, 1, 0, 1, 0, junk ^ 0x5a5a] };
+        let view_desc = |junk: u32| -> [u32; 16] {
+            let mut d = [0u32; 16];
+            d[..10].copy_from_slice(&[0x27, 1, 0x1688, junk, 3, 0, 17, 0, 1, junk.rotate_left(7)]);
+            (d[10], d[11]) = (0x7770_0000, 0xd);
+            d[12] = 0x16;
+            d
+        };
+        let mut seen = Vec::new();
+        for n in 0..500u32 {
+            create_placed_srv(null, &resource(n.wrapping_mul(0x9e37_79b9)), &view_desc(n.wrapping_mul(0x85eb_ca6b)), at);
+            let Some(View::Placed(false, r, d)) = view(at) else { panic!("a placed view") };
+            assert_eq!((r[1], r[13], d[3], d[9]), (0, 0, 0, 0));
+            // What the host reads is as given: first element, count, flags, address.
+            assert_eq!((d[0], d[1], d[2], d[4], d[6], d[8], d[10], d[11], d[12]), (0x27, 1, 0x1688, 3, 17, 1, 0x7770_0000, 0xd, 0x16));
+            assert_eq!(r[4], 0x44);
+            seen.push((r, d));
+        }
+        seen.dedup();
+        assert_eq!(seen.len(), 1, "one shape for the same view");
+        // An unordered view's union is 8 words from word 2: a texture 2D
+        // view (dimension 4) reads 2 of them.
+        let mut d = [0x1111_1111u32; 16];
+        (d[0], d[1]) = (0x1c, 4);
+        let (mut r, mut dd) = ([0x2222_2222u32; 14], d);
+        clear_placed(true, &mut r, &mut dd);
+        assert_eq!(&dd[2..4], &[0x1111_1111; 2]);
+        assert_eq!(&dd[4..10], &[0; 6]);
+        assert_eq!(&dd[10..], &d[10..]);
+        // The fold (`VICTORY_PLACED_FOLD=1`): the first element into the
+        // address, the width the view's own.
+        let (mut r, mut d) = (resource(5), view_desc(5));
+        clear_placed(false, &mut r, &mut d);
+        fold_placed(false, &mut r, &mut d);
+        assert_eq!((d[4], d[5], d[10], d[11], r[4]), (0, 0, 0x7770_000c, 0xd, 17 * 4));
+    }
+
     /// The leak of run 65: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -2067,13 +2224,15 @@ mod tests {
         // A resource description and a view no other test uses.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        // (As views are kept: their padding cleared, `normal_placed`.)
+        let kept = normal_placed(false, resource, desc).0;
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == kept,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == kept).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -2081,18 +2240,21 @@ mod tests {
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            let (r, d) = normal_placed(false, resource, desc);
+            assert_eq!(view(at), Some(View::Placed(false, r, d)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        let (r, d) = normal_placed(true, resource, desc);
+        assert_eq!(view(at), Some(View::Placed(true, r, d)));
         assert_eq!(shapes(), 2);
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        let (r, d) = normal_placed(false, resource, desc);
+        assert_eq!(view(at), Some(View::Placed(false, r, d)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.

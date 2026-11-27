@@ -486,6 +486,9 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     pages: usize,
+    /// Committed whole when made (`SEC_COMMIT`: under Wine, and with
+    /// [`pool_layout`]): views of it need no commit ([`Section::commit`]).
+    whole: bool,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
@@ -554,7 +557,7 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
+            if !self.commit(base + page * PAGE, run * PAGE) {
                 return None;
             }
             for p in page..page + run {
@@ -575,7 +578,7 @@ impl Section {
         // say touched, not committed, so it is committed here.
         if self.home.get().is_some() {
             self.touch(index, len / PAGE);
-            return counted(Call::Commit, || commit(base, len));
+            return counted(Call::Commit, || self.commit(base, len));
         }
         let pages = index..(index + len / PAGE).min(self.pages);
         let bit = |p: usize| (&self.committed[p / 64], 1 << (p % 64));
@@ -588,7 +591,7 @@ impl Section {
         if lean() && done() {
             return true;
         }
-        if !counted(Call::Commit, || commit(base, len)) {
+        if !counted(Call::Commit, || self.commit(base, len)) {
             return false;
         }
         for p in pages {
@@ -784,73 +787,176 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
-        return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
     }
+    // SAFETY: the title passes room for `n` page numbers.
+    let out = unsafe { std::slice::from_raw_parts_mut(pages, n) };
+    if allocate_pages(flags, out, pool_layout()) {
+        return 1;
+    }
+    // SAFETY: checked non-null.
+    unsafe { count.write(0) };
+    0
+}
+
+/// `VICTORY_POOL_IN_PLACE=layout` (off by default): the page pool is laid out
+/// as for the pool in place on the GPU side, with nothing placed there:
+/// every [`XMemAllocatePhysicalPages`] is made of sections committed whole
+/// (`SEC_COMMIT`), each of at most `VICTORY_POOL_CHUNK_MB` (1024), instead of
+/// one reserved section committed page by page as views show them. The
+/// value: the most pages in one section.
+///
+/// After notxuesty/amd9060xt 446a9917c (keeganbarnett18-star): on an RX 9060
+/// XT, driving after fresh boots, 8.4 -> 16.0 fps median and the write watch
+/// 17.4 -> 2.6 ms a frame. What goes is the commit of each page as the title
+/// maps it, and Windows walking the views of one 6.1 GiB section under its
+/// lock as the title remaps (what `VICTORY_SECTION_MB` elsewhere aims at).
+///
+/// What it costs: all of the pool is charged to the commit at allocation
+/// (6.1 GB for Grand Theft Auto VI; the page file must allow it), though
+/// not working set until touched. If the host refuses, that allocation is
+/// made as before (one reserved section), said once.
+///
+/// 1024 MiB keeps the title's 185 MB 32-bit heap (its own allocation) one
+/// section, which renderer port 1's [`arrange`] and `VICTORY_PORT_DRIVER`'s
+/// [`home_with`] need. Only `layout` is taken: this runtime has no pool
+/// placed on the GPU side (that tree's `=1`).
+fn pool_layout() -> Option<usize> {
+    static PAGES: LazyLock<Option<usize>> = LazyLock::new(|| {
+        layout_chunk_pages(
+            std::env::var("VICTORY_POOL_IN_PLACE").ok().as_deref(),
+            std::env::var("VICTORY_POOL_CHUNK_MB").ok().as_deref(),
+        )
+    });
+    *PAGES
+}
+
+/// [`pool_layout`] from the two switches' values.
+fn layout_chunk_pages(layout: Option<&str>, chunk_mb: Option<&str>) -> Option<usize> {
+    if !layout.is_some_and(|v| v.trim().eq_ignore_ascii_case("layout")) {
+        return None;
+    }
+    let mb = chunk_mb.and_then(|v| v.trim().parse::<usize>().ok()).filter(|&mb| mb > 0).unwrap_or(1024);
+    Some((mb.saturating_mul(MIB) / PAGE).max(1))
+}
+
+/// Makes the sections for `pages.len()` pages, enters them in the page table
+/// and writes their numbers to `pages`. `layout`: [`pool_layout`]. All or
+/// nothing.
+fn allocate_pages(flags: u64, pages: &mut [usize], layout: Option<usize>) -> bool {
+    let n = pages.len();
+    let size = n * PAGE;
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver request
+    // each that scans every range committed so far: committed whole there.
+    let mut sections = match layout {
+        Some(chunk) if !on_wine() => {
+            match sections_of(n, chunk, true) {
+                Ok(made) => Some(made),
+                Err(error) => {
+                    static SAID: AtomicU64 = AtomicU64::new(0);
+                    if SAID.fetch_add(1, Ordering::Relaxed) == 0 {
+                        tracing::warn!(
+                            n,
+                            mb = size >> 20,
+                            %error,
+                            "VICTORY_POOL_IN_PLACE=layout: the host would not commit the pages whole; a reserved section as before"
+                        );
+                    }
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if sections.is_none() {
+        // One pagefile-backed section, its pages committed when first
+        // mapped or written (`commit`): the title asks for 6.1 GiB at once,
+        // which a busy host often cannot commit (error 1450).
+        match sections_of(n, n, on_wine()) {
+            Ok(made) => sections = Some(made),
+            Err(error) => {
+                tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+                return false;
+            }
+        }
+    }
+    let Some(sections) = sections else {
+        return false;
+    };
     tracing::debug!(
         n,
+        sections = sections.len(),
+        whole = sections[0].whole,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     victory_gpu::layout_probe::title_allocated_coded(
         victory_gpu::layout_probe::Origin::PhysicalPages,
         0,
         size,
         flags,
     );
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-        home: std::sync::OnceLock::new(),
-    });
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        table.pages.insert(first + index * FRAMES, slice);
+    let mut page = 0;
+    for section in &sections {
+        for index in 0..section.pages {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            table.pages.insert(first + page * FRAMES, slice);
+            page += 1;
+        }
     }
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
-    for index in 0..n {
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(first + index * FRAMES) };
+    for (index, out) in pages.iter_mut().enumerate() {
+        *out = first + index * FRAMES;
     }
-    1
+    true
+}
+
+/// Sections for `n` pages, `chunk` pages each at most; committed whole
+/// (`SEC_COMMIT`) if `whole`. The host's error (and those made so far let
+/// go) if it refuses one.
+fn sections_of(n: usize, chunk: usize, whole: bool) -> Result<Vec<Arc<Section>>, std::io::Error> {
+    let chunk = chunk.clamp(1, n.max(1));
+    let mut sections = Vec::with_capacity(n.div_ceil(chunk));
+    for first in (0..n).step_by(chunk) {
+        let pages = chunk.min(n - first);
+        let size = pages * PAGE;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if whole { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // For the GPU side's in-place census: only a committed section can
+        // be opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, size as u64, whole);
+        sections.push(Arc::new(Section {
+            handle,
+            pages,
+            whole,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            home: std::sync::OnceLock::new(),
+        }));
+    }
+    Ok(sections)
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -902,7 +1008,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if !slice.section.commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -2172,11 +2278,16 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     true
 }
 
+impl Section {
+    /// Commits the pages of this section a view at `base` shows: nothing to
+    /// do if it was made committed whole ([`Section::whole`]).
+    fn commit(&self, base: usize, len: usize) -> bool {
+        self.whole || commit(base, len)
+    }
+}
+
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
-    }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
@@ -2695,6 +2806,57 @@ mod tests {
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// `VICTORY_POOL_IN_PLACE=layout` alone turns the layout on; the chunk
+    /// is 1024 MiB unless asked, in 64 KiB pages.
+    #[test]
+    fn the_pool_layout_switch_takes_layout_only() {
+        assert_eq!(layout_chunk_pages(Some("layout"), None), Some(1024 * MIB / PAGE));
+        assert_eq!(layout_chunk_pages(Some(" Layout "), Some("256")), Some(256 * MIB / PAGE));
+        assert_eq!(layout_chunk_pages(Some("layout"), Some("0")), Some(1024 * MIB / PAGE));
+        assert_eq!(layout_chunk_pages(Some("layout"), Some("x")), Some(1024 * MIB / PAGE));
+        for off in [None, Some(""), Some("0"), Some("1"), Some("lay")] {
+            assert_eq!(layout_chunk_pages(off, Some("256")), None, "{off:?}");
+        }
+        // The title's 185 MB 32-bit heap stays one section at the default.
+        assert!(1024 * MIB / PAGE >= (185 * MIB).div_ceil(PAGE));
+    }
+
+    /// Laid out (`VICTORY_POOL_IN_PLACE=layout`), an allocation is sections
+    /// committed whole of at most the chunk; views across two of them map,
+    /// read and write as one.
+    #[test]
+    fn a_laid_out_pool_is_whole_sections_of_the_chunk() {
+        let mut pages = vec![0usize; 5];
+        assert!(allocate_pages(0, &mut pages, Some(2)));
+        let sections: Vec<(usize, usize, bool)> = {
+            let table = page_table();
+            pages
+                .iter()
+                .map(|p| table.pages.get(p).unwrap())
+                .map(|s| (Arc::as_ptr(&s.section) as usize, s.index, s.section.whole))
+                .collect()
+        };
+        assert_eq!(sections.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 1, 0, 1, 0]);
+        assert!(sections.iter().all(|s| s.2));
+        assert!(sections[0].0 == sections[1].0 && sections[1].0 != sections[2].0 && sections[3].0 != sections[4].0);
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        assert_eq!(XMemMapPhysicalPages(at, 4, pages[1..].as_ptr()), at);
+        // SAFETY: four pages mapped read-write.
+        unsafe {
+            at.cast::<u8>().write(3);
+            at.cast::<u8>().byte_add(2 * PAGE).write(5);
+        }
+        assert!(write_physical(&pages, 4 * PAGE + 7, &[9]));
+        assert_eq!(page_bytes(pages[1])[0], 3);
+        assert_eq!(page_bytes(pages[3])[0], 5);
+        assert_eq!(page_bytes(pages[4])[7], 9);
+        assert_eq!(XMemMapPhysicalPages(at, 4, std::ptr::null()), at);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+        assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
     }
 
     /// Only a section as big as the reservation, never touched, goes home.

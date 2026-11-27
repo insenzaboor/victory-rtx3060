@@ -66,6 +66,8 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// Something besides its reset was written down (`VICTORY_THIN_SKIP_EMPTY`).
+    has_work: bool,
 }
 
 impl Drop for Front {
@@ -84,6 +86,7 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
+        self.has_work = false;
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -92,6 +95,7 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.has_work = false;
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -99,6 +103,9 @@ impl Front {
     fn put(&mut self, op: u64, args: &[u64]) {
         if self.closed || self.recording.is_none() {
             return;
+        }
+        if op != RESET && op != CLOSE {
+            self.has_work = true;
         }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
@@ -112,6 +119,7 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
+        self.has_work = true;
         let at = self.words.len();
         self.words.push(0);
         self.words.extend_from_slice(args);
@@ -150,8 +158,34 @@ impl Front {
     }
 
     fn close(&mut self) {
+        self.close_with_skip(skip_empty_on());
+    }
+
+    /// [`Self::close`]; `skip_empty`: a recording of nothing but its reset
+    /// (the title makes and closes hundreds at its start) is done at once,
+    /// with no list of ours and nothing for the threads.
+    fn close_with_skip(&mut self, skip_empty: bool) {
         if self.closed {
             return;
+        }
+        if skip_empty && !self.has_work {
+            self.closed = true;
+            self.words.clear();
+            if let Some(recording) = &self.recording {
+                let mut inner = held(&recording.inner);
+                // (Words handed over already would still be translated.)
+                if inner.chunks.is_empty() && !inner.scheduled && inner.back == 0 {
+                    inner.closed = true;
+                    recording.done.store(true, Release);
+                    recording.moved.notify_all();
+                    SKIPPED.fetch_add(1, Relaxed);
+                    return;
+                }
+                drop(inner);
+                self.closed = false;
+            } else {
+                return;
+            }
         }
         self.put(CLOSE, &[]);
         self.closed = true;
@@ -241,6 +275,24 @@ impl Recording {
         held(&self.inner).back as This
     }
 
+    /// With `VICTORY_THIN_RELEASE_BACK=1`, once its submission has taken the
+    /// host work (`Queue::unfold`): its list of ours goes back to [`BACKS`]
+    /// at once, not when the title next resets or lets go of its list, so
+    /// recordings the title keeps pin no host list.
+    pub(crate) fn release_back(&self) {
+        if release_back_on() {
+            self.release_back_now();
+        }
+    }
+
+    fn release_back_now(&self) {
+        if !self.done() {
+            return;
+        }
+        let back = std::mem::take(&mut held(&self.inner).back);
+        return_back(back);
+    }
+
     /// Translates what there is.
     fn run(&self) {
         loop {
@@ -285,8 +337,69 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            return_back(std::mem::take(&mut inner.back));
         }
+    }
+}
+
+/// `VICTORY_THIN_RELEASE_BACK=1` (off by default): lists of ours go back to
+/// [`BACKS`] as soon as their submission took their work, and hold a host
+/// list only from their reset to their submission. After
+/// MKmajster/victory-fork-8gb bb119618b and fbf89b7c.
+fn release_back_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_RELEASE_BACK").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_THIN_SKIP_EMPTY=1` (off by default): a recording of nothing but
+/// its reset and close is done at once, with no list of ours (MKmajster
+/// fbf89b7c: 665 empty lists at the start held 2.62 GiB of private memory).
+fn skip_empty_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_SKIP_EMPTY").is_some_and(|v| v == "1"))
+}
+
+/// Recordings [`skip_empty_on`] did at once, since the start.
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// A list of ours nobody uses back to [`BACKS`], or let go over
+/// `min(VICTORY_LIST_IDLE_MAX, 128)`. A host list it still holds while it
+/// takes them lazily (let go of before its submission) goes to the idle
+/// host lists.
+fn return_back(back: usize) {
+    if back == 0 {
+        return;
+    }
+    // SAFETY: a list of ours, ours alone now.
+    let orphan = unsafe {
+        let list = &mut *(back as *mut List);
+        if list.lazy_host { list.host.take() } else { None }
+    };
+    if let Some(host) = orphan {
+        super::recycle_host(host);
+    }
+    let mut backs = held(&BACKS);
+    if super::idle_list_max().is_none_or(|max| backs.len() < max.min(128)) {
+        backs.push(back);
+        return;
+    }
+    drop(backs);
+    // SAFETY: made by `Box::into_raw` of `boxed`/`boxed_back`, ours alone.
+    unsafe { drop(Box::from_raw(back as *mut List)) };
+}
+
+/// Lets go of the lists of ours in [`BACKS`] over `keep`.
+pub(super) fn trim_backs(keep: usize) {
+    let dropped: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        if backs.len() <= keep {
+            return;
+        }
+        backs.drain(keep..).collect()
+    };
+    for back in dropped {
+        // SAFETY: every entry of `BACKS` was made by `Box::into_raw`, ours alone.
+        unsafe { drop(Box::from_raw(back as *mut List)) };
     }
 }
 
@@ -306,6 +419,10 @@ fn back_list(kind: u32) -> This {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
+    }
+    if release_back_on() {
+        // (No host list until its reset; nothing to close.)
+        return Box::into_raw(super::boxed_back(kind)).cast_const().cast();
     }
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
@@ -721,6 +838,11 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         let n = w.first().map_or(0, |&n| n as usize);
         match op {
             RESET => {
+                // A recording let go of takes no host list for its list of ours.
+                // SAFETY: `list` is null (tests) or one of ours.
+                if skip && !list.is_null() && unsafe { (*list.cast::<List>()).lazy_host } {
+                    continue;
+                }
                 // (Only whether there is an allocator is looked at.)
                 let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
                 super::reset(list, allocator, w[0] as This);
@@ -922,5 +1044,47 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// `VICTORY_THIN_SKIP_EMPTY`: a recording of only its reset is done at
+    /// its close, with no list of ours; one with work is not.
+    #[test]
+    fn an_empty_recording_is_done_at_its_close() {
+        let mut f = Front::default();
+        f.begin(0, std::ptr::null());
+        assert!(!f.has_work);
+        f.close_with_skip(true);
+        let rec = f.recording.clone().expect("a recording");
+        assert!(rec.done() && rec.back().is_null() && f.words.is_empty());
+        f.begin(0, std::ptr::null());
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        assert!(f.has_work);
+        assert!(!f.recording.as_ref().unwrap().done());
+        f.leave();
+    }
+
+    /// `VICTORY_THIN_RELEASE_BACK`: a recording gives its list of ours back
+    /// once, and only when done; `trim_backs` keeps what it is told.
+    #[test]
+    fn a_done_recording_gives_its_list_back_once() {
+        let rec = Recording::new(0);
+        let back = Box::into_raw(super::super::boxed_back(0)) as usize;
+        {
+            let mut inner = held(&rec.inner);
+            inner.back = back;
+            inner.closed = true;
+        }
+        rec.release_back_now();
+        assert_eq!(rec.back() as usize, back);
+        rec.done.store(true, Release);
+        rec.release_back_now();
+        assert!(rec.back().is_null());
+        rec.release_back_now();
+        assert!(held(&BACKS).contains(&back));
+        for _ in 0..8 {
+            held(&BACKS).push(Box::into_raw(super::super::boxed_back(0)) as usize);
+        }
+        trim_backs(4);
+        assert!(held(&BACKS).len() <= 4);
     }
 }

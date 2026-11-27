@@ -735,6 +735,11 @@ impl Work for Job {
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
         let jobs = jobs_of(queue as This, &lists);
+        // (`VICTORY_THIN_RELEASE_BACK=1`: their work is taken, their lists of
+        // ours go back.)
+        for r in recordings.iter() {
+            r.release_back();
+        }
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
