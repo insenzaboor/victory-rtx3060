@@ -663,6 +663,16 @@ made before the world loads, so an A/B inside one run is not possible.
    Files: `uma_driver.rs` (+90), `inplace.rs` (`Rig::load_ms`, +60),
    `port.rs` and `xmem.rs` (the switch, +10). Done when one run logs the
    four load times.
+
+   *Built.* Every self-test line now begins `UMA self-test:`. The card's
+   steps are doubled from 16 until a run takes 5 ms; the other memories
+   double up to the card's steps and stop at 5 ms too (a run is at most
+   about twice the one before, so a very slow import never nears a device
+   timeout), and are scaled to the card's steps (marked `~`). The lines say
+   each time, the ratios against card memory and the driver heap, and
+   whether the file-mapping import reaches half the driver heap's speed
+   (option (a)'s decider). A refused opening is said as such; a device
+   removed meanwhile fails the test. On WARP all four read alike.
 2. **Level 1: the pages at home.** In `XMemMapPhysicalPages`, after
    `arrange`, the first map into a `LOW_RESERVATIONS` reservation whose
    section is as big as the reservation and wholly fresh calls a new
