@@ -1458,7 +1458,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<Budget>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
@@ -1494,6 +1494,120 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Whether host lists' indirect-work budgets are 256-byte slots of shared
+/// 64 KiB buffers (`VICTORY_BUDGET_PACK=1`; off by default: a buffer of each
+/// list's own). After skornuta/victory-memory-stack patch 0023 (`8172480`):
+/// a placed or committed buffer takes 64 KiB however small, and 602 lists'
+/// budgets held 37 MB in the first area. Shaders write a budget through its
+/// address (a root view: no barrier names its buffer); the list's end copies
+/// the card's notes into it ([`HostList::card_budget_out`]) at its offset.
+/// A slot goes back behind the submissions running when its list goes.
+fn budget_pack() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_some_and(|v| v == "1"))
+}
+
+/// A budget's bytes, and the buffers [`budget_pack`] cuts them from.
+const BUDGET_SLOT: u64 = 256;
+const BUDGET_SLAB: u64 = 64 << 10;
+
+/// The budgets' shared buffers (buffer, mapping), and the free slots (buffer,
+/// offset).
+struct BudgetSlabs(Vec<(ID3D12Resource, usize)>, Vec<(usize, u64)>);
+
+// SAFETY: D3D12 objects are free-threaded; the mappings are only addresses.
+unsafe impl Send for BudgetSlabs {}
+
+static BUDGET_SLABS: Mutex<BudgetSlabs> = Mutex::new(BudgetSlabs(Vec::new(), Vec::new()));
+
+/// A host list's indirect-work budget: a buffer and the offset of its 256
+/// bytes in it, mapped at `data`; with [`budget_pack`] the slot, given back
+/// when it goes.
+struct Budget {
+    buffer: ID3D12Resource,
+    offset: u64,
+    data: usize,
+    _slot: Option<BudgetSlot>,
+}
+
+/// A slot of [`BUDGET_SLABS`]: back when dropped, behind the submissions
+/// running then ([`retire`]).
+struct BudgetSlot(usize, u64);
+
+/// Gives a slot back when dropped.
+struct BudgetFree(usize, u64);
+
+impl Drop for BudgetFree {
+    fn drop(&mut self) {
+        BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner()).1.push((self.0, self.1));
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        retire(BudgetFree(self.0, self.1));
+    }
+}
+
+impl Budget {
+    fn new() -> Option<Budget> {
+        if !budget_pack() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
+            return Some(Budget {
+                buffer,
+                offset: 0,
+                data: data as usize,
+                _slot: None,
+            });
+        }
+        let mut slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+        if slabs.1.is_empty() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLAB)?;
+            name(&buffer, || "indirect budgets".into());
+            let at = slabs.0.len();
+            slabs.0.push((buffer, data as usize));
+            // Taken from the front: the slab's first slot first.
+            slabs.1.extend((0..BUDGET_SLAB / BUDGET_SLOT).rev().map(|k| (at, k * BUDGET_SLOT)));
+        }
+        let (slab, offset) = slabs.1.pop()?;
+        let (buffer, data) = slabs.0[slab].clone();
+        drop(slabs);
+        let data = data + offset as usize;
+        // A slot given back holds its last list's words: zeroed, as a new
+        // buffer is.
+        // SAFETY: the slot's 256 mapped bytes, ours alone now (its last
+        // list's submissions ran).
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
+        Some(Budget {
+            buffer,
+            offset,
+            data,
+            _slot: Some(BudgetSlot(slab, offset)),
+        })
+    }
+
+    fn gpu(&self) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetGPUVirtualAddress() + self.offset }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A packed budget's slot comes back when what holds it goes, and a
+    /// slab holds 256 of them.
+    #[test]
+    fn a_budget_slot_comes_back() {
+        assert_eq!(BUDGET_SLAB / BUDGET_SLOT, 256);
+        drop(BudgetFree(usize::MAX, 3 * BUDGET_SLOT));
+        let mut slabs = BUDGET_SLABS.lock().unwrap();
+        let at = slabs.1.iter().position(|&s| s == (usize::MAX, 3 * BUDGET_SLOT)).expect("given back");
+        slabs.1.remove(at);
+    }
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -8049,18 +8163,12 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = budget.data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -8085,8 +8193,11 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        Some(match card {
+            // SAFETY: a live buffer.
+            Some(card) => unsafe { card.GetGPUVirtualAddress() },
+            None => budget.gpu(),
+        })
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -8141,7 +8252,7 @@ impl HostList {
         if !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
+        let (Some(Some(card)), Some(Some(Budget { buffer: mapped, offset, .. }))) =
             (self.card_budget.get(), self.budget.get())
         else {
             return;
@@ -8154,7 +8265,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, offset + 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
