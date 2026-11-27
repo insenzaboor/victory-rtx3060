@@ -535,10 +535,36 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             wait_for_bake(p);
         } else {
             start(p, REQUESTED);
-            wait(p, crate::frame::current());
+            if p.graphics.is_none() && compute_waits() {
+                // Made here, or waited for while a worker makes it.
+                p.make();
+            } else {
+                wait(p, crate::frame::current());
+            }
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there. After
+/// fxceless/victory-fork a42b627e (#1312, with Exopus).
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes (a
+/// buffer reset or cleared), and what they leave is read for as long as the
+/// scene lasts. There, a compute program met for the first time took 4.4 s
+/// to make on a 16 GB machine; its one dispatch was dropped after the half
+/// second of budget, and the room's windows from before stayed blended over
+/// the whole picture for minutes (their run 195). A wait of seconds once
+/// (the pipeline library has it on the next run) against a picture wrong
+/// until the scene ends.
+/// On by default, as there; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the
+/// budget, as before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -1010,8 +1036,11 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
+        // A compute pipeline is made at once when dispatches wait for theirs
+        // (`compute_waits`, the default; it has no shaders here, so nothing
+        // comes of it); either way it is noted for the next launch
+        // (fxceless/victory-fork 4c60466).
         assert!(ready(&p).is_none());
-        assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
 
