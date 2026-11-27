@@ -1692,6 +1692,42 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
+/// Whether the threads kept for [`wide`] run above normal priority, as the
+/// submitting thread does (`VICTORY_WIDE_PRIORITY=1`; off by default; flips
+/// with the in-run A/B in diagnostics builds).
+///
+/// Why: a submission's refreshes are spread over these threads and the
+/// submitting thread ([`wide_each`]), which takes the next piece of work as
+/// soon as it has handed them out. With every processor busy (the title's
+/// threads, eight list threads, the pools), a woken helper waited to be
+/// scheduled, and the submitting thread did most of the work alone: in the
+/// house test on an RTX 5080 (run S12) it spent ~46% of its time in such
+/// spreads while the four helpers ran ~11 ms a frame each, and it was the
+/// frame's wall.
+fn wide_priority() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PRIORITY").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_WIDE_PRIORITY").unwrap_or(on);
+    on
+}
+
+/// A thread that helps the submitting thread ([`wide`]; the pools of
+/// `crate::land` for the title's bytes under flights' writes and the heaps'
+/// records): its priority as [`wide_priority`] says, set when that changes.
+/// `above` is what it was set to.
+pub(crate) fn helper_priority(above: &mut bool) {
+    let wanted = wide_priority();
+    if wanted == *above {
+        return;
+    }
+    *above = wanted;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
+    let priority = if wanted { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+    // SAFETY: this thread's own priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+}
+
 /// How many threads are kept for [`wide`]: a quarter of the processor's,
 /// 2 to 6, as before.
 ///
@@ -1742,7 +1778,9 @@ fn workers() -> &'static Workers {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
+                let mut above = false;
                 loop {
+                    helper_priority(&mut above);
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.

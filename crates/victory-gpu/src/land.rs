@@ -243,13 +243,17 @@ impl Pool {
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
-                pool.help()
+                pool.help(name == "victory-under" || name == "victory-records")
             });
         }
         pool
     }
 
-    fn help(&self) {
+    /// `for_submit`: a pool the submitting thread waits for (the title's bytes
+    /// under flights' writes, the heaps' records), whose threads follow
+    /// `VICTORY_WIDE_PRIORITY` ([`crate::shadow::helper_priority`]).
+    fn help(&self, for_submit: bool) {
+        let mut above = false;
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {
@@ -258,6 +262,9 @@ impl Pool {
             };
             state.running += 1;
             drop(state);
+            if for_submit {
+                crate::shadow::helper_priority(&mut above);
+            }
             let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
