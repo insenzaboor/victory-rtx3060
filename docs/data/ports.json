@@ -71,10 +71,10 @@
       "id": "port1",
       "title": "Renderer port 1: constants heap read in place",
       "category": "performance",
-      "status": "ready",
+      "status": "shipped",
       "source": "avatarmanz",
       "switch": "VICTORY_PORT_CONSTANTS=1",
-      "effect": "q21 (port 1 + inplace off): walk 22.9 ms per 1k draws vs 27.0 (q16), but killed at 1.0 GB free (rust-analyzer restarted mid-run). Re-test.",
+      "effect": "Off by default now (launcher and play script): q15 21.4 and q21 22.9 vs q16 27.0 ms per 1k draws",
       "issue": 79
     },
     {
@@ -1187,6 +1187,27 @@
       "effect": "Ported from XCL (GPL-3.0-or-later, credited in docs/THIRD_PARTY.md); self-test passes on WARP; not yet run on the 3060",
       "commit": "1216e6373",
       "issue": 89
+    },
+    {
+      "id": "card-no-cpu-side",
+      "title": "Card copies the GPU never writes keep no CPU side (RAM)",
+      "category": "memory",
+      "status": "ready",
+      "source": "ours (memory audit)",
+      "switch": "VICTORY_CARD_NO_CPU_SIDE=1",
+      "commit": "a91c153d1",
+      "effect": "Expected -1.25 to -1.45 GB private; uploads read title memory straight into the send ring",
+      "issue": 90
+    },
+    {
+      "id": "submit-stages-full",
+      "title": "Submit-thread timing covers the whole worker (idle, waits, driver, landing)",
+      "category": "tooling",
+      "status": "shipped",
+      "source": "ours",
+      "switch": "VICTORY_SUBMIT_STAGES=1",
+      "commit": "82fdc2351",
+      "effect": "Prints every 30 s on its own; q17 \"other\" was start-up time and \"Execute\" was a catch-all"
     }
   ]
 }
