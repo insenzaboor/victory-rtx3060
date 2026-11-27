@@ -1219,6 +1219,112 @@
       "commit": "8026027b1",
       "effect": "Self-test times dependent shader loads from card memory, driver heap, address import and file-mapping import: decides whether in-place reads can beat copies on this card",
       "issue": 91
+    },
+    {
+      "id": "inplace-constants",
+      "title": "Card steps may read in-place memory (no flight wait)",
+      "category": "performance",
+      "status": "ready",
+      "source": "Maykzera e67ab0708 / fxceless bcc542151",
+      "switch": "VICTORY_INPLACE_CONSTANTS=1",
+      "commit": "d4136113",
+      "effect": "Maykzera 3060: 15 -> 17.2 fps, 30-40 ms/frame of waits gone",
+      "issue": 92
+    },
+    {
+      "id": "pool-layout",
+      "title": "Page pool as committed sections of at most 1 GiB",
+      "category": "memory",
+      "status": "ready",
+      "source": "notxuesty 446a9917c",
+      "switch": "VICTORY_POOL_IN_PLACE=layout VICTORY_POOL_CHUNK_MB=1024",
+      "commit": "397eba02",
+      "effect": "RX 9060 XT: write watch 17.4 -> 2.6 ms/frame; +6.1 GB commit",
+      "issue": 93
+    },
+    {
+      "id": "thread-ticket",
+      "title": "2-D compute groups take thread numbers from a shared counter (NVIDIA fix)",
+      "category": "rendering",
+      "status": "default-untested",
+      "source": "trustno1 854f57ff7",
+      "switch": "VICTORY_THREAD_TICKET (on)",
+      "commit": "e70e4c76",
+      "effect": "Holes in water: threads ran twice or never",
+      "issue": 94
+    },
+    {
+      "id": "placed-normal",
+      "title": "Placed views clear padding so equal views share one entry",
+      "category": "memory",
+      "status": "default-untested",
+      "source": "foxhound b364baa70",
+      "switch": "VICTORY_PLACED_NORMAL (on)",
+      "commit": "3eb0e5ae",
+      "effect": "foxhound: stops RAM growing ~3 GB every 20 min",
+      "issue": 95
+    },
+    {
+      "id": "budget-pack",
+      "title": "List budgets packed into one shared buffer",
+      "category": "memory",
+      "status": "ready",
+      "source": "skornuta/victory-memory-stack",
+      "switch": "VICTORY_BUDGET_PACK=1",
+      "commit": "66d08969",
+      "issue": 96
+    },
+    {
+      "id": "list-idle-max",
+      "title": "Idle and back-list caps with anti-thrash limits",
+      "category": "memory",
+      "status": "ready",
+      "source": "MKmajster bb119618b / fbf89b7c",
+      "switch": "VICTORY_LIST_IDLE_MAX=N VICTORY_THIN_RELEASE_BACK=1 VICTORY_THIN_SKIP_EMPTY=1",
+      "commit": "025ac7aa",
+      "effect": "MKmajster: RAM 19.6 -> 16.3 GB",
+      "issue": 97
+    },
+    {
+      "id": "fill-plan",
+      "title": "Card-step planning shortcut when only fills are asked",
+      "category": "performance",
+      "status": "ready",
+      "source": "adybag14 83c7697",
+      "switch": "VICTORY_FILL_PLAN=1",
+      "commit": "7ec40ad0",
+      "issue": 98
+    },
+    {
+      "id": "rt-room-peak",
+      "title": "VRAM kept for render targets follows their peak",
+      "category": "memory",
+      "status": "ready",
+      "source": "MKmajster 0a1e1113",
+      "switch": "VICTORY_RT_ROOM_PEAK=1",
+      "commit": "cb22ebf2",
+      "effect": "About 2.5 GB back to textures on 12 GB at 720p (source estimate)",
+      "issue": 99
+    },
+    {
+      "id": "refresh-pages",
+      "title": "Refreshes copy only requested ranges, not the gaps",
+      "category": "performance",
+      "status": "ready",
+      "source": "DissolveDZ 77d3f507",
+      "switch": "VICTORY_REFRESH_PAGES=1",
+      "commit": "0da78b51",
+      "issue": 100
+    },
+    {
+      "id": "reflect-screen",
+      "title": "Screen-space reflection clamp (glossy floor / glass shimmer)",
+      "category": "rendering",
+      "status": "ready",
+      "source": "DissolveDZ 2feeb26f (Trexies)",
+      "switch": "VICTORY_REFLECT_SCREEN=1",
+      "commit": "1e1ec5cd",
+      "issue": 101
     }
   ]
 }
