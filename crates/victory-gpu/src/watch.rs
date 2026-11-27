@@ -751,6 +751,60 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Whether an asking ahead is made one reservation at a time, to the
+/// reservation's own end, rather than across the gaps between pieces
+/// (`VICTORY_WATCH_RESERVATION=1`; off by default, and the asking is as it
+/// always was without it).
+///
+/// After MoonYueya/VIctory-Kira ab8fae2, from stellarr-studio/kelvaroq
+/// patch 0045 (GPL-3.0-or-later), whose A/B on its own card put the median
+/// of a heavy frame at 129.2 -> 109.5 ms: the kernel keeps its written pages
+/// by reservation, and one asking that spans two of them (or a hole between
+/// them) is refused, so the run was split by halves and asked again and
+/// again. Here the pieces of one reservation are asked for together, and a
+/// refusal is not paid for first.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_RESERVATION").is_some_and(|v| v == "1"))
+}
+
+/// The end of the reservation holding page `first` (in pages, rounded
+/// down), and whether it is the process's own private memory, which is what
+/// the kernel keeps written pages of: `None` if the query fails.
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query takes an address as its input and fills our
+    // structure; the size given is that structure's.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (first * PAGE) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = (info.AllocationBase as usize).checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: a successful query filled the flags; bit zero is "private".
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Whether a piece may be asked about in one call with the run
+/// `[first, last)` of one reservation: not past [`AHEAD_MAX`], and not across
+/// a gap larger than the old eight MiB or than the smaller of the two.
+fn can_join(first: usize, last: usize, (start, end): (usize, usize)) -> bool {
+    last.max(end) - first <= AHEAD_MAX && start.saturating_sub(last) <= AHEAD_GAP.max((last - first).min(end - start))
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -783,23 +837,36 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
+    let reserved = by_reservation();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
+        if reserved {
+            // One reservation at a time, to its own end: an asking that
+            // reaches past it is refused whole.
+            let limit = reservation(first).map_or(last, |(end, _)| end);
+            while k < pieces.len() && pieces[k].1 <= limit && can_join(first, last, pieces[k]) {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+        } else {
+            while k < pieces.len()
+                && pieces[k].0 <= last + AHEAD_GAP
+                && last.max(pieces[k].1) - first <= AHEAD_MAX
+            {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
         }
         runs.push(i..k);
         i = k;
     }
     for (a, w) in spread_each(runs.len(), |r| {
         let (mut a, mut w) = (Vec::new(), Vec::new());
+        // (one reservation's run, `VICTORY_WATCH_RESERVATION=1`, is asked the
+        // same way: whole, then by halves where the kernel still refuses)
         ask_run(&pieces[runs[r].clone()], &mut a, &mut w);
         (a, w)
     }) {
@@ -4426,6 +4493,28 @@ mod tests {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
         }
+    }
+
+    /// With `VICTORY_WATCH_RESERVATION` the pieces of one reservation are
+    /// asked about in one call, and the asking stops at the reservation's
+    /// end: what the query says of our own allocation, and which pieces join.
+    #[test]
+    fn a_reservation_is_asked_about_to_its_own_end() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (end, private) = reservation(p / PAGE).expect("the query answers for our own memory");
+        assert!(end >= (p + 4 * PAGE) / PAGE, "the reservation ends at page {end}, before our four");
+        assert!(private, "our own commit is private memory");
+        // Two pieces next to each other join; one past the most an asking
+        // covers does not.
+        let (first, last) = (p / PAGE, p / PAGE + 1);
+        assert!(can_join(first, last, (last, last + 1)));
+        assert!(!can_join(first, last, (end + AHEAD_MAX, end + AHEAD_MAX + 1)));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A write between another thread's asking about a range and the second
