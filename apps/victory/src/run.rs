@@ -243,6 +243,9 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // VICTORY_UMA_DRIVER=1: the host device and the driver heaps' self-test,
+    // before the title's TLS callbacks and DllMains allocate anything.
+    victory_hle::uma_driver::before_title();
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

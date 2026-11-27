@@ -47,14 +47,14 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory) that runs a Series titl
 
 | | Category | Done | In flight | Planned |
 |---|---|---|---|---|
-| <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 27 | 17 | 2 |
+| <img src="docs/assets/progress/performance.svg" width="300"> | **Frame time / CPU** | 28 | 16 | 2 |
 | <img src="docs/assets/progress/memory.svg" width="300"> | **RAM and VRAM** | 2 | 9 | 3 |
 | <img src="docs/assets/progress/rendering.svg" width="300"> | **Picture correctness** | 2 | 16 | 4 |
 | <img src="docs/assets/progress/stability.svg" width="300"> | **Loads, hangs, crashes** | 4 | 9 | 0 |
 | <img src="docs/assets/progress/shaders.svg" width="300"> | **Shader translation** | 1 | 10 | 0 |
 | <img src="docs/assets/progress/tooling.svg" width="300"> | **Measurement and automation** | 5 | 4 | 0 |
 
-**41 of 115** items done or decided, **65** merged and waiting for a game run, **9** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
+**42 of 115** items done or decided, **64** merged and waiting for a game run, **9** planned · full list in **[docs/TRACKER.md](docs/TRACKER.md)** · charts in the **[live dashboard](https://insenzaboor.github.io/victory-rtx3060/)**
 
 <!-- PROGRESS:END -->
 
@@ -129,6 +129,7 @@ Every number on this page is from one PC: **AMD Ryzen 9 5900X · 32 GB RAM · NV
 
 Built on the work of the community, with history and credit kept in every commit:
 
+<<<<<<< HEAD
 - **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**: the compatibility layer itself
 - **[avatarmanz](https://github.com/avatarmanz/VIctory-7900XTX)**: renderer ports 1–7, the measured base set, the pop-in fix
 - **[fxceless](https://github.com/fxceless/victory-fork)**, **[DexNom](https://github.com/DexNom/VIctory)**, **[Belobug](https://github.com/Belobug/VIctory-Belobug-AMD)**: much of the tree we build on
@@ -137,6 +138,28 @@ Built on the work of the community, with history and credit kept in every commit
 - **[Th3C0D3R](https://github.com/Th3C0D3R/victory-fork)**, **chabrune**, **cool_fox / CGBJ**, **Rubenpannen**, **SPOOKEXE**, **ApexIV**, **aleksesipenko** and every fork listed in the tracker
 
 The upstream README this fork started from is kept in [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).
+=======
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors: the loader, the runtime services, the Direct3D 12 back end and
+  the shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
+  this one started from, and the people whose pull requests it carries.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
+  cube gradients, sparse textures.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
+  the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
+  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
+  reads into title memory.
+- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
+- **[XCL](https://github.com/xcl-dev/xcl)** was read for how the same title
+  behaves under another layer. Since its relicensing to GPL-3.0-or-later
+  (`06f90c198`), its driver heaps at the title's address (`f2248f068` by
+  Kalmarv, `f78e05bcc` by Prime1997) are ported here
+  (`VICTORY_UMA_DRIVER`); see [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
+- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+>>>>>>> av-exact
 
 ## License
 
