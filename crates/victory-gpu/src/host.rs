@@ -8981,9 +8981,23 @@ fn wide_fills() -> bool {
 /// buffer then holds (`texture.rs`, `dirty`) may come ahead of the refresh
 /// an earlier list of the submission asked for, not behind it. The texture
 /// is then uploaded by a later list too, once more than needed.
+///
+/// This is what fxceless/victory-fork ceb9e1f7a calls
+/// `VICTORY_PARALLEL_REFRESH=1` (a submission's texture checks gathered
+/// between writes of ours and run on the helper pool: -8.7 / -9.4 ms of the
+/// preparing thread at equal draws on an RTX 4070 + i7-14700KF); ours came
+/// earlier (151816ce) and is on by default where [`wide_refresh`] is. With
+/// the in-run A/B (`VICTORY_AB=<s>,VICTORY_WIDE_TEXTURES`, diagnostics builds)
+/// it flips while the title runs, to measure it on one machine; a flip in the
+/// middle of a submission only moves where its textures are checked (one
+/// noted due is checked at the next flush either way). It stays off without
+/// [`wide_refresh`].
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh());
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_WIDE_TEXTURES").map_or(on, |picked| picked && wide_refresh());
+    on
 }
 
 impl Batch {
